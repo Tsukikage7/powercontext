@@ -1,6 +1,7 @@
 "use strict";
 
 const dateKeyPattern = /^\d{4}-\d{2}-\d{2}$/;
+const dateTimeLocalPattern = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/;
 
 export function resolvePeriodSelection(mode, timezone, customRange = {}, now = new Date()) {
   const today = dateKeyInTimeZone(now, timezone);
@@ -25,8 +26,10 @@ export function resolvePeriodSelection(mode, timezone, customRange = {}, now = n
     startDate,
     endDate,
     period: {
-      start: zonedStartOfDay(startDate, timezone),
-      end: zonedStartOfDay(addDays(endDate, 1), timezone),
+      start: mode === "custom" ? zonedDateTime(startDate, timezone) : zonedStartOfDay(startDate, timezone),
+      end: mode === "custom"
+        ? addSecond(zonedDateTime(endDate, timezone))
+        : zonedStartOfDay(addDays(endDate, 1), timezone),
       timezone,
       compare_to_previous_period: true
     }
@@ -34,6 +37,12 @@ export function resolvePeriodSelection(mode, timezone, customRange = {}, now = n
 }
 
 export function validateDateRange(startDate, endDate) {
+  if (isValidDateTimeLocal(startDate) && isValidDateTimeLocal(endDate)) {
+    if (compareDateTimeLocal(startDate, endDate) > 0) {
+      throw new Error("periodInvalidRange");
+    }
+    return;
+  }
   if (!isValidDateKey(startDate) || !isValidDateKey(endDate)) {
     throw new Error("periodDatesRequired");
   }
@@ -43,14 +52,16 @@ export function validateDateRange(startDate, endDate) {
 }
 
 export function formatDateRange(startDate, endDate, locale) {
+  const hasTime = isValidDateTimeLocal(startDate) && isValidDateTimeLocal(endDate);
   const formatter = new Intl.DateTimeFormat(locale, {
     year: "numeric",
     month: "short",
     day: "numeric",
+    ...(hasTime ? {hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"} : {}),
     timeZone: "UTC"
   });
-  const start = formatter.format(dateKeyToDate(startDate));
-  const end = formatter.format(dateKeyToDate(endDate));
+  const start = formatter.format(hasTime ? dateTimeLocalToDate(startDate) : dateKeyToDate(startDate));
+  const end = formatter.format(hasTime ? dateTimeLocalToDate(endDate) : dateKeyToDate(endDate));
   return startDate === endDate ? start : `${start} – ${end}`;
 }
 
@@ -60,8 +71,17 @@ function dateKeyInTimeZone(value, timezone) {
 }
 
 function zonedStartOfDay(dateKey, timezone) {
-  const {year, month, day} = parseDateKey(dateKey);
-  const target = Date.UTC(year, month - 1, day);
+  return zonedLocalTime(`${dateKey}T00:00:00`, timezone);
+}
+
+function zonedDateTime(dateTime, timezone) {
+  const local = normalizeDateTimeLocal(dateTime);
+  return zonedLocalTime(local, timezone);
+}
+
+function zonedLocalTime(dateTime, timezone) {
+  const {year, month, day, hour, minute, second} = parseDateTimeLocal(dateTime);
+  const target = Date.UTC(year, month - 1, day, hour, minute, second);
   let candidate = target;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const parts = partsInTimeZone(new Date(candidate), timezone, true);
@@ -73,6 +93,10 @@ function zonedStartOfDay(dateKey, timezone) {
     }
   }
   return new Date(candidate).toISOString();
+}
+
+function addSecond(value) {
+  return new Date(Date.parse(value) + 1000).toISOString();
 }
 
 function partsInTimeZone(value, timezone, includeTime = false) {
@@ -122,12 +146,45 @@ function dateKeyToDate(dateKey) {
   return new Date(Date.UTC(year, month - 1, day));
 }
 
+function dateTimeLocalToDate(dateTime) {
+  const {year, month, day, hour, minute, second} = parseDateTimeLocal(dateTime);
+  return new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+}
+
 function parseDateKey(dateKey) {
   if (!isValidDateKey(dateKey)) {
     throw new Error("periodDatesRequired");
   }
   const [year, month, day] = dateKey.split("-").map(Number);
   return {year, month, day};
+}
+
+function parseDateTimeLocal(dateTime) {
+  const match = dateTimeLocalPattern.exec(dateTime || "");
+  if (!match) {
+    throw new Error("periodDatesRequired");
+  }
+  const [year, month, day] = match[1].split("-").map(Number);
+  const hour = Number(match[2]);
+  const minute = Number(match[3]);
+  const second = Number(match[4] || 0);
+  const value = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  if (
+    value.getUTCFullYear() !== year
+    || value.getUTCMonth() !== month - 1
+    || value.getUTCDate() !== day
+    || value.getUTCHours() !== hour
+    || value.getUTCMinutes() !== minute
+    || value.getUTCSeconds() !== second
+  ) {
+    throw new Error("periodDatesRequired");
+  }
+  return {year, month, day, hour, minute, second};
+}
+
+function normalizeDateTimeLocal(dateTime) {
+  const parsed = parseDateTimeLocal(dateTime);
+  return `${formatDateKey(parsed.year, parsed.month, parsed.day)}T${String(parsed.hour).padStart(2, "0")}:${String(parsed.minute).padStart(2, "0")}:${String(parsed.second).padStart(2, "0")}`;
 }
 
 function isValidDateKey(dateKey) {
@@ -137,6 +194,21 @@ function isValidDateKey(dateKey) {
   const [year, month, day] = dateKey.split("-").map(Number);
   const value = new Date(Date.UTC(year, month - 1, day));
   return value.getUTCFullYear() === year && value.getUTCMonth() === month - 1 && value.getUTCDate() === day;
+}
+
+function isValidDateTimeLocal(dateTime) {
+  try {
+    parseDateTimeLocal(dateTime);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function compareDateTimeLocal(left, right) {
+  const leftValue = normalizeDateTimeLocal(left);
+  const rightValue = normalizeDateTimeLocal(right);
+  return leftValue.localeCompare(rightValue);
 }
 
 function formatDateKey(year, month, day) {

@@ -97,13 +97,17 @@ def test_handoff_report_page_is_available_only_when_both_features_are_enabled(tm
     assert 'data-period-mode="day"' in enabled_page.text
     assert 'data-period-mode="week"' in enabled_page.text
     assert 'data-period-mode="month"' in enabled_page.text
-    assert 'id="period-start" type="date"' in enabled_page.text
-    assert 'id="period-end" type="date"' in enabled_page.text
+    assert 'id="period-start" type="datetime-local" step="1"' in enabled_page.text
+    assert 'id="period-end" type="datetime-local" step="1"' in enabled_page.text
     assert 'id="project-select"' in enabled_page.text
     assert 'id="project-tabs"' not in enabled_page.text
     assert '<section class="report-overview"' in enabled_page.text
     assert '<dl class="report-overview"' not in enabled_page.text
-    assert "handoff-report.js?v=state-races" in enabled_page.text
+    assert 'id="report-template" hidden' in enabled_page.text
+    assert 'data-i18n="defaultTemplateTitle"' in enabled_page.text
+    assert 'data-i18n="templateNoticeBody"' in enabled_page.text
+    assert 'id="template-retry"' in enabled_page.text
+    assert "handoff-report.js?v=period-datetime" in enabled_page.text
     assert protected_projects.status_code == 401
 
 

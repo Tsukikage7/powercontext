@@ -9,6 +9,130 @@
 {% set status_title = "Handoff Report" %}
 {% include "components/status.html" %}
 
+<section class="report-template" id="report-template" hidden aria-labelledby="report-template-title">
+  <div class="hero report-template-hero">
+    <div>
+      <p class="page-kind" data-i18n="handoffReportTitle">Handoff Report</p>
+      <h1 id="report-template-title" data-i18n="defaultTemplateTitle">Handoff Report Template</h1>
+      <p class="report-template-intro" data-i18n="defaultTemplateIntro">
+        Use this structure as a starting point. Real data appears after a Project is configured.
+      </p>
+    </div>
+    <span class="template-status" data-i18n="templatePreview">Template preview</span>
+  </div>
+
+  <div class="template-notice" role="note">
+    <strong data-i18n="templateNoticeTitle">No Project is configured</strong>
+    <p data-i18n="templateNoticeBody">
+      This preview shows the sections a report will contain. It does not represent actual project status.
+    </p>
+    <div class="template-notice-actions">
+      <button class="secondary-button page-button" id="template-retry" type="button" data-i18n="retry">Retry</button>
+    </div>
+  </div>
+
+  <section class="report-overview" aria-label="Handoff summary">
+    <div class="report-metric status-continuable">
+      <span data-i18n="continuable">Continuable</span>
+      <strong data-i18n="templateValue">—</strong>
+    </div>
+    <div class="report-metric status-blocked">
+      <span data-i18n="blocked">Blocked</span>
+      <strong data-i18n="templateValue">—</strong>
+    </div>
+    <div class="report-metric status-complete">
+      <span data-i18n="complete">Complete</span>
+      <strong data-i18n="templateValue">—</strong>
+    </div>
+    <div class="report-metric status-no-handoff">
+      <span data-i18n="noHandoff">No Handoff</span>
+      <strong data-i18n="templateValue">—</strong>
+    </div>
+  </section>
+
+  <section class="coverage-strip template-section" aria-labelledby="template-coverage-title">
+    <div>
+      <h2 id="template-coverage-title" data-i18n="coverage">Report coverage</h2>
+      <p data-i18n="templateCoverageBody">
+        Coverage values will appear after a Project and its Workstreams are configured.
+      </p>
+    </div>
+    <dl>
+      <div><dt data-i18n="workstreams">Workstreams</dt><dd data-i18n="templateValue">—</dd></div>
+      <div><dt data-i18n="activities">Activities</dt><dd data-i18n="templateValue">—</dd></div>
+      <div><dt data-i18n="evidenceUnavailable">Evidence unavailable</dt><dd data-i18n="templateValue">—</dd></div>
+    </dl>
+  </section>
+
+  <section class="data-section template-section" aria-labelledby="template-workstreams-title">
+    <div class="section-heading">
+      <div>
+        <h2 id="template-workstreams-title" data-i18n="workstreams">Workstreams</h2>
+        <p data-i18n="workstreamsSubtitle">Exact Handoff state and the next action for each scope</p>
+      </div>
+    </div>
+    <div class="template-empty-state" data-i18n="templateWorkstreamsBody">
+      Register a Workstream to populate this section.
+    </div>
+  </section>
+
+  <section class="data-section template-section" aria-labelledby="template-handoff-title">
+    <div class="section-heading">
+      <div>
+        <h2 id="template-handoff-title" data-i18n="handoffContents">Handoff content</h2>
+        <p data-i18n="handoffContentsSubtitle">
+          Objective, current state, next action, and known omissions for continuation
+        </p>
+      </div>
+    </div>
+    <div class="handoff-content-list">
+      <article class="handoff-content-card template-content-card">
+        <header>
+          <div>
+            <h3 data-i18n="templateWorkstreamTitle">Workstream handoff</h3>
+            <code class="template-placeholder" data-i18n="templateScopePlaceholder">scope-id</code>
+          </div>
+          <span class="status-badge template-placeholder" data-i18n="templateValue">—</span>
+        </header>
+        <section>
+          <h4 data-i18n="objective">Objective</h4>
+          <p class="template-placeholder" data-i18n="templateObjectivePlaceholder">
+            Project objective will appear here.
+          </p>
+        </section>
+        <section>
+          <h4 data-i18n="currentState">Current state</h4>
+          <p class="template-placeholder" data-i18n="templateStatePlaceholder">
+            Current state will appear here.
+          </p>
+        </section>
+        <section>
+          <h4 data-i18n="nextAction">Next action</h4>
+          <p class="template-placeholder" data-i18n="templateNextActionPlaceholder">
+            Next action will appear here.
+          </p>
+        </section>
+        <section>
+          <h4 data-i18n="omissions">Known omissions</h4>
+          <p class="template-placeholder" data-i18n="templateOmissionsPlaceholder">
+            Known omissions will appear here.
+          </p>
+        </section>
+      </article>
+    </div>
+  </section>
+
+  <section class="report-metadata template-metadata" aria-labelledby="template-metadata-title">
+    <h2 id="template-metadata-title" data-i18n="metadata">Report metadata</h2>
+    <dl>
+      <div><dt data-i18n="selectionConsistency">Selection consistency</dt><dd data-i18n="templateValue">—</dd></div>
+      <div><dt data-i18n="activityCoverage">Activity coverage</dt><dd data-i18n="templateValue">—</dd></div>
+      <div><dt data-i18n="selectionDigest">Selection digest</dt><dd data-i18n="templateValue">—</dd></div>
+      <div><dt data-i18n="reportDigest">Report digest</dt><dd data-i18n="templateValue">—</dd></div>
+    </dl>
+  </section>
+</section>
+
 <section class="server-content" id="handoff-report">
   <div class="hero report-hero">
     <div>
@@ -38,11 +162,11 @@
           <button class="period-preset" type="button" data-period-mode="month" data-i18n="month">Month</button>
         </div>
         <form class="custom-period-form" id="custom-period-form">
-          <label class="screen-reader-only" for="period-start" data-i18n="periodStart">Start date</label>
-          <input class="period-date-input" id="period-start" type="date">
+          <label class="screen-reader-only" for="period-start" data-i18n="periodStart">Start date and time</label>
+          <input class="period-date-input" id="period-start" type="datetime-local" step="1">
           <span class="period-separator" aria-hidden="true">–</span>
-          <label class="screen-reader-only" for="period-end" data-i18n="periodEnd">End date</label>
-          <input class="period-date-input" id="period-end" type="date">
+          <label class="screen-reader-only" for="period-end" data-i18n="periodEnd">End date and time</label>
+          <input class="period-date-input" id="period-end" type="datetime-local" step="1">
           <button class="secondary-button page-button" id="apply-custom-period" type="submit" data-i18n="apply">Apply</button>
         </form>
       </div>
@@ -145,5 +269,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script type="module" src="{{ url_for('web_static', path='/handoff-report.js') }}?v=state-races"></script>
+<script type="module" src="{{ url_for('web_static', path='/handoff-report.js') }}?v=period-datetime"></script>
 {% endblock %}

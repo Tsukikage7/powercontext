@@ -6,13 +6,27 @@ import {
   readServerToken,
   storeServerToken
 } from "./auth.js?v=session-shell";
-import {formatDateRange, resolvePeriodSelection, validateDateRange} from "./handoff-period.js";
+import {formatDateRange, resolvePeriodSelection, validateDateRange} from "./handoff-period.js?v=period-seconds";
 import {createPageUi, createRequestGate} from "./page-ui.js?v=request-gate";
 
 const selectedProjectKey = "powercontext.handoff-report.project";
 const translations = {
   en: {
     pageTitle: "PowerContext Handoff Report",
+    defaultTemplateTitle: "Handoff Report Template",
+    defaultTemplateIntro: "Use this structure as a starting point. Real data appears after a Project is configured.",
+    templatePreview: "Template preview",
+    templateNoticeTitle: "No Project is configured",
+    templateNoticeBody: "This preview shows the sections a report will contain. It does not represent actual project status.",
+    templateCoverageBody: "Coverage values will appear after a Project and its Workstreams are configured.",
+    templateWorkstreamsBody: "Register a Workstream to populate this section.",
+    templateWorkstreamTitle: "Workstream handoff",
+    templateScopePlaceholder: "scope-id",
+    templateObjectivePlaceholder: "Project objective will appear here.",
+    templateStatePlaceholder: "Current state will appear here.",
+    templateNextActionPlaceholder: "Next action will appear here.",
+    templateOmissionsPlaceholder: "Known omissions will appear here.",
+    templateValue: "—",
     dashboardTitle: "Dashboard",
     handoffReportTitle: "Handoff Report",
     maintainedBy: "Maintained by OceanBase.",
@@ -29,8 +43,8 @@ const translations = {
     week: "Week",
     month: "Month",
     custom: "Custom",
-    periodStart: "Start date",
-    periodEnd: "End date",
+    periodStart: "Start date and time",
+    periodEnd: "End date and time",
     apply: "Apply",
     periodSummary: "{preset} · {range} · {timezone}",
     periodComparison: "Activity: {current} current / {previous} previous / {delta} change",
@@ -96,6 +110,20 @@ const translations = {
   },
   zh: {
     pageTitle: "PowerContext 项目交接报告",
+    defaultTemplateTitle: "Handoff Report 模板",
+    defaultTemplateIntro: "这是报告结构预览；配置 Project 后将显示真实数据。",
+    templatePreview: "模板预览",
+    templateNoticeTitle: "尚未配置 Project",
+    templateNoticeBody: "以下内容仅展示报告结构，不代表任何真实项目状态。",
+    templateCoverageBody: "配置 Project 及其 Workstream 后，这里会显示覆盖范围数据。",
+    templateWorkstreamsBody: "注册 Workstream 后将填充此区域。",
+    templateWorkstreamTitle: "Workstream Handoff",
+    templateScopePlaceholder: "scope-id",
+    templateObjectivePlaceholder: "项目目标将在这里显示。",
+    templateStatePlaceholder: "当前状态将在这里显示。",
+    templateNextActionPlaceholder: "下一步将在这里显示。",
+    templateOmissionsPlaceholder: "已知缺失将在这里显示。",
+    templateValue: "—",
     dashboardTitle: "仪表盘",
     handoffReportTitle: "交接报告",
     maintainedBy: "由 OceanBase 维护。",
@@ -112,8 +140,8 @@ const translations = {
     week: "周",
     month: "月",
     custom: "自定义",
-    periodStart: "开始日期",
-    periodEnd: "结束日期",
+    periodStart: "开始日期和时间",
+    periodEnd: "结束日期和时间",
     apply: "应用",
     periodSummary: "{preset} · {range} · {timezone}",
     periodComparison: "Activity：本期 {current} / 上期 {previous} / 变化 {delta}",
@@ -186,7 +214,9 @@ const tokenInput = document.getElementById("token");
 const pageStatus = document.getElementById("page-status");
 const pageStatusMessage = document.getElementById("page-status-message");
 const pageStatusRetry = document.getElementById("page-status-retry");
+const templateRetry = document.getElementById("template-retry");
 const reportShell = document.getElementById("handoff-report");
+const templateShell = document.getElementById("report-template");
 const reportError = document.getElementById("report-error");
 const projectSelect = document.getElementById("project-select");
 const refreshButton = document.getElementById("refresh-report");
@@ -239,6 +269,10 @@ pageStatusRetry.addEventListener("click", async () => {
   } else {
     await loadReport(token, currentProject.project_id);
   }
+});
+
+templateRetry.addEventListener("click", async () => {
+  await authenticate(readServerToken());
 });
 
 refreshButton.addEventListener("click", async () => {
@@ -433,6 +467,7 @@ function showReportFailure(key, values = {}) {
   }
   currentPageStatus = null;
   pageStatus.hidden = true;
+  templateShell.hidden = true;
   reportShell.hidden = false;
   signOut.hidden = false;
   showReportError(key, values);
@@ -451,6 +486,7 @@ function showLogin(messageKey = "", values = {}) {
   clearReport();
   authShell.hidden = false;
   pageStatus.hidden = true;
+  templateShell.hidden = true;
   reportShell.hidden = true;
   signOut.hidden = true;
   tokenInput.focus();
@@ -460,7 +496,9 @@ function showPageStatus(messageKey, values = {}, retryable = false) {
   currentPageStatus = {key: messageKey, values, retryable};
   renderPageStatus();
   authShell.hidden = true;
-  pageStatus.hidden = false;
+  const isTemplate = messageKey === "noProjects";
+  pageStatus.hidden = isTemplate;
+  templateShell.hidden = !isTemplate;
   reportShell.hidden = true;
   signOut.hidden = false;
 }
@@ -496,6 +534,7 @@ function renderReport(report) {
   currentPageStatus = null;
   authShell.hidden = true;
   pageStatus.hidden = true;
+  templateShell.hidden = true;
   reportShell.hidden = false;
   signOut.hidden = false;
   clearReportError();
@@ -760,8 +799,8 @@ function renderPeriodControls(report = null) {
     return;
   }
   if (currentPeriodMode !== "custom") {
-    periodStartInput.value = selection.startDate;
-    periodEndInput.value = selection.endDate;
+    periodStartInput.value = `${selection.startDate}T00:00:00`;
+    periodEndInput.value = `${selection.endDate}T23:59:59`;
   }
   updatePeriodInputBounds();
   setText("period-summary-label", translate("periodSummary", {
