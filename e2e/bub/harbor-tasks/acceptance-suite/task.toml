@@ -1,0 +1,26 @@
+version = "1.3"
+multi_step_reward_strategy = "mean"
+
+[metadata]
+feature = "shared-model-free-acceptance"
+
+[agent]
+timeout_sec = 120.0
+
+[verifier]
+timeout_sec = 60.0
+
+[environment]
+build_timeout_sec = 300.0
+
+[[steps]]
+name = "locomo-support-group"
+min_reward = 1.0
+
+[[steps]]
+name = "project-database-decision"
+min_reward = 1.0
+
+[[steps]]
+name = "reviewed-artifact-lifecycle"
+min_reward = 1.0

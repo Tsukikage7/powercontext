@@ -1,41 +1,23 @@
 from __future__ import annotations
 
-import asyncio
-import os
 from pathlib import Path
-from uuid import uuid4
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import SecretStr
 from typer.testing import CliRunner
 
 import powercontext.client.cli as client_cli
-from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.cli.app import create_cli
-from powercontext.client import PowerContextClient, ServerResponseError
+from powercontext.client import PowerContextClient
 from powercontext.http import (
-    ApproveArtifactCandidateRequest,
-    CandidateFamily,
-    CaptureContentSourceRequest,
     ExperienceProposal,
-    GetArtifactCandidateRequest,
-    GetExperienceRequest,
-    GetSkillRequest,
-    ListArtifactCandidatesRequest,
-    PrepareContextRequest,
-    ProposeExperienceRequest,
-    ProposeSkillRequest,
-    ReviseArtifactCandidateRequest,
     SkillProposal,
     SkillValidationItem,
 )
 from powercontext.server.factory import create_server_app
 from powercontext.server.settings import McpConfig, ServerSettings
-
-OCEANBASE_URL = os.environ.get("POWERCONTEXT_TEST_OCEANBASE_URL")
 
 
 def _settings(database: Path) -> ServerSettings:
@@ -66,169 +48,6 @@ def _skill_proposal(
             SkillValidationItem("make contract-test passes"),
         ],
     )
-
-
-@pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
-def test_http_sdk_experience_review_vertical_slice(database_kind: str, tmp_path: Path) -> None:
-    if database_kind == "oceanbase":
-        if OCEANBASE_URL is None:
-            pytest.skip("set POWERCONTEXT_TEST_OCEANBASE_URL to a dedicated OceanBase MySQL-mode test database")
-        settings = ServerSettings(
-            database=OceanBaseConfig(url=SecretStr(OCEANBASE_URL)),
-            mcp=McpConfig(enabled=False),
-        )
-    else:
-        settings = _settings(tmp_path / "review.db")
-    app = create_server_app(settings=settings)
-    scope_id = f"candidate-review-{uuid4()}"
-
-    async def scenario() -> None:
-        async with (
-            app.router.lifespan_context(app),
-            httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="http://testserver",
-            ) as transport,
-        ):
-            client = PowerContextClient("http://testserver", http_client=transport)
-            capabilities = await client.get_capabilities()
-            captured = await client.capture_content_source(
-                CaptureContentSourceRequest(
-                    scope_id=scope_id,
-                    source_id="task-1",
-                    content="api-generate and contract-test passed",
-                )
-            )
-            candidate = await client.propose_experience(
-                ProposeExperienceRequest(
-                    scope_id=scope_id,
-                    proposal=_proposal("Regenerate the Client before contract tests."),
-                    source_refs=[captured.source],
-                    artifact_refs=[],
-                )
-            )
-            inbox = await client.list_artifact_candidates(ListArtifactCandidatesRequest(scope_id=scope_id))
-            prepared = await client.prepare_context(
-                PrepareContextRequest(
-                    scope_id=scope_id,
-                    query="Regenerate the Client before contract tests.",
-                )
-            )
-            revised = await client.revise_artifact_candidate(
-                ReviseArtifactCandidateRequest(
-                    scope_id=scope_id,
-                    candidate_id=candidate.candidate_id,
-                    expected_version=1,
-                    proposal=_proposal("Regenerate and inspect the Client before contract tests."),
-                    source_refs=[captured.source],
-                    artifact_refs=[],
-                )
-            )
-            with pytest.raises(ServerResponseError) as stale:
-                await client.approve_artifact_candidate(
-                    ApproveArtifactCandidateRequest(
-                        scope_id=scope_id,
-                        candidate_id=candidate.candidate_id,
-                        expected_version=1,
-                    )
-                )
-            approved = await client.approve_artifact_candidate(
-                ApproveArtifactCandidateRequest(
-                    scope_id=scope_id,
-                    candidate_id=candidate.candidate_id,
-                    expected_version=2,
-                )
-            )
-            assert approved.result_artifact is not None
-            experience = await client.get_experience(
-                GetExperienceRequest(scope_id=scope_id, artifact=approved.result_artifact)
-            )
-            approved_context = await client.prepare_context(
-                PrepareContextRequest(
-                    scope_id=scope_id,
-                    query="Regenerate and inspect the Client before contract tests.",
-                )
-            )
-            exact_candidate = await client.get_artifact_candidate(
-                GetArtifactCandidateRequest(scope_id=scope_id, candidate_id=candidate.candidate_id)
-            )
-
-            skill_candidate = await client.propose_skill(
-                ProposeSkillRequest(
-                    scope_id=scope_id,
-                    proposal=_skill_proposal(),
-                    source_refs=[],
-                    artifact_refs=[experience.artifact],
-                    reason="Incubated from the approved Experience.",
-                )
-            )
-            skill_inbox = await client.list_artifact_candidates(
-                ListArtifactCandidatesRequest(scope_id=scope_id, family=CandidateFamily.SKILL)
-            )
-            skill_approval = await client.approve_artifact_candidate(
-                ApproveArtifactCandidateRequest(
-                    scope_id=scope_id,
-                    candidate_id=skill_candidate.candidate_id,
-                    expected_version=1,
-                )
-            )
-            assert skill_approval.result_artifact is not None
-            first_skill = await client.get_skill(
-                GetSkillRequest(scope_id=scope_id, artifact=skill_approval.result_artifact)
-            )
-            usage = await client.capture_content_source(
-                CaptureContentSourceRequest(
-                    scope_id=scope_id,
-                    source_id="task-2",
-                    content="The managed Skill was used and validation passed.",
-                )
-            )
-            replacement = await client.propose_skill(
-                ProposeSkillRequest(
-                    scope_id=scope_id,
-                    proposal=_skill_proposal(
-                        "Regenerate the Client, inspect the diff, run generation checks, and then run contract tests."
-                    ),
-                    source_refs=[usage.source],
-                    artifact_refs=[first_skill.artifact],
-                    target=first_skill.artifact,
-                    reason="Usage evidence made the generation check explicit.",
-                )
-            )
-            replacement_approval = await client.approve_artifact_candidate(
-                ApproveArtifactCandidateRequest(
-                    scope_id=scope_id,
-                    candidate_id=replacement.candidate_id,
-                    expected_version=1,
-                )
-            )
-            assert replacement_approval.result_artifact is not None
-            second_skill = await client.get_skill(
-                GetSkillRequest(scope_id=scope_id, artifact=replacement_approval.result_artifact)
-            )
-            historical_skill = await client.get_skill(GetSkillRequest(scope_id=scope_id, artifact=first_skill.artifact))
-
-            assert capabilities.artifact_families == ["memory", "experience", "skill", "handoff"]
-            assert inbox.candidates == [candidate]
-            assert prepared.status == "empty"
-            assert revised.version == 2
-            assert (stale.value.status_code, stale.value.code) == (409, "candidate_conflict")
-            assert experience.content == revised.proposal
-            assert experience.source_refs == [captured.source]
-            assert approved_context.status == "ready"
-            assert approved_context.content is not None
-            assert '"kind":"experience"' in approved_context.content
-            assert approved.result_artifact.artifact_id in approved_context.content
-            assert exact_candidate == approved
-            assert skill_inbox.candidates == [skill_candidate]
-            assert first_skill.artifact.family == "skill"
-            assert first_skill.artifact_refs == [experience.artifact]
-            assert second_skill.artifact.revision == 2
-            assert second_skill.source_refs == [usage.source]
-            assert second_skill.artifact_refs == [first_skill.artifact]
-            assert historical_skill == first_skill
-
-    asyncio.run(scenario())
 
 
 def test_candidate_cli_lists_shows_revises_approves_and_rejects(

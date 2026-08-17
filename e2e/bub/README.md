@@ -1,88 +1,53 @@
 # End-to-end workload harness
 
-This directory contains PowerContext's end-to-end workload catalog. LoCoMo is used as a pinned input sample, not as a
-benchmark suite. The Terminal-Bench case retains its native task and verifier, while PowerContext acceptance is based
-on Memory collection, grounding, and recall rather than the native task reward.
+This directory contains PowerContext's Harbor workload catalog. Harbor is the single execution boundary. It owns
+datasets, tasks, steps, agents, timeouts, container lifecycles, verifiers, and native evidence. The harness selects
+workloads, provides PowerContext scopes, adds Memory observations, and generates a unified report.
 
-The common architecture separates workload selection, execution, evidence, Memory evaluation, and reporting. Bub is
-the current execution adapter because its model, tools, context injection, capture, and checkpoints are observable.
-Another adapter can be added later without changing the common workload or evaluation contracts.
+Each manifest has three orthogonal dimensions:
 
-Every workload follows one execution path:
+- `dataset`: the Harbor task source, ID, and checksum;
+- `agent`: `acceptance`, `bub`, or `codex`;
+- `evaluation`: either the Harbor-native verifier or Memory capture and recall evaluation in addition to the native
+  reward.
 
-```text
-Pydantic manifest and native runtime settings
-  -> isolated PowerContext scope
-  -> Harbor Job
-  -> Harbor ACP runner
-  -> Bub ACP server
-  -> PowerContext
-  -> Pydantic Memory evaluation
-  -> Pydantic JSON evidence and Marko report
-```
-
-Harbor owns task and agent execution. Local multi-step Harbor tasks model independent capture and recall sessions;
-registry-backed tasks such as Terminal-Bench use the same `Job.run` call. The harness does not contain a second Bub
-runner. Pydantic validates configuration, manifests, observations, and evaluation reports. Marko renders the Markdown
-summary.
-
-## Layout
-
-```text
-e2e/bub/
-  tasks/                  # PowerContext manifests and evaluation expectations
-  harbor-tasks/           # Local Harbor tasks used by built-in samples
-  src/powercontext_e2e/   # One Harbor runner and one Memory evaluator
-```
-
-All manifests use the same schema:
+Categories describe suite and capability membership. They do not select an execution adapter or imply model and
+credential requirements.
 
 ```yaml
 schema: powercontext.e2e-task/v1
-id: project-database-decision
+id: acceptance-suite
 categories:
   - acceptance
-  - sample
+  - smoke
 dataset:
   path: e2e/bub/harbor-tasks
-  task_id: project-database-decision
+  task_id: acceptance-suite
   checksum: <harbor-task-checksum>
-execution:
-  type: bub
-  model: false
-  max_steps: 10
-  max_tokens: 4096
+agent: acceptance
 evaluation:
-  expected_memory:
-    - OceanBase
-  probes:
-    - id: database-decision
-      query: What database did this project select, and why?
-      expected_context:
-        - OceanBase
+  type: native
 ```
 
-The dataset can be a local Harbor dataset path or a registry dataset name and version. `execution` selects the
-adapter and its budget. `model` declares only whether the workload requires a model. The runtime selects the model,
-provider, endpoint, and credentials. `evaluation` declares only externally observable Memory behavior.
+## Workloads
 
-Runtime configuration keeps the native ownership of each component. The harness Client reads
-`POWERCONTEXT_CLIENT_*`, the Bub adapter forwards native `BUB_*` settings for model-backed workloads, and the
-PowerContext integration reads `POWERCONTEXT_BUB_*`. Harness-owned settings are limited to workload selection,
-evidence paths, database identity, repository mounting, and nested-container orchestration. Harbor does not require
-model provider credentials.
-
-The built-in manifests are:
-
-| ID | Dataset | Categories | Purpose |
+| ID | Agent | Evaluation | Purpose |
 | --- | --- | --- | --- |
-| `locomo-support-group` | local Harbor multi-step task | `acceptance`, `sample` | Pinned LoCoMo-derived sample |
-| `project-database-decision` | local Harbor multi-step task | `acceptance`, `sample`, `smoke` | Durable project decision |
-| `terminal-bench-db-wal-recovery` | `terminal-bench@2.0` | `long-horizon`, `terminal-bench` | Long-running capture and recall |
+| `acceptance-suite` | Model-free acceptance | Harbor native | Validate the LoCoMo sample, project database decision, and reviewed Artifact lifecycle in one Harbor multi-step trial |
+| `terminal-bench-db-wal-recovery` | Bub ACP | Memory | Exercise model-driven, long-horizon Terminal-Bench capture and recall |
+| `codex-experience-recall` | Harbor Codex | Harbor native | Validate three-step recall of approved Experiences with a real Codex agent |
 
-## Run acceptance workloads
+The three `acceptance-suite` steps share one Harbor task environment and one agent setup, but each step uses an
+independent PowerContext scope. The acceptance agent runs only fixed Bub tool commands or public Client calls and does
+not require an LLM. The required SQLite and OceanBase CI jobs use the same `acceptance` selector.
 
-Against an existing PowerContext Server, run the default `acceptance` category:
+Terminal-Bench requires a model and corresponding credentials, so it is not part of acceptance. Codex recall is also
+explicitly opt-in. It uses Harbor's native Codex agent, and the Harbor task definition owns its 600-second agent
+timeout. Acceptance CI does not enable the Terminal workload or request its credentials.
+
+## Run acceptance
+
+Against an existing PowerContext Server:
 
 ```bash
 export POWERCONTEXT_CLIENT_SERVER_URL=http://127.0.0.1:8000
@@ -90,25 +55,24 @@ export POWERCONTEXT_BUB_BASE_URL=http://host-gateway:8000
 make harness-acceptance
 ```
 
-Selection uses the `acceptance` command's repeatable `--id` and `--category` options:
+With the fixed Compose harness:
 
 ```bash
-make harness-acceptance ARGS='--id locomo-support-group --id project-database-decision'
-
-make harness-acceptance ARGS='--category acceptance --category sample'
-```
-
-ID and category selection are additive. The same selectors work in the fixed Compose harness:
-
-```bash
-make harness-compose-acceptance
+make harness-compose-acceptance ARGS='--category acceptance'
 
 POWERCONTEXT_E2E_DATABASE=oceanbase \
-make harness-compose-acceptance \
-ARGS='--id locomo-support-group --id project-database-decision'
+make harness-compose-acceptance ARGS='--category acceptance'
 ```
 
-Each selected workload writes the same layout:
+Selection accepts repeatable workload IDs and categories. ID and category selectors are additive:
+
+```bash
+make harness-compose-acceptance ARGS='--id acceptance-suite'
+make harness-compose-acceptance ARGS='--category acceptance --category smoke'
+```
+
+Every workload produces the same output structure. Harbor trial, agent, verifier, and environment evidence is stored
+under `harbor-jobs/`:
 
 ```text
 <output>/<workload-id>/
@@ -118,80 +82,46 @@ Each selected workload writes the same layout:
   harbor-jobs/
 ```
 
-`replay.json` is a self-contained Pydantic observation. Its workload's `execution.type` identifies the `bub` adapter,
-and the remaining fields record the pre-execution Memory baseline and the instructions resolved by Harbor's ACP
-runner.
-`eval-report.json` uses
-`powercontext.e2e-evaluation/v1`. `report.md` is rendered from the report model with Marko. Native Harbor and ACP
-evidence remains under `harbor-jobs/`.
+`replay.json` is a self-contained Pydantic observation. It records the dataset checksum, agent identity, database
+identity, Harbor reward, native artifacts, and any Memory workload snapshots, captures, and probes.
+`eval-report.json` uses `powercontext.e2e-evaluation/v1`; `report.md` is a human-readable projection of the same result.
 
-## Long-horizon task
+## Model-backed workloads
 
-The Terminal-Bench manifest pins its task checksum, model requirement, step budget, capture cadence, recall probes,
-and acceptance thresholds. Bub and ACP server versions belong to the adapter runtime and are recorded in replay
-evidence. Harbor task and agent timeouts remain Harbor-owned; `BUB_MODEL_TIMEOUT_SECONDS` remains a native runtime
-setting. Run the task with the same command:
+Terminal-Bench retains its registry task, native verifier, and isolation boundary. The Bub agent installs the local
+PowerContext plugin and ACP server through the supported `uv tool install` path. Provide `BUB_MODEL` and the
+corresponding native Bub authentication settings at runtime:
 
 ```bash
-make harness-compose-acceptance ARGS='--category long-horizon'
-```
-
-This task requires privileged Linux containers, enough time and disk for the task image, a runtime-provided Bub
-model and credentials, and configured PowerContext generation and embedding inference. For example:
-
-```bash
-export OPENROUTER_API_KEY=replace-me
 export BUB_MODEL=openrouter:openai/gpt-5.4
-export BUB_API_KEY="$OPENROUTER_API_KEY"
-export POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL=openrouter:deepseek/deepseek-v4-pro
-export POWERCONTEXT_SERVER_INFERENCE_GENERATION_TIMEOUT_SECONDS=120
-export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL=openrouter:qwen/qwen3-embedding-4b
-export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_PROFILE_ID=openrouter-qwen3-embedding-4b-2560-unit
-export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION=2560
+export BUB_API_KEY=replace-me
 make harness-compose-acceptance ARGS='--category long-horizon'
 ```
 
-The runtime may authenticate Bub with its native `BUB_API_KEY`, provider-specific `BUB_<PROVIDER>_API_KEY`, or a
-Codex OAuth document at
-`${CODEX_HOME:-$HOME/.codex}/auth.json`. Authentication choice is not part of the workload manifest.
-The fixed Compose harness exposes `BUB_MODEL`, `BUB_API_KEY`, and `BUB_API_BASE`; direct harness execution also
-forwards other native `BUB_*` values without translating them.
+The task definition owns Harbor task and environment timeouts; Bub continues to own `BUB_MODEL_TIMEOUT_SECONDS`. The
+Memory evaluator independently checks checkpoints, grounded captures, and recall probes. The Harbor-native reward is
+diagnostic only.
 
-If the agent task container requires an outbound proxy, set `POWERCONTEXT_E2E_AGENT_PROXY_URL` to a URL reachable
-from that container. In the fixed nested-container harness, `host-gateway` addresses the harness container, so a
-proxy exposed there can be passed as `http://host-gateway:<port>`. The typed setting is also treated as a secret when
-evidence is written.
+Codex recall requires `CODEX_MODEL` and uses either a native Codex `auth.json` file or `OPENAI_API_KEY`:
 
-Agent setup uses Bub's supported installation path: `uv tool install` installs Bub with the local PowerContext plugin,
-then `bub install bub-acp-server` adds the ACP server to the same environment. Harbor uploads and runs its native ACP
-client. The Terminal-Bench task keeps its original image, setup, verifier, and isolation boundary. The harness ignores
-dataset CPU and memory limits because it evaluates Memory behavior rather than benchmark resource compliance. This
-also keeps the fixed harness usable in nested container runtimes that cannot create additional cgroups.
+```bash
+export CODEX_MODEL=gpt-5.4
+make harness-compose-acceptance ARGS='--id codex-experience-recall'
+```
 
-Long-horizon acceptance requires observable Memory behavior:
-
-- the manifest checksum matches Harbor's resolved task;
-- native ACP evidence exists;
-- completed Bub events were captured at the configured coverage;
-- a checkpoint created Memory in an initially empty scope;
-- new Memory cites sources captured during the run;
-- recall probes return prepared context.
-
-In-run context injections remain a reported metric, but they do not gate this single-session task because extraction
-may complete only at the final checkpoint. Harbor rewards are diagnostic scores and do not gate Memory acceptance.
+The harness does not translate provider settings. The Client consumes `POWERCONTEXT_CLIENT_*`, Bub consumes `BUB_*`,
+the PowerContext Bub integration consumes `POWERCONTEXT_BUB_*`, and Codex uses its own authentication file or
+`OPENAI_API_KEY`.
 
 ## Rescore evidence
 
-Every workload uses the same offline command:
+All workloads use the same offline entry point:
 
 ```bash
 REPLAY=.powercontext-e2e/bub/sqlite/acceptance/terminal-bench-db-wal-recovery/replay.json \
 make harness-rescore
 ```
 
-The harness does not mirror PowerContext Server, PowerContext Client, Bub, Harbor, or any-llm settings. Each component
-loads its native parameters, and the adapter only forwards the native values needed across the nested-container
-boundary. The Bub plugin uses Bub's Pydantic settings extension and accepts the same fields in the `powercontext`
-section of `bub.yml`. Native Bub API keys and the PowerContext Client token are redacted at every final evidence sink.
-CI scans evidence with TruffleHog before publishing it. Native ACP artifacts can contain arbitrary command output and
-should be reviewed before sharing.
+The final evidence sink removes configured Client, Bub, and Codex secrets. CI scans evidence with TruffleHog before
+publishing artifacts. Harbor-native artifacts can still contain arbitrary task output and require manual review before
+publication.

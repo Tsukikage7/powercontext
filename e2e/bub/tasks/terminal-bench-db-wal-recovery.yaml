@@ -8,12 +8,9 @@ dataset:
   version: "2.0"
   task_id: db-wal-recovery
   checksum: 01f470c86f3a1f7ce4d91bdf0aaaa89fa96a4124ac48617990e2735b5291913a
-execution:
-  type: bub
-  model: true
-  max_steps: 200
-  max_tokens: 16384
+agent: bub
 evaluation:
+  type: memory
   capture_events: true
   checkpoint_every_events: 5
   max_event_bytes: 8192

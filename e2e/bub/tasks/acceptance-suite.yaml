@@ -1,0 +1,20 @@
+schema: powercontext.e2e-task/v1
+id: acceptance-suite
+categories:
+  - acceptance
+  - smoke
+provenance:
+  source: benchmark/locomo/dataset/locomo10.json
+  revision: 4448275ea2c5cd0af5774d80aea7b05b5a16e1b996caf8554ca3d762a301ae84
+  selection: first-conversation-first-question/v1
+  case_ids:
+    - conv-26
+    - conv-26:q001
+    - D1
+dataset:
+  path: e2e/bub/harbor-tasks
+  task_id: acceptance-suite
+  checksum: 143fea090f01bd8f8f50b12f67d260ec849bd4bbf9b15b9654b9adcfd5b014a0
+agent: acceptance
+evaluation:
+  type: native

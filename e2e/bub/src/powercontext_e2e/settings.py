@@ -41,6 +41,14 @@ class ModelNotConfiguredError(RuntimeError):
         super().__init__(f"The following workloads require BUB_MODEL: {joined_ids}")
 
 
+class CodexNotConfiguredError(RuntimeError):
+    """Report Codex workloads without the executable or native authentication."""
+
+    def __init__(self, workload_ids: tuple[str, ...], reason: str) -> None:
+        joined_ids = ", ".join(workload_ids)
+        super().__init__(f"The following workloads require Codex ({reason}): {joined_ids}")
+
+
 class HarnessSettings(BaseSettings):
     """Configuration owned by the end-to-end harness."""
 
@@ -84,6 +92,7 @@ class HarnessSettings(BaseSettings):
             for name in environ
             if name == "BUB_API_KEY"
             or (name.startswith("BUB_") and name.endswith("_API_KEY"))
+            or name == "OPENAI_API_KEY"
             or name == "POWERCONTEXT_CLIENT_API_TOKEN"
         }
         values = {environ[name] for name in secret_names if environ[name]}

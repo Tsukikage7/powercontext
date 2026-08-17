@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
+from powercontext.http import ArtifactCandidate, ExperienceArtifact, SkillArtifact
 from pydantic import BaseModel, ConfigDict, Field
 
 from .catalog import E2ETask
@@ -46,6 +47,11 @@ class MemorySnapshot(EvidenceModel):
 class PreparedContextSnapshot(EvidenceModel):
     status: str
     content: str = ""
+
+
+class ClientErrorSnapshot(EvidenceModel):
+    status_code: int
+    code: str | None = None
 
 
 class CaptureRecord(EvidenceModel):
@@ -100,6 +106,16 @@ class ResolvedInstruction(EvidenceModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class ReviewedArtifactsObservation(EvidenceModel):
+    capability_families: tuple[str, ...] = ()
+    candidates: dict[str, ArtifactCandidate] = Field(default_factory=dict)
+    experiences: dict[str, ExperienceArtifact] = Field(default_factory=dict)
+    skills: dict[str, SkillArtifact] = Field(default_factory=dict)
+    contexts: dict[str, PreparedContextSnapshot] = Field(default_factory=dict)
+    inboxes: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    client_errors: dict[str, ClientErrorSnapshot] = Field(default_factory=dict)
+
+
 class TaskObservation(EvidenceModel):
     schema_: Literal["powercontext.e2e-evidence/v1"] = Field(
         default="powercontext.e2e-evidence/v1",
@@ -110,12 +126,12 @@ class TaskObservation(EvidenceModel):
     task: E2ETask
     status: Literal["completed", "failed"]
     errors: tuple[str, ...] = ()
-    harbor: HarborTrialObservation
+    harbor: HarborTrialObservation = Field(default_factory=HarborTrialObservation)
     capture_records: tuple[CaptureRecord, ...] = ()
     native_artifacts: tuple[NativeArtifact, ...] = ()
     resolved_instructions: tuple[ResolvedInstruction, ...] = ()
-    memory_before: MemorySnapshot
-    memory_after: MemorySnapshot
+    memory_before: MemorySnapshot = Field(default_factory=MemorySnapshot)
+    memory_after: MemorySnapshot = Field(default_factory=MemorySnapshot)
     probes: tuple[RecallProbeObservation, ...] = ()
 
 

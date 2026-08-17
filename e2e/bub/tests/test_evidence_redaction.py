@@ -48,7 +48,7 @@ def test_final_evidence_redacts_configured_secrets_and_preserves_the_public_sche
     monkeypatch.setenv("BUB_API_KEY", sensitive_value)
     repository = Path(__file__).resolve().parents[3]
     task = next(
-        task for task in load_tasks(repository / "e2e" / "bub" / "tasks") if task.id == "project-database-decision"
+        task for task in load_tasks(repository / "e2e" / "bub" / "tasks") if task.id == "terminal-bench-db-wal-recovery"
     )
     recorded_at = datetime(2026, 8, 13, tzinfo=UTC)
     observation = TaskObservation(
@@ -101,7 +101,7 @@ def test_final_evidence_redacts_configured_secrets_and_preserves_the_public_sche
     replay = json.loads(artifacts["replay.json"])
     evaluation = json.loads(artifacts["eval-report.json"])
     assert replay["schema"] == "powercontext.e2e-evidence/v1"
-    assert replay["task"]["execution"]["type"] == "bub"
+    assert replay["task"]["agent"] == "bub"
     assert replay["resolved_instructions"][0]["content"] == "Use credential [REDACTED] to complete the task."
     assert evaluation["schema"] == "powercontext.e2e-evaluation/v1"
-    assert evaluation["cases"][0]["attributes"]["execution_adapter"] == "bub"
+    assert evaluation["cases"][0]["attributes"]["agent"] == "bub"

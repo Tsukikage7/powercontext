@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Annotated, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -37,19 +37,6 @@ class HarborDatasetSpec(CatalogModel):
         return self
 
 
-class BubExecutionSpec(CatalogModel):
-    native_artifact_names: ClassVar[frozenset[str]] = frozenset({
-        "acp-summary.json",
-        "acp-events.jsonl",
-        "trajectory.json",
-    })
-
-    type: Literal["bub"] = "bub"
-    model: bool = False
-    max_steps: int = Field(default=50, ge=1, le=200)
-    max_tokens: int = Field(default=16384, ge=256)
-
-
 class CaptureThresholds(CatalogModel):
     capture_coverage: float = Field(default=0, ge=0, le=1)
     groundedness: float = Field(default=0, ge=0, le=1)
@@ -64,6 +51,7 @@ class RecallProbeSpec(CatalogModel):
 
 
 class MemoryEvaluationSpec(CatalogModel):
+    type: Literal["memory"] = "memory"
     capture_events: bool = False
     checkpoint_every_events: int = Field(default=5, ge=1, le=100)
     max_event_bytes: int = Field(default=8192, ge=512, le=32768)
@@ -80,14 +68,18 @@ class MemoryEvaluationSpec(CatalogModel):
         return self
 
 
+class NativeEvaluationSpec(CatalogModel):
+    type: Literal["native"] = "native"
+
+
 class E2ETask(CatalogModel):
     schema_: Literal["powercontext.e2e-task/v1"] = Field(alias="schema")
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
     categories: tuple[str, ...] = Field(min_length=1)
     provenance: Provenance | None = None
     dataset: HarborDatasetSpec
-    execution: BubExecutionSpec
-    evaluation: MemoryEvaluationSpec
+    agent: Literal["acceptance", "bub", "codex"]
+    evaluation: Annotated[MemoryEvaluationSpec | NativeEvaluationSpec, Field(discriminator="type")]
 
 
 class TaskSelectionError(ValueError):
@@ -129,6 +121,14 @@ def select_tasks(
     return tuple(
         task for task in tasks if task.id in requested_ids or requested_categories.intersection(task.categories)
     )
+
+
+def runtime_requirement(task: E2ETask) -> Literal["none", "bub-model", "codex"]:
+    if task.agent == "bub":
+        return "bub-model"
+    if task.agent == "codex":
+        return "codex"
+    return "none"
 
 
 def _validate_provenance(task: E2ETask) -> None:

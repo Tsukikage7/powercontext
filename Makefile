@@ -32,13 +32,6 @@ unit-test: ## Run tests that do not cross the Server boundary end to end.
 e2e-test: ## Run CLI to Client SDK to Server end-to-end tests.
 	@uv run python -m pytest tests/e2e
 
-.PHONY: real-e2e-test
-real-e2e-test: ## Run opt-in real Codex Experience/Skill tests; REAL_E2E_MODE defaults to all.
-	@uv run python -m pytest -s tests/e2e/real_experience_skill --run-real-e2e \
-		--real-e2e-mode="$${REAL_E2E_MODE:-all}" \
-		--real-codex-timeout="$${REAL_CODEX_TIMEOUT:-600}" \
-		--real-e2e-env-file="$${REAL_E2E_ENV_FILE:-.env}"
-
 .PHONY: harness-sync
 harness-sync: ## Install the Bub replay harness environment.
 	@uv sync --project e2e/bub
@@ -47,7 +40,7 @@ harness-sync: ## Install the Bub replay harness environment.
 harness-check: ## Validate the Bub replay harness and committed scenarios.
 	@uv run ruff check e2e/bub
 	@uv run ruff format --check e2e/bub
-	@uv run ty check --project e2e/bub --python e2e/bub/.venv e2e/bub/src integrations/bub/src
+	@uv run ty check --project e2e/bub --python e2e/bub/.venv --python-version 3.12 e2e/bub/src integrations/bub/src
 	@uv run --project e2e/bub python -m pytest e2e/bub/tests
 	@uv run --project e2e/bub powercontext-e2e --help >/dev/null
 

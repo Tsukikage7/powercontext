@@ -1,3 +1,8 @@
+!!! warning "实现说明"
+
+    当前实现使用 Harbor 作为唯一执行边界。Catalog 现在只建模 dataset、agent 与 evaluation；下文关于 execution spec
+    compatibility 的设计仅作为提案历史背景保留。
+
 - Proposal Name: `unified_workloads_and_long_horizon_memory_evaluation`
 - Start Date: 2026-08-13
 - RFC PR: [oceanbase/powercontext#1229](https://github.com/oceanbase/powercontext/pull/1229)

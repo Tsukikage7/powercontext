@@ -47,11 +47,11 @@ jobs:
       - name: Check out
         uses: actions/checkout@v7
 
-      - name: Run deterministic scenarios
+      - name: Run shared deterministic acceptance
         env:
           POWERCONTEXT_E2E_DATABASE: ${{ matrix.database }}
           POWERCONTEXT_E2E_OUTPUT: ${{ github.workspace }}/.powercontext-e2e/${{ matrix.database }}/acceptance
-        run: make harness-compose-acceptance
+        run: make harness-compose-acceptance ARGS='--category acceptance'
 
       - name: Scan replay evidence
         id: evidence_scan

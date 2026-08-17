@@ -1,0 +1,12 @@
+schema: powercontext.e2e-task/v1
+id: codex-experience-recall
+categories:
+  - codex
+  - experience-recall
+dataset:
+  path: e2e/bub/harbor-tasks
+  task_id: codex-experience-recall
+  checksum: ffe248ca77218afc17e5b01f34d56dd0fc5c7c7247677395b2107475fc2ee779
+agent: codex
+evaluation:
+  type: native

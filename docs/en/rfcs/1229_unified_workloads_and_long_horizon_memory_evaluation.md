@@ -1,3 +1,8 @@
+!!! warning "Implementation note"
+
+    The current implementation uses Harbor as the single execution boundary. The catalog now models only dataset,
+    agent, and evaluation; the execution-spec compatibility design below is retained as historical proposal context.
+
 - Proposal Name: `unified_workloads_and_long_horizon_memory_evaluation`
 - Start Date: 2026-08-13
 - RFC PR: [oceanbase/powercontext#1229](https://github.com/oceanbase/powercontext/pull/1229)
