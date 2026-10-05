@@ -12,40 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import BaseModel, ValidationError
 
+import powercontext.http as http_models
 from powercontext.http import (
     AcknowledgeHandoffRequest,
     ActivateHandoffRequest,
     ApproveArtifactCandidateRequest,
     ArtifactCandidate,
+    ArtifactCreated,
     ArtifactReference,
+    ArtifactRevision,
     CaptureContentSourceRequest,
     CaptureContentSourceResponse,
     CommitHandoffRequest,
     CommittedHandoff,
     ContinueHandoffRequest,
+    CreateArtifactRequest,
+    CreateMemoryArtifactContent,
+    CreateMemoryArtifactEntry,
+    CreateMemoryArtifactRequest,
+    CreateSourceRequest,
     CreateWorkContractRequest,
+    EntryChangeOperation,
     ExternalSkillResolution,
     FinalizeHandoffRequest,
+    FlushTopicMemoryRequest,
+    FlushTopicMemoryResponse,
     GeneratedCandidateResponse,
     GenerateExperienceRequest,
     GenerateSkillRequest,
+    GetMemoryCapacityRequest,
     GetMemoryEntryRequest,
     GetStatsRequest,
+    GetTopicMemoryRequest,
     HandoffAcknowledgement,
     HandoffActivation,
     HandoffCurrentWorkRequest,
     HandoffDraft,
     HandoffResolution,
     ImportExternalSkillRequest,
+    ListArtifactsRequest,
     ListExternalSkillsRequest,
     ListExternalSkillsResponse,
     ListMemoryEntriesRequest,
+    MemoryCapacity,
     PrepareContextRequest,
     PreparedContext,
     PreparedHandoff,
@@ -60,8 +77,13 @@ from powercontext.http import (
     ScanExternalSkillsResponse,
     ScopedStats,
     SearchMemoryRequest,
+    SearchTopicMemoryRequest,
+    SearchTopicMemoryResponse,
     SkillProposal,
     SkillValidationItem,
+    SourceRecord,
+    SourceType,
+    SourceTypeReference,
     StatsPeriod,
     WorkSourceReceipt,
 )
@@ -72,40 +94,85 @@ from powercontext.http._generated.operations import (
     CAPTURE_CONTENT_SOURCE,
     COMMIT_HANDOFF,
     CONTINUE_HANDOFF,
+    CREATE_ARTIFACT,
+    CREATE_REMOTE_SKILL_TARGET,
+    CREATE_SOURCE,
     CREATE_WORK_CONTRACT,
+    DOWNLOAD_REMOTE_SKILL_PACKAGE,
+    DOWNLOAD_SKILL_PACKAGE,
+    ENROLL_REMOTE_SKILL_TARGET,
     FINALIZE_HANDOFF,
     FLUSH_MEMORY,
+    FLUSH_TOPIC_MEMORY,
     GENERATE_EXPERIENCE,
     GENERATE_SKILL,
+    GET_ARTIFACT,
     GET_ARTIFACT_CANDIDATE,
+    GET_ARTIFACT_REVISION,
     GET_EXPERIENCE,
+    GET_MEMORY_CAPACITY,
     GET_MEMORY_ENTRY,
     GET_READINESS,
     GET_SKILL,
+    GET_SKILL_PACKAGE_MANIFEST,
+    GET_SOURCE,
     GET_STATS,
+    GET_TOPIC_MEMORY,
     HANDOFF_CURRENT_WORK,
     IMPORT_EXTERNAL_SKILL,
     LIST_ARTIFACT_CANDIDATES,
+    LIST_ARTIFACTS,
     LIST_EXTERNAL_SKILLS,
+    LIST_MANAGED_SKILLS,
     LIST_MEMORY_CHANGES,
     LIST_MEMORY_ENTRIES,
+    LIST_REMOTE_SKILL_TARGETS,
     PREPARE_CONTEXT,
     PREPARE_HANDOFF,
     PROPOSE_EXPERIENCE,
     PROPOSE_SKILL,
+    PROPOSE_SKILL_PACKAGE,
+    PUBLISH_ARTIFACT,
+    PUBLISH_REMOTE_SKILL,
+    RECONCILE_REMOTE_SKILLS,
+    RECORD_REMOTE_SKILL_RECEIPT,
+    RECORD_SKILL_USAGE,
     RECORD_TASK_OUTCOME,
     REJECT_ARTIFACT_CANDIDATE,
     REMEMBER_MEMORY,
+    RENAME_REMOTE_SKILL_TARGET,
+    REPLACE_ARTIFACT,
     RESOLVE_EXTERNAL_SKILL,
     RETIRE_MEMORY_ENTRY,
     REVISE_ARTIFACT_CANDIDATE,
     REVISE_MEMORY_ENTRY,
+    REVOKE_REMOTE_SKILL_TARGET,
     SCAN_EXTERNAL_SKILLS,
     SEARCH_MEMORY,
+    SEARCH_TOPIC_MEMORY,
+    SUBMIT_SOURCE_OBSERVATION,
+    UNPUBLISH_REMOTE_SKILL,
+    UPDATE_SKILL_LIFECYCLE,
 )
 from powercontext.server.app import create_app
 from powercontext.server.factory import create_server_app
 from powercontext.server.settings import HandoffReportConfig, ServerSettings
+
+
+def test_http_public_exports_resolve() -> None:
+    assert [name for name in http_models.__all__ if not hasattr(http_models, name)] == []
+
+
+def test_http_star_import_resolves_every_public_export() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "from powercontext.http import *"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
 
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "openapi" / "powercontext.yaml"
 
@@ -117,21 +184,88 @@ def test_contract_uses_the_namespaced_request_id_header() -> None:
     assert "X-Request-ID" not in contract
 
 
-def test_contract_declares_optional_bearer_authentication() -> None:
+def test_contract_declares_server_and_remote_target_bearer_boundaries() -> None:
     contract = yaml.safe_load(CONTRACT_PATH.read_text())
 
     assert contract["security"] == [{"BearerAuth": []}, {}]
     assert contract["components"]["securitySchemes"]["BearerAuth"] == {
         "type": "http",
         "scheme": "bearer",
-        "description": "Static bearer token used when local Server authentication is enabled.",
+        "description": "Bearer credential resolved to an opaque authenticated Principal by the Server deployment.",
+    }
+    assert contract["components"]["securitySchemes"]["TargetBearerAuth"] == {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Per-target credential issued once during remote Receiver enrollment.",
+    }
+    public_paths = {"/health/live", "/health/ready", "/v1/skill/remote/target/enroll"}
+    target_paths = {
+        "/v1/skill/remote/reconcile",
+        "/v1/skill/remote/package/download",
+        "/v1/skill/remote/receipt",
     }
     for path, path_item in contract["paths"].items():
         operation = next(iter(path_item.values()))
-        if path.startswith("/health/"):
+        if path in public_paths:
             assert operation["security"] == []
+        elif path in target_paths:
+            assert operation["responses"]["401"] == {"$ref": "#/components/responses/Unauthorized"}
+            assert operation["security"] == [{"TargetBearerAuth": []}]
         else:
             assert operation["responses"]["401"] == {"$ref": "#/components/responses/Unauthorized"}
+            assert operation["responses"]["403"] == {"$ref": "#/components/responses/Forbidden"}
+            assert "x-powercontext-access" in operation
+
+
+def test_every_access_protected_operation_declares_the_unavailable_response() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+
+    for path_item in contract["paths"].values():
+        operation = next(iter(path_item.values()))
+        if "x-powercontext-access" in operation:
+            assert operation["responses"]["503"] == {"$ref": "#/components/responses/Unavailable"}
+
+
+def test_source_ingestion_operations_preserve_the_access_boundary() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    expected = {
+        "/v1/source-definitions/register": {
+            "action": "server.admin",
+            "resource": {"type": "server"},
+        },
+        "/v1/connector-checkpoints/get": {
+            "action": "scope.contribute",
+            "resource": {"type": "scope", "scope-id-from": "binding.scope_id"},
+        },
+        "/v1/source-observations": {
+            "action": "scope.contribute",
+            "resource": {"type": "scope", "scope-id-from": "scope_id"},
+        },
+        "/v1/connector-checkpoints/commit": {
+            "action": "scope.contribute",
+            "resource": {"type": "scope", "scope-id-from": "binding.scope_id"},
+        },
+    }
+
+    for path, requirement in expected.items():
+        operation = contract["paths"][path]["post"]
+        assert operation["x-powercontext-access"] == requirement
+
+
+def test_access_contract_uses_compound_checks_and_generic_binding_replacement() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    paths = contract["paths"]
+    schemas = contract["components"]["schemas"]
+
+    assert "/v1/access/check-batch" not in paths
+    assert "/v1/access/bindings/reassign-handoff-receiver" not in paths
+    assert paths["/v1/access/check"]["post"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AccessCheckResponse"
+    }
+    assert schemas["AccessCheckRequest"]["required"] == ["match", "requirements"]
+    assert schemas["AccessRequirementMatch"]["enum"] == ["all", "any"]
+    assert paths["/v1/access/bindings/replace"]["post"]["operationId"] == "replace_access_binding"
+    assert schemas["AccessRoleCardinality"]["enum"] == ["many_per_resource", "one_per_resource"]
 
 
 def test_capabilities_report_semantics_without_runtime_tuning_values() -> None:
@@ -140,6 +274,7 @@ def test_capabilities_report_semantics_without_runtime_tuning_values() -> None:
     properties = schemas["Capabilities"]["properties"]
 
     assert set(properties) == {
+        "artifact_dreaming",
         "source_types",
         "artifact_families",
         "memory_extraction",
@@ -149,6 +284,7 @@ def test_capabilities_report_semantics_without_runtime_tuning_values() -> None:
         "handoff_generation",
         "search_modes",
         "context_versions",
+        "prompts",
     }
     assert "CapabilityLimit" not in schemas
 
@@ -163,14 +299,72 @@ def test_capture_operation_declares_its_typed_accepted_exchange() -> None:
     assert CAPTURE_CONTENT_SOURCE.success_status == 202
 
 
-def test_stats_operation_exposes_dashboard_ready_scoped_values() -> None:
-    assert GET_STATS.method == "GET"
+def test_topic_memory_operations_use_strict_public_shapes_without_retrieval_controls() -> None:
+    assert FLUSH_TOPIC_MEMORY.request_type is FlushTopicMemoryRequest
+    assert FLUSH_TOPIC_MEMORY.response_type is FlushTopicMemoryResponse
+    assert SEARCH_TOPIC_MEMORY.request_type is SearchTopicMemoryRequest
+    assert SEARCH_TOPIC_MEMORY.response_type is SearchTopicMemoryResponse
+    assert GET_TOPIC_MEMORY.request_type is GetTopicMemoryRequest
+    assert (
+        FLUSH_TOPIC_MEMORY.success_status
+        == SEARCH_TOPIC_MEMORY.success_status
+        == GET_TOPIC_MEMORY.success_status
+        == 200
+    )
+    assert set(SearchTopicMemoryRequest.model_fields) == {"scope_id", "query", "limit"}
+
+    with pytest.raises(ValidationError):
+        SearchTopicMemoryRequest.model_validate({"scope_id": "scope-a", "query": "query", "mode": "fts"})
+
+
+def test_source_observation_contract_uses_explicit_connector_scope_and_captured_values() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    schemas = contract["components"]["schemas"]
+
+    request = schemas["SubmitSourceObservationRequest"]
+    observation = schemas["SourceObservation"]
+
+    assert set(request["properties"]) == {"scope_id", "observation"}
+    assert request["properties"]["observation"] == {"$ref": "#/components/schemas/SourceObservation"}
+    assert observation["properties"]["materialization"]["enum"] == ["captured"]
+    assert "ProjectedSource" not in schemas
+    assert SUBMIT_SOURCE_OBSERVATION.scope_mode == "none"
+
+
+def test_standard_skill_operations_preserve_agent_and_receiver_scope_boundaries() -> None:
+    agent_scoped = (
+        LIST_MANAGED_SKILLS,
+        UPDATE_SKILL_LIFECYCLE,
+        GET_SKILL_PACKAGE_MANIFEST,
+        DOWNLOAD_SKILL_PACKAGE,
+        PROPOSE_SKILL_PACKAGE,
+        RECORD_SKILL_USAGE,
+        LIST_REMOTE_SKILL_TARGETS,
+        CREATE_REMOTE_SKILL_TARGET,
+        RENAME_REMOTE_SKILL_TARGET,
+        REVOKE_REMOTE_SKILL_TARGET,
+        PUBLISH_REMOTE_SKILL,
+        UNPUBLISH_REMOTE_SKILL,
+    )
+    receiver_scoped = (
+        ENROLL_REMOTE_SKILL_TARGET,
+        RECONCILE_REMOTE_SKILLS,
+        DOWNLOAD_REMOTE_SKILL_PACKAGE,
+        RECORD_REMOTE_SKILL_RECEIPT,
+    )
+
+    assert {operation.scope_mode for operation in agent_scoped} == {"current"}
+    assert {operation.scope_mode for operation in receiver_scoped} == {"none"}
+
+
+def test_stats_operation_exposes_dashboard_ready_selection_values() -> None:
+    assert GET_STATS.method == "POST"
     assert GET_STATS.path == "/v1/stats"
     assert GET_STATS.request_type is GetStatsRequest
-    assert GET_STATS.request_location == "query"
+    assert GET_STATS.request_location == "body"
     assert GET_STATS.response_type is ScopedStats
     assert GET_STATS.success_status == 200
-    assert GetStatsRequest(scope_id="project").period is StatsPeriod.FIELD_30D
+    assert GetStatsRequest.model_validate({"selection": {"mode": "all"}}).period is StatsPeriod.FIELD_30D
 
     contract = yaml.safe_load(CONTRACT_PATH.read_text())
     schemas = contract["components"]["schemas"]
@@ -179,16 +373,37 @@ def test_stats_operation_exposes_dashboard_ready_scoped_values() -> None:
     usage_value = schemas["ModelUsageValue"]
     recall = schemas["RecallTokenStatistics"]
 
-    operation = contract["paths"]["/v1/stats"]["get"]
-    assert "requestBody" not in operation
-    assert [parameter["name"] for parameter in operation["parameters"]] == ["scope_id", "period"]
-    assert set(stats["properties"]) == {"scope_id", "as_of", "inventory", "usage", "recall"}
+    operation = contract["paths"]["/v1/stats"]["post"]
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/GetStatsRequest"
+    }
+    assert set(stats["properties"]) == {
+        "selection",
+        "scope_ids",
+        "as_of",
+        "inventory",
+        "usage",
+        "recall",
+        "by_scope",
+    }
     assert usage["properties"]["by_purpose"]["maxItems"] == 16
     assert usage["properties"]["daily"]["maxItems"] == 30
     assert usage_value["properties"]["input_tokens"]["nullable"] is True
     assert usage_value["properties"]["output_tokens"]["nullable"] is True
     assert recall["properties"]["estimator"]["nullable"] is True
     assert recall["properties"]["daily"]["maxItems"] == 30
+
+
+def test_scope_resource_operations_separate_identity_from_mutable_metadata() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    path_item = contract["paths"]["/v1/scopes/{scope_id}"]
+    assert path_item["get"]["parameters"][0]["in"] == "path"
+    assert "requestBody" not in path_item["get"]
+    assert path_item["put"]["parameters"][0]["in"] == "path"
+    assert path_item["put"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UpdateScopeRequest"
+    }
+    assert "scope_id" not in contract["components"]["schemas"]["UpdateScopeRequest"]["properties"]
 
 
 def test_memory_operations_use_family_prefixed_paths_and_typed_requests() -> None:
@@ -212,6 +427,45 @@ def test_memory_search_declares_the_revision_conflict_response() -> None:
     assert SEARCH_MEMORY.responses[409] == {"$ref": "#/components/responses/Conflict"}
 
 
+def test_handoff_access_metadata_resolves_business_revision_to_logical_authorization() -> None:
+    assert CONTINUE_HANDOFF.access is not None
+    assert CONTINUE_HANDOFF.access.action is None
+    assert CONTINUE_HANDOFF.access.resolver == "continue_handoff_access"
+    assert ACKNOWLEDGE_HANDOFF.access is not None
+    assert ACKNOWLEDGE_HANDOFF.access.action is None
+    assert ACKNOWLEDGE_HANDOFF.access.resolver == "acknowledge_handoff_access"
+
+
+def test_access_contract_uses_logical_resources_and_generic_skill_read_access() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    schemas = contract["components"]["schemas"]
+
+    assert schemas["AccessResourceType"]["enum"] == ["server", "scope", "artifact"]
+    assert "access.self" not in schemas["AccessAction"]["enum"]
+    artifact = schemas["ArtifactAccessResource"]
+    assert artifact["required"] == ["type", "scope_id", "identity"]
+    assert set(artifact["properties"]) == {"type", "scope_id", "identity", "selector"}
+    selector = schemas["MemoryEntryAccessSelector"]
+    assert selector["required"] == ["type", "entry_id"]
+    assert set(selector["properties"]) == {"type", "entry_id"}
+    identity = schemas["AccessArtifactIdentity"]
+    assert identity["required"] == ["family", "artifact_id"]
+    assert set(identity["properties"]) == {"family", "artifact_id"}
+    assert set(schemas["AccessDecision"]["properties"]) == {"allowed", "reason_code"}
+    assert schemas["AccessBinding"]["properties"]["policy_revision"]["maxLength"] == 64
+    assert schemas["AccessAuditEvent"]["properties"]["policy_revision"]["maxLength"] == 64
+
+    assert GET_MEMORY_ENTRY.access is not None
+    assert GET_MEMORY_ENTRY.access.resolver == "exact_memory_access"
+    assert GET_EXPERIENCE.access is not None
+    assert GET_EXPERIENCE.access.resolver == "exact_experience_access"
+    assert GET_SKILL.access is not None
+    assert GET_SKILL.access.resolver == "exact_skill_access"
+    assert PUBLISH_ARTIFACT.path == "/v1/artifact-publications"
+    assert PUBLISH_ARTIFACT.access is not None
+    assert PUBLISH_ARTIFACT.access.resolver == "publish_artifact_access"
+
+
 def test_prepared_context_is_a_generic_typed_operation_outside_the_mcp_memory_tools() -> None:
     assert PREPARE_CONTEXT.path == "/v1/context/prepare"
     assert PREPARE_CONTEXT.request_type is PrepareContextRequest
@@ -220,7 +474,13 @@ def test_prepared_context_is_a_generic_typed_operation_outside_the_mcp_memory_to
 
     contract = yaml.safe_load(CONTRACT_PATH.read_text())
     schemas = contract["components"]["schemas"]
-    assert set(schemas["PrepareContextRequest"]["properties"]) == {"scope_id", "query", "max_bytes"}
+    assert set(schemas["PrepareContextRequest"]["properties"]) == {
+        "scope_id",
+        "query",
+        "max_bytes",
+        "assembly",
+        "include_code",
+    }
     assert set(schemas["PreparedContext"]["properties"]) == {"schema", "status", "content", "content_bytes"}
     assert not {"memory", "mode", "selection"} & set(schemas["PreparedContext"]["properties"])
 
@@ -257,12 +517,17 @@ def test_experience_skill_and_review_operations_are_typed_and_family_routed() ->
 
     contract = yaml.safe_load(CONTRACT_PATH.read_text())
     schemas = contract["components"]["schemas"]
-    assert set(schemas["ExperienceProposal"]["properties"]) == {"situation", "action", "outcome", "lesson"}
+    assert set(schemas["ExperienceProposal"]["properties"]) == {"situation", "action", "outcome", "lesson", "failure"}
     assert set(schemas["SkillProposal"]["properties"]) == {
         "name",
         "description",
         "instructions",
         "validation",
+        "package",
+        "license",
+        "compatibility",
+        "metadata",
+        "allowed_tools",
     }
     assert schemas["ListArtifactCandidatesRequest"]["properties"]["limit"] == {
         "type": "integer",
@@ -481,6 +746,230 @@ def test_generated_transport_rejects_values_outside_openapi(
         model.model_validate(value)
 
 
+def test_base_access_contract_includes_revision_history_and_tags() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    paths = contract["paths"]
+
+    expected_operations = {
+        ("/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}/tags", "get"): "get_artifact_tags",
+        ("/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}/tags", "put"): "replace_artifact_tags",
+        (
+            "/v1/scopes/{scope_id}/artifacts/memory/{artifact_id}/entries/{entry_id}/tags",
+            "get",
+        ): "get_memory_entry_tags",
+        (
+            "/v1/scopes/{scope_id}/artifacts/memory/{artifact_id}/entries/{entry_id}/tags",
+            "put",
+        ): "replace_memory_entry_tags",
+        ("/v1/scopes/{scope_id}/sources", "post"): "create_source",
+        ("/v1/scopes/{scope_id}/sources", "get"): "list_sources",
+        ("/v1/scopes/{scope_id}/sources/{source_type}/{source_id}", "get"): "get_source",
+        ("/v1/scopes/{scope_id}/artifacts", "post"): "create_artifact",
+        ("/v1/scopes/{scope_id}/artifacts/{family}", "get"): "list_artifacts",
+        ("/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}", "get"): "get_artifact",
+        ("/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}", "put"): "replace_artifact",
+        ("/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}/revisions", "get"): "list_artifact_revisions",
+        (
+            "/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}/revisions/{revision}",
+            "get",
+        ): "get_artifact_revision",
+    }
+    actual_operations = {
+        (path, method): operation["operationId"]
+        for path, path_item in paths.items()
+        if path.startswith("/v1/scopes/{scope_id}/sources") or path.startswith("/v1/scopes/{scope_id}/artifacts")
+        for method, operation in path_item.items()
+    }
+    assert actual_operations == expected_operations
+    assert not any(
+        operation_id in {"search_sources", "search_artifacts", "delete_artifact", "list_scopes"}
+        for operation_id in actual_operations.values()
+    )
+    assert not any("search-results" in path for path in paths)
+
+
+def test_scope_pagination_declares_cursor_failures() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    responses = contract["paths"]["/v1/scopes"]["get"]["responses"]
+
+    assert responses["400"] == {"$ref": "#/components/responses/BadRequest"}
+    assert responses["410"] == {"$ref": "#/components/responses/CursorExpired"}
+
+
+def test_base_access_create_requests_leave_identity_generation_to_the_server() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    schemas = contract["components"]["schemas"]
+
+    source = schemas["CreateSourceRequest"]
+    assert source["required"] == ["content"]
+    assert set(source["properties"]) == {"source_type", "content"}
+    assert source["properties"]["source_type"]["enum"] == ["content"]
+    assert source["properties"]["source_type"]["default"] == "content"
+
+    artifact = schemas["CreateArtifactRequest"]
+    assert len(artifact["oneOf"]) == 7
+    assert artifact["discriminator"]["propertyName"] == "family"
+    prompt_request = schemas["CreatePromptArtifactRequest"]
+    assert prompt_request["required"] == ["family", "prompt_key", "content"]
+    assert set(prompt_request["properties"]) == {"family", "prompt_key", "content"}
+    for name in (
+        "CreateMemoryArtifactRequest",
+        "CreateExperienceArtifactRequest",
+        "CreateSkillArtifactRequest",
+        "CreateHandoffArtifactRequest",
+    ):
+        family_request = schemas[name]
+        assert family_request["required"] == ["family", "content"]
+        assert set(family_request["properties"]) == {"family", "content"}
+        assert not {"scope_id", "source_id", "artifact_id"} & set(family_request["properties"])
+
+    assert CreateSourceRequest(content="evidence").source_type is SourceType.CONTENT
+    assert (
+        CreateArtifactRequest(
+            root=CreateMemoryArtifactRequest(
+                family="memory",
+                content=CreateMemoryArtifactContent(
+                    entries=[CreateMemoryArtifactEntry(kind="preference", text="Use Chinese")]
+                ),
+            )
+        ).root.family
+        == "memory"
+    )
+    memory_entry = schemas["CreateMemoryArtifactEntry"]["properties"]
+    assert memory_entry["kind"]["minLength"] == 1
+    assert memory_entry["kind"]["maxLength"] == 128
+    for recommended in ("fact", "preference", "decision", "constraint", "working_note"):
+        assert recommended in memory_entry["kind"]["description"]
+    assert (
+        CreateMemoryArtifactEntry(kind="business_specific", text="Keep the caller's kind").kind == "business_specific"
+    )
+    for invalid_kind in (" ", "x" * 129):
+        with pytest.raises(ValidationError):
+            CreateMemoryArtifactEntry(kind=invalid_kind, text="invalid")
+    for model, payload in (
+        (CreateSourceRequest, {"scope_id": "scope", "content": "evidence"}),
+        (CreateSourceRequest, {"source_id": "source", "content": "evidence"}),
+        (CreateArtifactRequest, {"artifact_id": "artifact", "family": "memory", "content": {}}),
+    ):
+        with pytest.raises(ValidationError):
+            model.model_validate(payload)
+
+
+def test_artifact_collection_accepts_pagination_and_exact_tag_filters() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    paths = contract["paths"]
+
+    assert "/v1/scopes/{scope_id}/sources/{source_type}" not in paths
+    parameters = paths["/v1/scopes/{scope_id}/artifacts/{family}"]["get"]["parameters"]
+    assert {parameter["name"] for parameter in parameters if parameter["in"] == "query"} == {
+        "limit",
+        "cursor",
+        "tag",
+        "tag_match",
+    }
+    assert ListArtifactsRequest().model_dump() == {"limit": 50, "cursor": None, "tag": None, "tag_match": None}
+
+
+def test_standard_artifact_reads_share_topic_memory_family_and_display_metadata() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    paths = contract["paths"]
+    read_paths = (
+        "/v1/scopes/{scope_id}/artifacts/{family}",
+        "/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}",
+        "/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}/revisions",
+        "/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}/revisions/{revision}",
+    )
+    for path in read_paths:
+        family = next(parameter for parameter in paths[path]["get"]["parameters"] if parameter["name"] == "family")
+        assert family["schema"] == {"$ref": "#/components/schemas/ArtifactReadFamily"}
+    assert "topic-memory" in contract["components"]["schemas"]["ArtifactReadFamily"]["enum"]
+    assert "topic-memory" in contract["components"]["schemas"]["BaseArtifactFamily"]["enum"]
+    item = http_models.ArtifactCollectionItem.model_validate({
+        "scope_id": "scope-a",
+        "family": "topic-memory",
+        "artifact_id": "topic-1",
+        "revision": 2,
+        "sources": [],
+        "artifacts": [],
+        "content_digest": f"sha256:{'0' * 64}",
+        "title": "A topic",
+        "summary": "A summary",
+        "published_at": "2026-09-10T00:00:00Z",
+        "source_count": 2,
+    })
+    assert item.family.value == "topic-memory"
+    assert item.title == "A topic"
+    assert item.source_count == 2
+
+
+def test_base_access_uses_a_dedicated_source_type_reference() -> None:
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    schemas = contract["components"]["schemas"]
+
+    assert set(schemas["SourceReference"]["properties"]) == {"name", "source_id"}
+    assert set(schemas["SourceTypeReference"]["properties"]) == {"source_type", "source_id"}
+    assert schemas["SourcePage"]["required"] == ["items", "next_cursor"]
+    assert schemas["SourcePage"]["properties"]["items"]["items"] == {"$ref": "#/components/schemas/SourceRecord"}
+    for schema_name in ("ArtifactCreated", "ArtifactRevision", "ArtifactCollectionItem"):
+        assert schemas[schema_name]["properties"]["sources"]["items"] == {
+            "$ref": "#/components/schemas/SourceTypeReference"
+        }
+    for request_name in (
+        "CreateMemoryArtifactRequest",
+        "CreateExperienceArtifactRequest",
+        "CreateSkillArtifactRequest",
+        "CreateHandoffArtifactRequest",
+        "ReplaceMemoryArtifactRequest",
+        "ReplaceExperienceArtifactRequest",
+        "ReplaceSkillArtifactRequest",
+        "ReplaceHandoffArtifactRequest",
+    ):
+        assert "sources" not in schemas[request_name]["properties"]
+    for source_type in ("content", "note"):
+        for source_id in ("source", "用户偏好", "release notes"):
+            reference = SourceTypeReference(source_type=source_type, source_id=source_id)
+            assert reference.model_dump() == {"source_type": source_type, "source_id": source_id}
+
+
+def test_base_access_operations_describe_create_and_conditional_get() -> None:
+    assert CREATE_SOURCE.request_type is CreateSourceRequest
+    assert CREATE_ARTIFACT.request_type is CreateArtifactRequest
+    assert CREATE_ARTIFACT.response_type is ArtifactCreated
+    assert LIST_ARTIFACTS.request_type is ListArtifactsRequest
+    assert GET_SOURCE.request_type is None
+    assert GET_ARTIFACT.request_type is None
+    assert GET_ARTIFACT_REVISION.request_type is None
+    assert REPLACE_ARTIFACT.response_type is ArtifactRevision
+    assert 304 in GET_ARTIFACT.responses
+
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    item_path = contract["paths"]["/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}"]
+    get_parameters = {parameter["name"]: parameter for parameter in item_path["get"]["parameters"]}
+    assert get_parameters["If-None-Match"]["required"] is False
+    assert "content" not in item_path["get"]["responses"]["304"]
+
+    parameters = {item["name"]: item for item in item_path["put"]["parameters"]}
+    assert parameters["If-Match"]["required"] is True
+    assert parameters["If-Match"]["schema"] == {"type": "string", "minLength": 1}
+    assert set(item_path["put"]["responses"]) >= {"412", "428"}
+
+
+def test_generated_response_models_ignore_unknown_fields() -> None:
+    response = SourceRecord.model_validate({
+        "scope_id": "scope",
+        "source_type": "content",
+        "source_id": "source",
+        "content": "evidence",
+        "metadata": {},
+        "created_at": "2026-09-02T12:00:00Z",
+        "position": 1,
+        "content_digest": f"sha256:{'0' * 64}",
+        "future_optional_field": "ignored",
+    })
+
+    assert "future_optional_field" not in response.model_dump()
+
+
 def test_server_publishes_the_canonical_openapi_schema() -> None:
     contract = yaml.safe_load(CONTRACT_PATH.read_text())
 
@@ -489,3 +978,13 @@ def test_server_publishes_the_canonical_openapi_schema() -> None:
         create_server_app(settings=ServerSettings(handoff_report=HandoffReportConfig(enabled=True))).openapi()
         == contract
     )
+
+
+def test_memory_capacity_contract_and_compact_change_are_public():
+    assert GET_MEMORY_CAPACITY.path == "/v1/memory/capacity"
+    assert GET_MEMORY_CAPACITY.request_type is GetMemoryCapacityRequest
+    assert GET_MEMORY_CAPACITY.response_type is MemoryCapacity
+    assert GET_MEMORY_CAPACITY.access == LIST_MEMORY_ENTRIES.access
+    assert EntryChangeOperation.COMPACT.value == "compact"
+    with pytest.raises(ValidationError):
+        GetMemoryCapacityRequest.model_validate({"scope_id": "scope", "budget": {}})

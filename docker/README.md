@@ -23,7 +23,7 @@ docker run --rm \
 
 The image listens on `0.0.0.0:8000` inside the container. Keep the host-side publish address on loopback unless bearer
 authentication and a TLS-terminating network boundary are configured. See
-[`Deploy the Server`](../docs/en/docs/how-to/deploy-server.md) for the remote-access setup.
+[`Deploy the Server`](../docs/en/docs/operate/deploy-server.md) for the remote-access setup.
 
 The image stores its default data under `/data` and exposes a Docker health check backed
 by `GET /health/ready`. Runtime or database failures return `not_ready` with HTTP 503. A configured inference failure
@@ -41,8 +41,8 @@ PowerContext refuses to start an unauthenticated Server on a non-loopback addres
 port is reachable, and its network namespace is the controlled boundary that opt-in is meant for, so the image sets
 it by default and the `docker run` above starts without extra configuration. Access is still governed by which ports
 you publish (`--publish`) and the surrounding network. For an exposed deployment, put the Server behind a
-TLS-terminating proxy and enable bearer authentication with
-`POWERCONTEXT_SERVER_AUTH_ENABLED=true` and `POWERCONTEXT_SERVER_AUTH_TOKEN=...`; when authentication is enabled the
+TLS-terminating proxy and enable enforced Access Control with
+`POWERCONTEXT_SERVER_ACCESS_MODE=enforced` and `POWERCONTEXT_SERVER_AUTH_TOKEN=...`; in enforced mode the
 opt-in is no longer required.
 
 The `Build Docker image` GitHub workflow builds downloadable Linux amd64 and arm64 image archives for pull requests,

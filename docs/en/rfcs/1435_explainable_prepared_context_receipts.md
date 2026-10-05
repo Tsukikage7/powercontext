@@ -1,3 +1,7 @@
+---
+title: "RFC 1435: Explainable PreparedContext Receipts"
+---
+
 - Proposal Name: `explainable_prepared_context_receipts`
 - Start Date: 2026-09-02
 - RFC PR: [oceanbase/powercontext#1435](https://github.com/oceanbase/powercontext/pull/1435)

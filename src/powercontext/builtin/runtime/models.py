@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
@@ -34,6 +34,8 @@ from powercontext.builtin.artifacts.memory.models import (
     MemorySearchMode,
     MemoryUsedSearchMode,
 )
+from powercontext.builtin.artifacts.profile.models import ProfileCandidateProposal, ProfileWriteContent
+from powercontext.builtin.artifacts.prompt import PromptCapability
 from powercontext.builtin.artifacts.skill import (
     ExternalSkillProviderScan,
     ExternalSkillResolution,
@@ -49,11 +51,12 @@ from powercontext.builtin.review import (
 )
 from powercontext.builtin.review.generation import SkillGenerationOrigin
 from powercontext.builtin.sources import ExternalSkillImportMode
-from powercontext.sources import SourceRef
+from powercontext.builtin.tags import TagFilter
+from powercontext.sources import ConnectorBinding, SourceObservation, SourceRef
 
 PreparedContextSchema: TypeAlias = Literal["powercontext.prepared-context.v1"]
 PreparedContextStatus: TypeAlias = Literal["ready", "empty"]
-ReviewedProposal: TypeAlias = ExperienceContent | SkillContent
+ReviewedProposal: TypeAlias = ExperienceContent | SkillContent | ProfileCandidateProposal
 
 PREPARED_CONTEXT_SCHEMA: PreparedContextSchema = "powercontext.prepared-context.v1"
 
@@ -77,30 +80,79 @@ class SourceReceipt(BaseModel):
     sequence: int
 
 
+class SubmitSourceObservation(BaseModel):
+    """Submit one worker-materialized observation for durable acceptance."""
+
+    scope_id: str
+    observation: SourceObservation
+
+
+class ConnectorCheckpointState(BaseModel):
+    """Current opaque checkpoint for one exact Connector binding."""
+
+    binding: ConnectorBinding
+    checkpoint: JsonValue | None
+
+
+class CommitConnectorCheckpoint(BaseModel):
+    """Compare and replace one binding checkpoint after durable submissions."""
+
+    binding: ConnectorBinding
+    expected: JsonValue | None
+    checkpoint: JsonValue | None
+
+
 class RuntimeCapabilities(BaseModel):
     """Behavior available from the assembled Source-to-Memory Runtime."""
 
     memory_extraction: bool
     experience_generation: bool = False
     managed_skill_generation: bool = False
+    artifact_dreaming: bool = False
     external_skill_registry: bool = False
     memory_search_modes: tuple[MemorySearchMode, ...]
     handoff_generation: bool = False
+    prompts: dict[str, PromptCapability] = Field(default_factory=dict)
     context_versions: tuple[PreparedContextSchema, ...] = (PREPARED_CONTEXT_SCHEMA,)
 
 
 class MemoryFlushResult(BaseModel):
-    """Result of processing one scoped Source window."""
+    """Result of processing one scoped Source window.
+
+    ``held_count`` and ``hold_codes`` expose a gate refusal to the caller: a held window
+    advances its cursor but writes no Memory, and the structured code says why.
+    """
 
     previous_cursor: int
     high_watermark: int
     current_cursor: int
     source_count: int
     memory_ref: ArtifactRef | None
+    held_count: int = 0
+    hold_codes: tuple[str, ...] = ()
 
     @property
     def processed(self) -> bool:
         return self.current_cursor > self.previous_cursor
+
+
+class TopicMemoryFlushResult(BaseModel):
+    """Durable acceptance result for one scoped Topic Memory flush request."""
+
+    status: Literal["accepted", "idle"]
+
+
+class SearchTopicMemoryRequest(BaseModel):
+    """Caller-neutral Topic Memory search request."""
+
+    query: str
+    limit: int = 10
+
+
+class GetTopicMemoryRequest(BaseModel):
+    """Read one exact immutable Topic Memory revision."""
+
+    artifact: ArtifactRef
 
 
 class ExperienceIncubationResult(BaseModel):
@@ -111,6 +163,7 @@ class ExperienceIncubationResult(BaseModel):
     current_cursor: int = Field(ge=0)
     source_count: int = Field(ge=0)
     candidate_count: int = Field(ge=0)
+    candidate_ids: tuple[str, ...] = ()
 
     @property
     def processed(self) -> bool:
@@ -130,6 +183,7 @@ class SearchMemoryRequest(BaseModel):
     query: str
     limit: int = 10
     mode: MemorySearchMode = "auto"
+    tag_filter: TagFilter | None = None
 
 
 class MemorySearchPage(BaseModel):
@@ -141,11 +195,52 @@ class MemorySearchPage(BaseModel):
     rerank: MemoryRerankTrace | None = None
 
 
+class ContextAssemblySection(_PreparedContextModel):
+    """One selected Artifact family and its maximum output count."""
+
+    family: Literal["memory", "experience", "profile", "topic-memory"]
+    limit: Annotated[int, Field(ge=1, le=8)]
+
+    @model_validator(mode="after")
+    def validate_limit(self) -> ContextAssemblySection:
+        if self.family == "experience" and self.limit > 2:
+            raise ValueError("Experience sections cannot include more than two entries")  # noqa: TRY003
+        return self
+
+
+class ContextAssembly(_PreparedContextModel):
+    """Request-local selection and presentation of historical context."""
+
+    format: Literal["markdown"] = "markdown"
+    sections: Annotated[tuple[ContextAssemblySection, ...], Field(max_length=4, strict=False)] = (
+        ContextAssemblySection(family="memory", limit=6),
+        ContextAssemblySection(family="experience", limit=2),
+    )
+    show: Annotated[tuple[Literal["confidence", "recall_rank"], ...], Field(max_length=2, strict=False)] = ()
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> ContextAssembly:
+        if len({section.family for section in self.sections}) != len(self.sections):
+            raise ValueError("Assembly families must be unique")  # noqa: TRY003
+        if len(set(self.show)) != len(self.show):
+            raise ValueError("Assembly metadata fields must be unique")  # noqa: TRY003
+        return self
+
+
 class PrepareContextRequest(_PreparedContextModel):
     """Prepare bounded context for one Agent turn."""
 
     query: Annotated[str, Field(min_length=1, max_length=8192)]
     max_bytes: Annotated[int, Field(ge=512, le=32768)] = 8000
+    assembly: ContextAssembly | None = None
+    include_code: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_null_assembly(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and "assembly" in value and value["assembly"] is None:
+            raise ValueError("assembly must be omitted or contain an object")  # noqa: TRY003
+        return value
 
     @field_validator("query")
     @classmethod
@@ -232,6 +327,7 @@ class ProposeExperienceRequest(BaseModel):
     proposal: ExperienceContent
     sources: tuple[SourceRef, ...] = ()
     artifacts: tuple[ArtifactRef, ...] = ()
+    memory_citations: tuple[MemoryCitation, ...] = ()
     target: ArtifactRef | None = None
     reason: str | None = None
 
@@ -317,7 +413,7 @@ class ListArtifactCandidatesRequest(BaseModel):
     """Filter and page the current Review Inbox."""
 
     status: CandidateStatus = CandidateStatus.PENDING
-    family: Literal["experience", "skill"] | None = None
+    family: Literal["experience", "skill", "profile"] | None = None
     cursor: str | None = None
     limit: Annotated[int, Field(ge=1, le=MAX_CANDIDATE_PAGE_SIZE)] = DEFAULT_CANDIDATE_PAGE_SIZE
 
@@ -336,9 +432,10 @@ class RejectArtifactCandidateRequest(ApproveArtifactCandidateRequest):
 
 
 class ReviseArtifactCandidateRequest(ApproveArtifactCandidateRequest):
-    proposal: ReviewedProposal
+    proposal: ExperienceContent | SkillContent | ProfileWriteContent
     sources: tuple[SourceRef, ...] = ()
     artifacts: tuple[ArtifactRef, ...] = ()
+    memory_citations: tuple[MemoryCitation, ...] | None = None
     target: ArtifactRef | None = None
     reason: str | None = None
 

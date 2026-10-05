@@ -24,18 +24,27 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 from bub import Settings, config, ensure_config, hookimpl
 from bub.hooks.interception import LlmCallRequest, LlmCallResult, ToolCall, ToolCallResult
 from bub.turn import TurnState
-from pydantic import Field, HttpUrl
+from pydantic import Field, HttpUrl, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
 
 from powercontext.client import InvalidResponseError, PowerContextClient, ServerResponseError, TransportError
 from powercontext.client.capture import render_capture_event
+from powercontext.client.transport_policy import ClientTransportSettings
 from powercontext.http import CaptureContentSourceRequest, FlushMemoryRequest, PrepareContextRequest
+
+try:
+    from powercontext.http import ContextAssembly
+except ImportError:
+    # Older core releases support legacy recall but cannot accept assembly settings.
+    from types import NoneType as ContextAssembly
+
+from .scope import resolve_scope_id, workspace_binding_key
 
 STATE_KEY = "_powercontext"
 CONTEXT_MARKER = "PowerContext host-supplied context"
@@ -49,7 +58,7 @@ CAPTURE_SCHEMA = "powercontext.bub-capture-event/v1"
 
 
 @config(name="powercontext")
-class PowerContextSettings(Settings):
+class PowerContextSettings(ClientTransportSettings, Settings):
     """Validated Bub configuration for the PowerContext plugin."""
 
     model_config = SettingsConfigDict(
@@ -57,42 +66,63 @@ class PowerContextSettings(Settings):
         env_ignore_empty=True,
         extra="ignore",
         frozen=True,
+        hide_input_in_errors=True,
     )
 
+    transport_host: ClassVar[str] = "bub"
     base_url: HttpUrl = HttpUrl("http://127.0.0.1:8000")
+    api_token: SecretStr | None = Field(default=None, repr=False)
     scope_id: str | None = Field(default=None, min_length=1)
     timeout: float = Field(default=10, gt=0)
     max_bytes: int = Field(default=8000, ge=512, le=32768)
+    context_assembly: ContextAssembly | None = None
     capture_events: bool = False
     capture_checkpoint_every: int = Field(default=5, ge=1, le=100)
     capture_max_bytes: int = Field(default=8192, ge=512, le=32768)
     capture_log: Path | None = None
     trust_transport_security: bool = False
 
+    @field_validator("context_assembly", mode="before")
+    @classmethod
+    def validate_assembly_support(cls, value: object) -> object:
+        if value is not None and ContextAssembly is type(None):
+            raise ValueError(  # noqa: TRY003
+                "context_assembly requires a PowerContext core with text assembly support; "
+                "install the core and adapter from the same checkout"
+            )
+        return value
+
 
 def open_client(
     base_url: str,
     *,
     timeout: float,
+    api_token: SecretStr | None = None,
     trust_transport_security: bool = False,
+    allow_insecure_http: bool = False,
 ) -> AbstractAsyncContextManager[PowerContextClient]:
     """Open a client, vouching for the transport only when the operator opted in."""
 
+    token = None if api_token is None else api_token.get_secret_value()
     if trust_transport_security:
-        return _vouched_client(base_url, timeout)
-    return PowerContextClient(base_url, timeout=timeout)
+        return _vouched_client(base_url, timeout, token=token, allow_insecure_http=allow_insecure_http)
+    return PowerContextClient(base_url, token=token, timeout=timeout, allow_insecure_http=allow_insecure_http)
 
 
 @asynccontextmanager
-async def _vouched_client(base_url: str, timeout_seconds: float) -> AsyncIterator[PowerContextClient]:
+async def _vouched_client(
+    base_url: str, timeout_seconds: float, *, token: str | None, allow_insecure_http: bool
+) -> AsyncIterator[PowerContextClient]:
     # The operator vouched for the network (e.g. a private Compose bridge), and the
     # client only honours that vouch for a caller-supplied transport.
     async with (
         httpx.AsyncClient(timeout=timeout_seconds) as transport,
         PowerContextClient(
             base_url,
+            token=token,
             http_client=transport,
             trust_transport_security=True,
+            allow_insecure_http=allow_insecure_http,
         ) as client,
     ):
         yield client
@@ -103,19 +133,28 @@ class PowerContextPlugin:
 
     def __init__(self, framework: Any) -> None:
         self.settings = ensure_config(PowerContextSettings)
-        self.base_url = str(self.settings.base_url).rstrip("/")
-        self.scope_id = self.settings.scope_id or _workspace_scope(Path(framework.workspace))
+        self.base_url, self.allow_insecure_http = self.settings.resolve_transport()
+        self._framework = framework
+        self._scope_lock = asyncio.Lock()
         self._capture_lock = asyncio.Lock()
 
     @hookimpl
     def load_state(self, message: Any, session_id: str) -> TurnState:
         del message, session_id
+        workspace_key = workspace_binding_key(getattr(self._framework, "workspace", None))
+        binding_keys = [workspace_key] if workspace_key is not None else []
         return {
             STATE_KEY: {
                 "base_url": self.base_url,
-                "scope_id": self.scope_id,
+                "scope_id": None,
+                "explicit_scope_id": self.settings.scope_id,
+                "binding_keys": binding_keys,
                 "timeout": self.settings.timeout,
+                "api_token": self.settings.api_token,
                 "trust_transport_security": self.settings.trust_transport_security,
+                "allow_insecure_http": self.allow_insecure_http,
+                "max_bytes": self.settings.max_bytes,
+                "context_assembly": self.settings.context_assembly,
                 "capture_sequence": 0,
                 "captured_events": 0,
                 "captured_position": 0,
@@ -132,6 +171,13 @@ class PowerContextPlugin:
     @hookimpl
     async def before_llm_call(self, request: LlmCallRequest, state: TurnState) -> LlmCallRequest | None:
         query = _latest_user_text(request.messages)
+        if not query:
+            return None
+
+        scope_id = await self._scope_id(state)
+        if scope_id is None:
+            return None
+
         capture_state = state[STATE_KEY]
         if self.settings.capture_events and query and not capture_state["prompt_captured"]:
             capture_state["prompt_captured"] = True
@@ -145,10 +191,7 @@ class PowerContextPlugin:
         if any(_contains_context_marker(message) for message in request.messages):
             return None
 
-        if not query:
-            return None
-
-        prepared_content = await self._prepare_context(query, state)
+        prepared_content = await self._prepare_context(query, scope_id, state)
         if not prepared_content:
             return None
 
@@ -203,14 +246,49 @@ class PowerContextPlugin:
         return open_client(
             self.base_url,
             timeout=self.settings.timeout,
+            api_token=self.settings.api_token,
             trust_transport_security=self.settings.trust_transport_security,
+            allow_insecure_http=self.allow_insecure_http,
         )
 
-    async def _prepare_context(self, query: str, state: TurnState) -> str | None:
+    async def _scope_id(self, state: TurnState) -> str | None:
+        scope_state = state[STATE_KEY]
+        explicit_scope_id = scope_state["explicit_scope_id"]
+        binding_keys = scope_state["binding_keys"]
+        cached_scope_id = scope_state.get("scope_id")
+        if cached_scope_id is not None:
+            return cached_scope_id
+
+        async with self._scope_lock:
+            cached_scope_id = scope_state.get("scope_id")
+            if cached_scope_id is not None:
+                return cached_scope_id
+            try:
+                async with self._client() as client:
+                    resolved_scope_id = await resolve_scope_id(
+                        client,
+                        explicit_scope_id=explicit_scope_id,
+                        binding_keys=binding_keys,
+                    )
+            except CLIENT_ERRORS as exc:
+                scope_state["scope_error"] = type(exc).__name__
+                self._write_capture_record(
+                    event="scope",
+                    status="failed",
+                    error=type(exc).__name__,
+                )
+                return None
+
+            scope_state["scope_id"] = resolved_scope_id
+            scope_state.pop("scope_error", None)
+            return resolved_scope_id
+
+    async def _prepare_context(self, query: str, scope_id: str, state: TurnState) -> str | None:
         request = PrepareContextRequest(
-            scope_id=self.scope_id,
+            scope_id=scope_id,
             query=query,
             max_bytes=self.settings.max_bytes,
+            **({"assembly": self.settings.context_assembly} if self.settings.context_assembly is not None else {}),
         )
         try:
             async with self._client() as client:
@@ -241,15 +319,19 @@ class PowerContextPlugin:
         payload: dict[str, Any],
         state: TurnState,
     ) -> None:
+        scope_id = await self._scope_id(state)
+        if scope_id is None:
+            return
+
         async with self._capture_lock:
             capture_state = state[STATE_KEY]
             capture_state["capture_sequence"] += 1
             sequence = capture_state["capture_sequence"]
             session_id = str(state.get("session_id", "unknown"))
-            source_id = _source_id(self.scope_id, session_id, sequence, event, run_id)
+            source_id = _source_id(scope_id, session_id, sequence, event, run_id)
             content = render_capture_event(event, sequence, payload, self.settings.capture_max_bytes)
             request = CaptureContentSourceRequest(
-                scope_id=self.scope_id,
+                scope_id=scope_id,
                 source_id=source_id,
                 content=content,
                 metadata={
@@ -292,9 +374,13 @@ class PowerContextPlugin:
         if target_position <= capture_state["flushed_position"]:
             return
 
+        scope_id = await self._scope_id(state)
+        if scope_id is None:
+            return
+
         try:
             async with self._client() as client:
-                response = await client.flush_memory(FlushMemoryRequest(scope_id=self.scope_id))
+                response = await client.flush_memory(FlushMemoryRequest(scope_id=scope_id))
         except CLIENT_ERRORS as exc:
             self._write_capture_record(
                 event="checkpoint",
@@ -352,11 +438,6 @@ def _latest_user_text(messages: list[dict[str, Any]]) -> str:
 def _contains_context_marker(message: dict[str, Any]) -> bool:
     content = message.get("content")
     return isinstance(content, str) and CONTEXT_MARKER in content
-
-
-def _workspace_scope(workspace: Path) -> str:
-    digest = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:20]
-    return f"bub:{digest}"
 
 
 def _source_id(scope_id: str, session_id: str, sequence: int, event: str, run_id: str) -> str:

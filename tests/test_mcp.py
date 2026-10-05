@@ -13,21 +13,21 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
+import os
+import re
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self, TypeVar
 
 import httpx
 from fastapi import Request
 from fastmcp import Client
-from fastmcp.client.elicitation import ElicitResult
 from fastmcp.client.transports import StreamableHttpTransport
-from mcp.types import ElicitRequestFormParams
+from jsonschema import Draft202012Validator
 
-from powercontext.builtin.handoff_report import CatalogPage
-from powercontext.builtin.handoff_report import ProjectDescriptor as ReportProjectDescriptor
-from powercontext.builtin.handoff_report import WorkstreamDescriptor as ReportWorkstreamDescriptor
 from powercontext.builtin.runtime import MemoryEntriesPage
 from powercontext.server.access import HttpAccessLogMiddleware
 from powercontext.server.app import create_app
@@ -37,79 +37,40 @@ from powercontext.server.mcp import create_mcp_server, mount_mcp
 ResultT = TypeVar("ResultT")
 
 
-class HandoffReportCatalogStub:
-    def __init__(
-        self,
-        projects: tuple[ReportProjectDescriptor, ...],
-        workstreams: dict[str, tuple[ReportWorkstreamDescriptor, ...]],
-    ) -> None:
-        self.projects = projects
-        self.workstreams = workstreams
+def test_mcp_guidance_is_visible_without_loading_a_skill() -> None:
+    async def inspect() -> tuple[str, list[Any]]:
+        async with Client(create_mcp_server(create_app())) as client:
+            assert client.initialize_result is not None
+            return client.initialize_result.instructions or "", await client.list_tools()
 
-    async def list_projects(
-        self,
-        *,
-        cursor: str | None = None,
-        limit: int = 50,
-        include_archived: bool = False,
-    ) -> CatalogPage[ReportProjectDescriptor]:
-        del cursor, include_archived
-        return CatalogPage(self.projects[:limit], None)
-
-    async def list_workstreams(
-        self,
-        project_id: str,
-        *,
-        cursor: str | None = None,
-        limit: int = 50,
-        include_archived: bool = False,
-    ) -> CatalogPage[ReportWorkstreamDescriptor]:
-        del cursor, include_archived
-        return CatalogPage(self.workstreams.get(project_id, ())[:limit], None)
-
-
-def handoff_report_app(
-    projects: tuple[ReportProjectDescriptor, ...],
-    workstreams: dict[str, tuple[ReportWorkstreamDescriptor, ...]],
-):
-    application = SimpleNamespace(handoff_report=HandoffReportCatalogStub(projects, workstreams))
-    return create_app(application=application, handoff_report_enabled=True)
-
-
-def report_project(project_id: str, project_key: str, title: str) -> ReportProjectDescriptor:
-    return ReportProjectDescriptor(
-        project_id=project_id,
-        project_key=project_key,
-        title=title,
-        timezone="UTC",
-        version=1,
-    )
-
-
-def report_workstream(
-    project_id: str,
-    scope_id: str,
-    key: str,
-    title: str,
-    *,
-    labels: tuple[str, ...] = (),
-) -> ReportWorkstreamDescriptor:
-    return ReportWorkstreamDescriptor(
-        project_id=project_id,
-        scope_id=scope_id,
-        key=key,
-        title=title,
-        kind="feature",
-        labels=labels,
-        version=1,
-    )
+    guidance, tools = asyncio.run(inspect())
+    assert guidance
+    names = {tool.name for tool in tools}
+    assert set(re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", guidance)) <= names
+    if directory := os.environ.get("POWERCONTEXT_GUIDANCE_EXPORT"):
+        root = Path(__file__).parents[1]
+        for host in ("codex", "claude-code", "workbuddy", "agent-plugin", "minimax"):
+            plugin = root / "integrations" / host
+            plugin /= "powercontext" if host == "agent-plugin" else "plugins/powercontext"
+            name = "powercontext-project-context"
+            content = (plugin / f"skills/{name}/SKILL.md").read_text(encoding="utf-8")
+            catalog = {
+                "host": host,
+                "guidance": guidance,
+                "tools": [
+                    {"name": tool.name, "description": tool.description, "parameters": tool.inputSchema}
+                    for tool in tools
+                ],
+                "skill": {"name": name, "content": content},
+            }
+            (Path(directory) / f"{host}.json").write_text(json.dumps(catalog, indent=2), encoding="utf-8")
 
 
 def run_async(operation: Callable[[], Coroutine[Any, Any, ResultT]]) -> ResultT:
     return asyncio.run(operation())
 
 
-def test_mcp_exposes_only_the_agent_facing_server_operations() -> None:
+def test_mcp_exposes_only_data_plane_and_integration_control_operations() -> None:
     async def inspect_components() -> tuple[list[str], int, int]:
         async with Client(create_mcp_server(create_app())) as client:
             tools = await client.list_tools()
@@ -120,29 +81,96 @@ def test_mcp_exposes_only_the_agent_facing_server_operations() -> None:
     tool_names, resource_count, prompt_count = run_async(inspect_components)
 
     assert set(tool_names) == {
+        "generate_experience",
+        "get_experience",
+        "propose_experience",
+        "generate_skill",
+        "get_skill",
+        "propose_skill",
+        "list_managed_skills",
+        "scan_external_skills",
+        "list_external_skills",
+        "resolve_external_skill",
+        "import_external_skill",
         "activate_handoff",
         "acknowledge_handoff",
         "approve_artifact_candidate",
         "capture_content_source",
+        "clear_scope_binding",
         "commit_handoff",
         "continue_handoff",
+        "prepare_handoff_hint",
+        "create_scope",
         "create_work_contract",
         "finalize_handoff",
         "get_artifact_candidate",
+        "get_memory_capacity",
         "get_memory_entry",
+        "get_topic_memory",
+        "get_scope",
         "handoff_current_work",
+        "create_dream_run",
+        "get_dream_run",
+        "list_dream_runs",
         "list_artifact_candidates",
         "list_memory_entries",
+        "list_scopes",
+        "publish_artifact",
+        "query_code",
         "reject_artifact_candidate",
         "record_task_outcome",
+        "resolve_scope_binding",
         "remember_memory",
         "retire_memory_entry",
         "revise_artifact_candidate",
         "revise_memory_entry",
         "search_memory",
+        "search_topic_memory",
+        "set_scope_binding",
     }
     assert resource_count == 0
     assert prompt_count == 0
+
+
+def test_mcp_memory_reads_are_read_only_and_flush_is_excluded() -> None:
+    async def inspect_annotations() -> dict[str, Any]:
+        async with Client(create_mcp_server(create_app())) as client:
+            return {tool.name: tool.annotations for tool in await client.list_tools()}
+
+    tools = run_async(inspect_annotations)
+
+    assert "flush_topic_memory" not in tools
+    for name in ("search_topic_memory", "get_topic_memory", "get_memory_capacity"):
+        annotations = tools[name]
+        assert annotations is not None
+        assert annotations.readOnlyHint is True
+        assert annotations.destructiveHint is False
+        assert annotations.idempotentHint is True
+        assert annotations.openWorldHint is False
+
+
+def test_mcp_full_profile_tools_describe_read_and_write_effects() -> None:
+    async def inspect_annotations() -> dict[str, Any]:
+        async with Client(create_mcp_server(create_app())) as client:
+            return {tool.name: tool.annotations for tool in await client.list_tools()}
+
+    annotations = run_async(inspect_annotations)
+    reads = {"get_experience", "get_skill", "list_managed_skills", "list_external_skills", "resolve_external_skill"}
+    writes = {
+        "generate_experience",
+        "propose_experience",
+        "generate_skill",
+        "propose_skill",
+        "scan_external_skills",
+        "import_external_skill",
+    }
+    for name in reads | writes:
+        hints = annotations[name]
+        assert hints is not None
+        assert hints.readOnlyHint is (name in reads)
+        assert hints.idempotentHint is (name in reads)
+        assert hints.destructiveHint is False
+        assert hints.openWorldHint is ("external" in name)
 
 
 def test_mcp_exposes_read_only_handoff_report_tools_only_when_feature_routes_are_enabled() -> None:
@@ -153,164 +181,12 @@ def test_mcp_exposes_read_only_handoff_report_tools_only_when_feature_routes_are
     tools = run_async(inspect_components)
 
     assert "get_handoff_report" in tools
-    assert "get_handoff_report_workspace" in tools
-    assert "list_handoff_report_known_scopes" in tools
-    assert "record_handoff_report_activity" not in tools
-    assert "attach_handoff_report_workspace" not in tools
-    picker = tools["select_handoff_workstream"]
-    assert picker is not None
-    assert picker.readOnlyHint is True
-    assert picker.destructiveHint is False
-    assert picker.idempotentHint is True
-    assert picker.openWorldHint is False
-
-
-def test_mcp_handoff_picker_returns_structured_choices_without_elicitation() -> None:
-    project = report_project("prj-powercontext", "powercontext", "PowerContext")
-    workstreams = (
-        report_workstream(project.project_id, "scope-claude", "claude-compat", "Claude compatibility"),
-        report_workstream(project.project_id, "scope-ui", "handoff-ui", "Handoff workbench"),
-    )
-    app = handoff_report_app((project,), {project.project_id: workstreams})
-
-    async def select() -> tuple[dict[str, Any], dict[str, Any]]:
-        async with Client(create_mcp_server(app)) as client:
-            choices = await client.call_tool("select_handoff_workstream", {})
-            selected = await client.call_tool(
-                "select_handoff_workstream",
-                {"project_id": project.project_id, "work_id": "handoff-ui"},
-            )
-        return choices.structured_content or {}, selected.structured_content or {}
-
-    choices, selected = run_async(select)
-
-    assert choices["status"] == "needs_selection"
-    assert choices["stage"] == "workstream"
-    assert [item["work_id"] for item in choices["workstream_choices"]] == ["claude-compat", "handoff-ui"]
-    assert selected["status"] == "selected"
-    assert selected["selected"] == {
-        "work_id": "handoff-ui",
-        "scope_id": "scope-ui",
-        "project_id": project.project_id,
-        "project_key": "powercontext",
-        "title": "Handoff workbench",
-        "kind": "feature",
-        "catalog_version": 1,
-    }
-
-
-def test_mcp_handoff_picker_does_not_silently_resolve_an_ambiguous_work_id() -> None:
-    project = report_project("prj-powercontext", "powercontext", "PowerContext")
-    workstreams = (
-        report_workstream(project.project_id, "scope-claude", "shared-id", "Claude compatibility"),
-        report_workstream(project.project_id, "shared-id", "handoff-ui", "Handoff workbench"),
-    )
-    app = handoff_report_app((project,), {project.project_id: workstreams})
-
-    async def select() -> dict[str, Any]:
-        async with Client(create_mcp_server(app)) as client:
-            result = await client.call_tool(
-                "select_handoff_workstream",
-                {"project_id": project.project_id, "work_id": "shared-id"},
-            )
-        return result.structured_content or {}
-
-    result = run_async(select)
-
-    assert result["status"] == "needs_selection"
-    assert result["stage"] == "workstream"
-    assert [item["work_id"] for item in result["workstream_choices"]] == ["shared-id", "handoff-ui"]
-
-
-def test_mcp_handoff_picker_uses_native_form_elicitation() -> None:
-    project = report_project("prj-powercontext", "powercontext", "PowerContext")
-    workstreams = (
-        report_workstream(project.project_id, "scope-claude", "claude-compat", "Claude compatibility"),
-        report_workstream(project.project_id, "scope-ui", "handoff-ui", "Handoff workbench"),
-    )
-    app = handoff_report_app((project,), {project.project_id: workstreams})
-    requests: list[ElicitRequestFormParams] = []
-
-    async def choose_second(_message, _response_type, params, _context) -> str:
-        assert isinstance(params, ElicitRequestFormParams)
-        requests.append(params)
-        return "option-2"
-
-    async def select() -> dict[str, Any]:
-        async with Client(create_mcp_server(app), elicitation_handler=choose_second) as client:
-            result = await client.call_tool("select_handoff_workstream", {"locale": "en"})
-        return result.structured_content or {}
-
-    selected = run_async(select)
-
-    assert selected["status"] == "selected"
-    assert selected["selected"]["work_id"] == "handoff-ui"
-    assert len(requests) == 1
-    assert requests[0].message == "Choose the work to hand off or continue."
-    options = requests[0].requestedSchema["properties"]["value"]["oneOf"]
-    assert options == [
-        {"const": "option-1", "title": "Claude compatibility · claude-compat · feature"},
-        {"const": "option-2", "title": "Handoff workbench · handoff-ui · feature"},
-    ]
-
-
-def test_mcp_handoff_picker_preserves_cancelled_selection() -> None:
-    project = report_project("prj-powercontext", "powercontext", "PowerContext")
-    workstreams = (
-        report_workstream(project.project_id, "scope-claude", "claude-compat", "Claude compatibility"),
-        report_workstream(project.project_id, "scope-ui", "handoff-ui", "Handoff workbench"),
-    )
-    app = handoff_report_app((project,), {project.project_id: workstreams})
-
-    async def cancel(_message, _response_type, _params, _context) -> ElicitResult:
-        return ElicitResult(action="cancel")
-
-    async def select() -> dict[str, Any]:
-        async with Client(create_mcp_server(app), elicitation_handler=cancel) as client:
-            result = await client.call_tool("select_handoff_workstream", {})
-        return result.structured_content or {}
-
-    result = run_async(select)
-
-    assert result["status"] == "cancelled"
-    assert result["stage"] == "workstream"
-    assert result["selected"] is None
-
-
-def test_mcp_handoff_picker_selects_project_then_workstream() -> None:
-    memory = report_project("prj-memory", "memory", "Memory")
-    handoff = report_project("prj-handoff", "handoff", "Handoff")
-    app = handoff_report_app(
-        (memory, handoff),
-        {
-            memory.project_id: (report_workstream(memory.project_id, "scope-memory", "memory-core", "Memory Core"),),
-            handoff.project_id: (
-                report_workstream(handoff.project_id, "scope-cli", "handoff-cli", "Handoff CLI"),
-                report_workstream(handoff.project_id, "scope-web", "handoff-web", "Handoff Web"),
-            ),
-        },
-    )
-    replies = iter(("option-2", "option-1"))
-    messages: list[str] = []
-
-    async def choose(_message, _response_type, _params, _context) -> str:
-        messages.append(_message)
-        return next(replies)
-
-    async def select() -> dict[str, Any]:
-        async with Client(create_mcp_server(app), elicitation_handler=choose) as client:
-            result = await client.call_tool("select_handoff_workstream", {"locale": "en"})
-        return result.structured_content or {}
-
-    result = run_async(select)
-
-    assert messages == [
-        "Choose the Project that owns this Handoff.",
-        "Choose the work to hand off or continue.",
-    ]
-    assert result["status"] == "selected"
-    assert result["selected"]["project_id"] == handoff.project_id
-    assert result["selected"]["work_id"] == "handoff-cli"
+    report = tools["get_handoff_report"]
+    assert report is not None
+    assert report.readOnlyHint is True
+    assert report.destructiveHint is False
+    assert report.idempotentHint is True
+    assert report.openWorldHint is False
 
 
 def test_mcp_describes_handoff_tool_side_effects_for_host_approval() -> None:
@@ -343,6 +219,41 @@ def test_mcp_describes_handoff_tool_side_effects_for_host_approval() -> None:
     assert resolve.readOnlyHint is True
     assert resolve.destructiveHint is False
     assert resolve.openWorldHint is False
+
+
+def test_mcp_accepts_first_handoff_carrier_in_followup_tool_schemas() -> None:
+    async def handoff_schemas() -> dict[str, dict[str, Any]]:
+        async with Client(create_mcp_server(create_app())) as client:
+            return {
+                tool.name: tool.inputSchema
+                for tool in await client.list_tools()
+                if tool.name in {"continue_handoff", "commit_handoff"}
+            }
+
+    schemas = run_async(handoff_schemas)
+    citation = {"kind": "source", "source_ref": {"name": "content", "source_id": "boundary-1"}}
+    prepared = {
+        "generation": None,
+        "schema": "powercontext.prepared-handoff.v1",
+        "scope_id": "scope-1",
+        "base": None,
+        "content": {
+            "generation": None,
+            "schema": "powercontext.handoff.v1",
+            "objective": "Continue the acceptance test.",
+            "state": [{"text": "The boundary was captured.", "citations": [citation]}],
+            "disposition": "continuable",
+            "next_action": {"text": "Check the followup tools.", "citations": [citation]},
+            "omissions": [],
+        },
+    }
+
+    Draft202012Validator(schemas["continue_handoff"]).validate({
+        "scope_id": "scope-1",
+        "selection": "prepared",
+        "prepared": prepared,
+    })
+    Draft202012Validator(schemas["commit_handoff"]).validate({"scope_id": "scope-1", "handoff": prepared})
 
 
 def test_mcp_describes_review_write_side_effects_for_host_approval() -> None:

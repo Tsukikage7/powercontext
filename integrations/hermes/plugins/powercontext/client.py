@@ -24,6 +24,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .powercontext_client_config import normalize_server_url, resolve_allow_insecure_http
+
 if TYPE_CHECKING:
     from typing_extensions import override
 else:
@@ -145,10 +147,17 @@ class PowerContextClient:
         base_url: str,
         *,
         authorization: str | None = None,
+        allow_insecure_http: bool | None = None,
         timeout: float = 5.0,
         transport: Transport | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.allow_insecure_http = resolve_allow_insecure_http(
+            base_url,
+            host="hermes",
+            host_environment="POWERCONTEXT_HERMES_ALLOW_INSECURE_HTTP",
+            explicit=allow_insecure_http,
+        )
+        self.base_url = normalize_server_url(base_url, allow_insecure_http=self.allow_insecure_http)
         self.authorization = authorization.strip() if authorization else None
         self.timeout = timeout
         self._opener = build_opener(_NoRedirectHandler())
@@ -234,10 +243,43 @@ class PowerContextClient:
     def get_capabilities(self) -> dict[str, Any]:
         return self._request("/v1/capabilities", method="GET")
 
-    def prepare_context(self, scope_id: str, query: str, *, max_bytes: int) -> dict[str, Any]:
+    def resolve_scope_binding(
+        self,
+        *,
+        explicit_scope_id: str | None,
+        binding_keys: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        return self._request(
+            "/v1/scope-bindings/resolve",
+            {"explicit_scope_id": explicit_scope_id, "binding_keys": binding_keys},
+        )
+
+    def set_scope_binding(self, key: dict[str, str], scope_id: str) -> dict[str, Any]:
+        return self._request(
+            "/v1/scope-bindings",
+            {"key": key, "scope_id": scope_id},
+            method="PUT",
+        )
+
+    def clear_scope_binding(self, key: dict[str, str]) -> dict[str, Any]:
+        return self._request("/v1/scope-bindings/clear", {"key": key})
+
+    def prepare_context(
+        self,
+        scope_id: str,
+        query: str,
+        *,
+        max_bytes: int,
+        assembly: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return self._request(
             "/v1/context/prepare",
-            {"scope_id": scope_id, "query": query, "max_bytes": max_bytes},
+            {
+                "scope_id": scope_id,
+                "query": query,
+                "max_bytes": max_bytes,
+                **({"assembly": assembly} if assembly is not None else {}),
+            },
         )
 
     def search_memory(self, scope_id: str, query: str, *, limit: int, mode: str) -> dict[str, Any]:

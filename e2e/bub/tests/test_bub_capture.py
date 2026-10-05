@@ -32,8 +32,10 @@ def test_tool_capture_redacts_credentials_before_crossing_the_client_boundary(
     captured_requests: list[Any] = []
 
     class RecordingClient:
-        def __init__(self, base_url: str, *, timeout: float) -> None:
-            del base_url, timeout
+        def __init__(
+            self, base_url: str, *, token: str | None = None, timeout: float, allow_insecure_http: bool = False
+        ) -> None:
+            del base_url, timeout, allow_insecure_http
 
         async def __aenter__(self) -> RecordingClient:
             return self
@@ -44,6 +46,10 @@ def test_tool_capture_redacts_credentials_before_crossing_the_client_boundary(
         async def capture_content_source(self, request: Any) -> SimpleNamespace:
             captured_requests.append(request)
             return SimpleNamespace(position=1)
+
+        async def resolve_scope_binding(self, request: Any) -> SimpleNamespace:
+            assert request.explicit_scope_id == "test:scope"
+            return SimpleNamespace(scope_id="scp_00000000000000000000000000")
 
     settings = PowerContextSettings(
         base_url="http://127.0.0.1:8000",
@@ -73,6 +79,7 @@ def test_tool_capture_redacts_credentials_before_crossing_the_client_boundary(
 
     assert len(captured_requests) == 1
     request = captured_requests[0]
+    assert request.scope_id == "scp_00000000000000000000000000"
     assert request.metadata["event"] == "tool_result"
     assert sensitive_value not in request.content
     assert "[REDACTED]" in request.content

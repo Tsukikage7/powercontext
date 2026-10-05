@@ -27,6 +27,11 @@ Anything tagged with "bug" and "help wanted" is open to whoever wants to impleme
 Look through the GitHub issues for features.
 Anything tagged with "enhancement" and "help wanted" is open to whoever wants to implement it.
 
+Dashboard contributors should follow the [implementation and verification baseline](docs/en/development/dashboard.md) ([中文](docs/zh/development/dashboard.md)).
+
+For release preparation, use the [version update and release guide](docs/en/development/releasing.md)
+([中文](docs/zh/development/releasing.md)). It documents the Makefile commands and the versions managed independently.
+
 ## Write Documentation
 
 powercontext could always use more documentation, whether as part of the official docs, in docstrings, or even on the web in blog posts, articles, and such.

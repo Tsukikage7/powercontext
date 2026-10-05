@@ -24,26 +24,19 @@ from contextlib import suppress
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
+from typing import Any, Protocol, cast
 from urllib.error import HTTPError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
-
-if TYPE_CHECKING:
-    from typing_extensions import override
-else:
-    _MethodT = TypeVar("_MethodT")
-
-    def override(method: _MethodT, /) -> _MethodT:
-        return method
-
+from urllib.request import Request
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+_SCRIPTS_ROOT = _PLUGIN_ROOT / "scripts"
 sys.path.insert(0, str(_PLUGIN_ROOT))
+sys.path.insert(0, str(_SCRIPTS_ROOT))
 
 from claude_code_settings import ClaudeCodePluginSettings  # noqa: E402
 from hooks import prepared_context as _prepared_context  # noqa: E402
 from hooks.diagnostics import should_emit as _should_emit_diagnostic  # noqa: E402
-from scripts.project_scope import resolve_scope_id  # noqa: E402
+from workspace_scope import bind_response_deadline, open_bounded, resolve_scope_id  # noqa: E402
 
 _MAX_CONTEXT_BYTES = _prepared_context.MAX_CONTEXT_BYTES
 _InvalidResponseError = _prepared_context.InvalidPreparedContextResponse
@@ -54,7 +47,7 @@ _READ_CHUNK_BYTES = 65_536
 _REQUEST_HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
-    "User-Agent": "powercontext-claude-code-plugin/0.1.0",
+    "User-Agent": "powercontext-claude-code-plugin/0.1.2",
 }
 _FAILURE_OUTCOMES = frozenset({"authentication_failed", "version_mismatch", "server_unavailable", "invalid_response"})
 
@@ -69,25 +62,6 @@ class _Response(_ReadableResponse, Protocol):
     def __enter__(self) -> _Response: ...
 
     def __exit__(self, *args: object) -> object: ...
-
-
-class _RejectRedirects(HTTPRedirectHandler):
-    """Leave every 3xx response to urllib's default HTTP error handler."""
-
-    @override
-    def redirect_request(
-        self,
-        req: Request,
-        fp: object,
-        code: int,
-        msg: str,
-        headers: object,
-        newurl: str,
-    ) -> Request | None:
-        return None
-
-
-_URL_OPENER = build_opener(_RejectRedirects)
 
 
 class _HttpStatusError(RuntimeError):
@@ -162,8 +136,13 @@ def main(settings: ClaudeCodePluginSettings | None = None) -> int:
             _write_hook_output(diagnostic_events=diagnostic_events)
             return 0
 
-        scope_id = resolve_scope_id(cwd, configured_scope_id=settings.scope_id)
         http_deadline = monotonic() + settings.http_budget_seconds
+        scope_id = resolve_scope_id(
+            cwd,
+            session_id=_payload_identifier(payload, "session_id"),
+            settings=settings,
+            deadline=http_deadline,
+        )
         context = None
         with suppress(Exception):
             context = _recall_context(
@@ -237,6 +216,8 @@ def _prepare_context(
             "scope_id": scope_id,
             "query": query,
             "max_bytes": _MAX_CONTEXT_BYTES,
+            **({"include_code": True} if settings.include_code else {}),
+            **({"assembly": settings.context_assembly} if settings.context_assembly is not None else {}),
         },
         settings=settings,
         deadline=deadline,
@@ -336,7 +317,7 @@ def _post_json(
     try:
         request_timeout = min(settings.request_timeout_seconds, _remaining_time(deadline))
         request_deadline = min(deadline, monotonic() + request_timeout)
-        with _URL_OPENER.open(request, timeout=request_timeout) as response:
+        with open_bounded(request, timeout=request_timeout) as response:
             if expected_status is not None and response.status != expected_status:
                 code = _decode_error_code(_read_response(response, deadline=request_deadline))
                 raise _HttpStatusError(response.status, path, code)
@@ -375,6 +356,7 @@ def _read_response(
 ) -> bytes:
     """Read one response under a wall-clock deadline and a hard size bound."""
 
+    bind_response_deadline(response, deadline)
     content = bytearray()
     while True:
         _set_response_timeout(response, _remaining_time(deadline))

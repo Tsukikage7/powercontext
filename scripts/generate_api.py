@@ -17,15 +17,26 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from pathlib import Path
 from pprint import pformat
-from typing import Literal
+from typing import Literal, TypedDict
 
 import yaml
 from datamodel_code_generator import GenerateConfig, InputFileType, generate
 from datamodel_code_generator.enums import StrictTypes
 from datamodel_code_generator.format import CodeFormatter, Formatter, PythonVersion
-from fastapi.openapi.models import MediaType, OpenAPI, PathItem, Reference, RequestBody, Response, Schema
+from fastapi.openapi.models import (
+    MediaType,
+    OpenAPI,
+    Parameter,
+    ParameterInType,
+    PathItem,
+    Reference,
+    RequestBody,
+    Response,
+    Schema,
+)
 from fastapi.openapi.models import Operation as OpenAPIOperation
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
@@ -56,6 +67,13 @@ class ContractGenerationError(RuntimeError):
         self.subject = subject
         self.value = value
         super().__init__(f"cannot generate PowerContext API: invalid {subject}: {value!r}")
+
+
+class _AccessRequirement(TypedDict):
+    action: str | None
+    resource: Literal["server", "scope", "artifact"] | None
+    scope_id_field: str | None
+    resolver: str
 
 
 def generate_sources() -> dict[Path, str]:
@@ -125,7 +143,82 @@ def _generate_models(
     if not isinstance(result, str):
         raise ContractGenerationError("model generator output", result)  # noqa: TRY003
     evidence_models = _candidate_evidence_models(transport_contract.components.schemas)
-    return _with_candidate_evidence_limits(f"{result.rstrip()}\n", evidence_models)
+    source = _with_nested_model_defaults(f"{result.rstrip()}\n")
+    source = _with_code_validation(source, transport_contract.components.schemas)
+    return _with_candidate_evidence_limits(source, evidence_models)
+
+
+def _with_code_validation(source: str, schemas: dict[str, Schema | Reference]) -> str:
+    """Preserve semantic constraints that OpenAPI 3.0 cannot express natively."""
+    validators = {
+        "operation": "validate_code_operation(self.model_dump())",
+        "query": "validate_code_query(self.operation.kind, self.expected_fingerprint, self.before_fingerprint)",
+    }
+    for name, schema in schemas.items():
+        if not isinstance(schema, Schema):
+            continue
+        kind = (schema.model_extra or {}).get("x-powercontext-code-validation")
+        if kind is None:
+            continue
+        if kind not in validators:
+            raise ContractGenerationError("x-powercontext-code-validation", kind)
+        source = _with_model_validator_import(source)
+        header = f"class {name}(BaseModel):"
+        start = source.find(header)
+        if start < 0:
+            raise ContractGenerationError("generated model class", name)  # noqa: TRY003
+        next_class = source.find("\nclass ", start + len(header))
+        insert_at = next_class if next_class >= 0 else len(source.rstrip())
+        validator = f"""
+    @model_validator(mode="after")
+    def _validate_code_{kind}(self):
+        from powercontext._code_validation import validate_code_{kind}
+
+        {validators[kind]}
+        return self
+"""
+        source = f"{source[:insert_at].rstrip()}\n{validator.rstrip()}\n\n{source[insert_at:].lstrip()}"
+    return source
+
+
+def _with_nested_model_defaults(source: str) -> str:
+    """Construct typed nested defaults instead of assigning raw JSON to list[Model].
+
+    Pydantic validates the generator's raw dictionaries with validate_default=True,
+    but static checkers correctly reject them as model instances. Validate each
+    nested default explicitly while preserving the OpenAPI values and omission.
+    """
+
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    replacements: list[tuple[int, int, str]] = []
+    tree = ast.parse(source)
+    model_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AnnAssign) or not isinstance(node.value, ast.List):
+            continue
+        value = node.value
+        annotation = node.annotation
+        if isinstance(annotation, ast.Subscript) and isinstance(annotation.slice, ast.Tuple):
+            annotation = annotation.slice.elts[0]
+        if not isinstance(annotation, ast.Subscript) or not isinstance(annotation.slice, ast.Name):
+            continue
+        model_name = annotation.slice.id
+        if model_name not in model_names:
+            continue
+        if not value.elts or not all(isinstance(item, ast.Dict) for item in value.elts):
+            continue
+        if value.end_lineno is None or value.end_col_offset is None:
+            continue
+        start = offsets[value.lineno - 1] + value.col_offset
+        end = offsets[value.end_lineno - 1] + value.end_col_offset
+        items = ", ".join(f"{model_name}.model_validate({ast.get_source_segment(source, item)})" for item in value.elts)
+        replacements.append((start, end, f"[{items}]"))
+    for start, end, replacement in sorted(replacements, reverse=True):
+        source = source[:start] + replacement + source[end:]
+    return source
 
 
 def _generate_operations(
@@ -145,13 +238,20 @@ def _generate_operations(
             if operation.operationId is None or operation.summary is None:
                 raise ContractGenerationError("operation metadata", path)  # noqa: TRY003
             operation_id = operation.operationId
-            request_model = _request_model(operation, schemas)
+            access = _access_requirement(operation, operation_id)
+            parameters = _operation_parameters(path_item, operation)
+            request_model = _request_model(operation, parameters, schemas)
             if request_model is not None:
                 imports.add(request_model[:2])
 
             success_status, success_response = _success_response(operation.responses, path)
-            response_model = _model_for_json_content(success_response.content, schemas, path)
-            imports.add(response_model[:2])
+            response_model = (
+                None
+                if success_response.content is None
+                else _model_for_json_content(success_response.content, schemas, path)
+            )
+            if response_model is not None:
+                imports.add(response_model[:2])
             operations.append(
                 _render_operation(
                     constant_name=operation_id.upper(),
@@ -160,14 +260,19 @@ def _generate_operations(
                     operation_id=operation_id,
                     request_model=None if request_model is None else request_model[1],
                     request_location=None if request_model is None else request_model[2],
-                    response_model=response_model[1],
+                    response_model=None if response_model is None else response_model[1],
+                    path_parameters=tuple(
+                        parameter.name for parameter in parameters if parameter.in_ is ParameterInType.path
+                    ),
                     success_status=success_status,
                     summary=operation.summary,
                     tags=tuple(operation.tags or ()),
+                    scope_mode=_scope_mode(operation),
                     responses={
                         int(code) if code.isdecimal() else code: _response_metadata(response)
                         for code, response in operation.responses.items()
                     },
+                    access=access,
                 )
             )
 
@@ -198,11 +303,21 @@ class Operation(BaseModel, Generic[RequestT, ResponseT]):
     operation_id: str
     request_type: type[RequestT] | None
     request_location: Literal["body", "query"] | None
-    response_type: type[ResponseT]
+    response_type: type[ResponseT] | None
+    path_parameters: tuple[str, ...]
     success_status: int
     summary: str
     tags: tuple[str, ...]
+    scope_mode: Literal["none", "current", "selection"]
     responses: dict[int | str, dict[str, JsonValue]]
+    access: AccessRequirement | None
+
+
+class AccessRequirement(BaseModel):
+    action: str | None
+    resource: Literal["server", "scope", "artifact"] | None
+    scope_id_field: str | None
+    resolver: str
 
 
 {rendered_operations}
@@ -261,7 +376,13 @@ def _with_candidate_evidence_limits(source: str, model_names: tuple[str, ...]) -
             raise ContractGenerationError("generated model class", model_name)  # noqa: TRY003
         next_class = updated.find("\nclass ", start + len(class_header))
         insert_at = next_class if next_class >= 0 else len(updated.rstrip())
-        updated = f"{updated[:insert_at].rstrip()}\n{_CANDIDATE_EVIDENCE_VALIDATOR.rstrip()}\n\n{updated[insert_at:].lstrip()}"
+        validator = _CANDIDATE_EVIDENCE_VALIDATOR
+        if "    memory_citations:" in updated[start:insert_at]:
+            validator = validator.replace(
+                "len(self.source_refs) + len(self.artifact_refs)",
+                "len(self.source_refs) + len(self.artifact_refs) + len(self.memory_citations or ())",
+            )
+        updated = f"{updated[:insert_at].rstrip()}\n{validator.rstrip()}\n\n{updated[insert_at:].lstrip()}"
     formatter = CodeFormatter(
         python_version=PythonVersion.PY_311,
         formatters=[Formatter.RUFF_FORMAT, Formatter.RUFF_CHECK],
@@ -272,6 +393,8 @@ def _with_candidate_evidence_limits(source: str, model_names: tuple[str, ...]) -
 
 
 def _with_model_validator_import(source: str) -> str:
+    if " model_validator," in source or "import model_validator" in source:
+        return source
     single_line_import = "from pydantic import BaseModel, ConfigDict, Field,"
     if single_line_import in source:
         return source.replace(
@@ -293,6 +416,7 @@ def _with_model_validator_import(source: str) -> str:
 
 def _request_model(
     operation: OpenAPIOperation,
+    parameters: tuple[Parameter, ...],
     schemas: dict[str, Schema | Reference],
 ) -> tuple[str, str, Literal["body", "query"]] | None:
     request_body = operation.requestBody
@@ -302,7 +426,7 @@ def _request_model(
         module, name = _model_for_json_content(request_body.content, schemas, "request body")
         return module, name, "body"
 
-    if not operation.parameters:
+    if not any(parameter.in_ is ParameterInType.query for parameter in parameters):
         return None
     operation_id = operation.operationId
     if operation_id is None:
@@ -313,6 +437,15 @@ def _request_model(
     return "powercontext.http._generated.models", query_model, "query"
 
 
+def _operation_parameters(path_item: PathItem, operation: OpenAPIOperation) -> tuple[Parameter, ...]:
+    parameters: list[Parameter] = []
+    for parameter in (*(path_item.parameters or ()), *(operation.parameters or ())):
+        if not isinstance(parameter, Parameter):
+            raise ContractGenerationError("parameter reference", parameter)  # noqa: TRY003
+        parameters.append(parameter)
+    return tuple(parameters)
+
+
 def _success_response(
     responses: dict[str, Response | object],
     path: str,
@@ -320,11 +453,16 @@ def _success_response(
     successes = [
         (int(code), response) for code, response in responses.items() if code.isdecimal() and 200 <= int(code) < 300
     ]
-    if len(successes) != 1:
+    if not successes:
         raise ContractGenerationError("success response", path)  # noqa: TRY003
     success_status, response = successes[0]
     if not isinstance(response, Response):
         raise ContractGenerationError("success response reference", path)  # noqa: TRY003
+    # Idempotent asynchronous operations can return accepted or terminal state
+    # with the same response model. The first status is the route's default.
+    for _, alternative in successes[1:]:
+        if not isinstance(alternative, Response) or alternative.content != response.content:
+            raise ContractGenerationError("success response schema", path)  # noqa: TRY003
     return success_status, response
 
 
@@ -353,6 +491,49 @@ def _response_metadata(response: Response | object) -> dict[str, JsonValue]:
     )
 
 
+def _access_requirement(operation: OpenAPIOperation, operation_id: str) -> _AccessRequirement | None:
+    value = (operation.model_extra or {}).get("x-powercontext-access")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ContractGenerationError(f"{operation_id} x-powercontext-access", value)  # noqa: TRY003
+    named_resolver = value.get("resolver")
+    if named_resolver is not None:
+        if not isinstance(named_resolver, str) or not named_resolver:
+            raise ContractGenerationError(f"{operation_id} access resolver", named_resolver)  # noqa: TRY003
+        return {
+            "action": None,
+            "resource": None,
+            "scope_id_field": None,
+            "resolver": named_resolver,
+        }
+    action = value.get("action")
+    resource_value = value.get("resource")
+    if isinstance(resource_value, dict):
+        resource = resource_value.get("type")
+        scope_id_field = resource_value.get("scope-id-from")
+    else:
+        # Accept the first implementation's flat shape while downstream branches
+        # regenerate their contract from the RFC 1396 nested form.
+        resource = resource_value
+        scope_id_field = value.get("scope_id_field")
+    resolver = "static" if resource == "server" else "request"
+    if not isinstance(action, str) or not action:
+        raise ContractGenerationError(f"{operation_id} access action", action)  # noqa: TRY003
+    if resource not in {"server", "scope", "artifact"}:
+        raise ContractGenerationError(f"{operation_id} access resource", resource)  # noqa: TRY003
+    if scope_id_field is not None and not isinstance(scope_id_field, str):
+        raise ContractGenerationError(f"{operation_id} access scope_id_field", scope_id_field)  # noqa: TRY003
+    if resource != "server" and resolver == "request" and not scope_id_field:
+        raise ContractGenerationError(f"{operation_id} access scope_id_field", scope_id_field)  # noqa: TRY003
+    return {
+        "action": action,
+        "resource": resource,
+        "scope_id_field": scope_id_field,
+        "resolver": resolver,
+    }
+
+
 def _render_operation(
     *,
     constant_name: str,
@@ -361,25 +542,48 @@ def _render_operation(
     operation_id: str,
     request_model: str | None,
     request_location: Literal["body", "query"] | None,
-    response_model: str,
+    response_model: str | None,
+    path_parameters: tuple[str, ...],
     success_status: int,
     summary: str,
     tags: tuple[str, ...],
+    scope_mode: Literal["none", "current", "selection"],
     responses: dict[int | str, dict[str, JsonValue]],
+    access: _AccessRequirement | None,
 ) -> str:
     request_type = "None" if request_model is None else request_model
-    return f"""{constant_name} = Operation[{request_type}, {response_model}](
+    response_type = "None" if response_model is None else response_model
+    rendered_access = (
+        "None"
+        if access is None
+        else "AccessRequirement("
+        f"action={access['action']!r}, "
+        f"resource={access['resource']!r}, "
+        f"scope_id_field={access['scope_id_field']!r}, "
+        f"resolver={access['resolver']!r})"
+    )
+    return f"""{constant_name} = Operation[{request_type}, {response_type}](
     method={method!r},
     path={path!r},
     operation_id={operation_id!r},
     request_type={request_type},
     request_location={request_location!r},
-    response_type={response_model},
+    path_parameters={path_parameters!r},
+    response_type={response_type},
     success_status={success_status},
     summary={summary!r},
     tags={tags!r},
+    scope_mode={scope_mode!r},
     responses={pformat(responses, width=100, sort_dicts=False)},
+    access={rendered_access},
 )"""
+
+
+def _scope_mode(operation: OpenAPIOperation) -> Literal["none", "current", "selection"]:
+    value = (operation.model_extra or {}).get("x-powercontext-scope-mode", "none")
+    if value not in {"none", "current", "selection"}:
+        raise ContractGenerationError("x-powercontext-scope-mode", value)
+    return value
 
 
 if __name__ == "__main__":

@@ -49,6 +49,14 @@ provider configuration, or set
 assistant turns are captured; system/tool messages are excluded and detected
 secrets are redacted before sending them to PowerContext.
 
+The provider advertises Hermes' pre-compress checkpoint API v2. When Hermes
+supplies its host-normalized evidence list, that list is captured instead of the
+raw transcript, so turns Hermes already replaced with a compression summary are
+not stored as fresh evidence. With `compression.checkpoint_required: true`,
+enable `capture_pre_compress` as well: if PowerContext cannot commit the
+checkpoint, the provider raises and Hermes keeps the uncompressed transcript
+instead of discarding it behind a failed capture.
+
 Evaluation tracing is also opt-in. Set `evaluation_trace: true` or
 `POWERCONTEXT_HERMES_EVALUATION_TRACE=1` to record context injections in
 per-session JSONL files under `$HERMES_HOME/powercontext/evaluation-trace/`.
@@ -66,11 +74,9 @@ authorization.
 When the provider is active, it also registers the bundled powercontext skill
 guide so Hermes has the workflow and authorization rules for those operations.
 
-Workstream persistence is enabled by default. When the current directory is a
-Git workspace, Hermes reads the shared
-.git/powercontext/codex-workspace.json binding used by the other integrations.
-An explicit scope_id configuration takes precedence. The /pc workstream
-command can inspect, create, or clear the binding.
+Hermes resolves Scope through PowerContext using an explicit Scope, durable
+session and workspace bindings, or the Server default. The `/pc scope` command
+can inspect, create, or clear the durable workspace binding.
 
 The standalone companion registers `/pc` and `/powercontext` during normal
 Hermes plugin discovery, so both aliases are known before the first Agent is
@@ -105,7 +111,7 @@ exposes that invocation context.
 /pc skill {propose|generate|get} PAYLOAD_JSON
 /pc external-skills {scan|list|resolve|import} [PAYLOAD_JSON]
 /pc review {list|get|approve|reject|revise} [PAYLOAD_JSON]
-/pc workstream {status|bind SCOPE_ID|clear}
+/pc scope {status|bind SCOPE_ID|clear}
 /pc call OPERATION [PAYLOAD_JSON]
 ```
 

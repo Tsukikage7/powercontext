@@ -16,9 +16,10 @@
 
 Every surface that opens or configures an HTTP connection to a Server -- the
 Python Client, the CLI, and the Agent integrations -- follows the same rule:
-plaintext HTTP is only trusted on a loopback address. Bearer credentials must
-never leave the machine over an unencrypted connection, and an unauthenticated
-Server must not bind to a routable address without an explicit opt-in.
+plaintext HTTP is accepted on loopback by default. A Client may explicitly opt
+into plaintext on another address; this does not disable HTTPS certificate
+verification. An unauthenticated Server must not bind to a routable address
+without its separate explicit opt-in.
 """
 
 from __future__ import annotations
@@ -60,8 +61,24 @@ def is_plaintext_non_loopback(url: str) -> bool:
     return parsed.scheme == "http" and not is_loopback_host(parsed.hostname)
 
 
+def canonical_loopback_endpoint(url: str) -> str | None:
+    """Return a comparison key for a loopback HTTP(S) service endpoint."""
+
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not is_loopback_host(parsed.hostname):
+        return None
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return None
+    path = parsed.path.rstrip("/")
+    return f"{scheme}://loopback:{port}{path}"
+
+
 __all__ = [
     "LOOPBACK_HOSTS",
+    "canonical_loopback_endpoint",
     "is_loopback_host",
     "is_plaintext_non_loopback",
 ]

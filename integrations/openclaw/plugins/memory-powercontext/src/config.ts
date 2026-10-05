@@ -18,26 +18,29 @@
 import { createHash } from "node:crypto";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveTransport } from "./transport.js";
 
 export type PowerContextConfig = {
   endpoint?: string;
+  allowInsecureHttp: boolean;
+  scopeId?: string;
   tokenEnv: string;
   timeoutMs: number;
   prepareMaxBytes: number;
+  contextAssembly?: Record<string, unknown>;
   autoRecall: boolean;
   autoCapture: boolean;
   captureMaxChars: number;
-  scopeMode: "agent" | "project";
 };
 
 const DEFAULT_CONFIG: PowerContextConfig = {
+  allowInsecureHttp: false,
   tokenEnv: "POWERCONTEXT_CLIENT_API_TOKEN",
   timeoutMs: 2500,
   prepareMaxBytes: 8000,
   autoRecall: true,
   autoCapture: true,
   captureMaxChars: 4000,
-  scopeMode: "agent",
 };
 
 function readPluginConfig(config: OpenClawConfig | undefined, fallback: unknown): Record<string, unknown> {
@@ -53,61 +56,36 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
     : fallback;
 }
 
-function normalizeEndpoint(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const endpoint = value.trim().replace(/\/+$/u, "");
-  if (!/^https?:\/\//iu.test(endpoint)) {
-    return undefined;
-  }
-  try {
-    const parsed = new URL(endpoint);
-    return parsed.username || parsed.password ? undefined : endpoint;
-  } catch {
-    return undefined;
-  }
-}
-
 export function resolvePowerContextConfig(
   config: OpenClawConfig | undefined,
   fallback?: unknown,
+  env: NodeJS.ProcessEnv = process.env,
 ): PowerContextConfig {
   const raw = readPluginConfig(config, fallback);
-  const endpoint = normalizeEndpoint(raw.endpoint);
+  const transport = resolveTransport("openclaw", env, raw.endpoint, raw.allowInsecureHttp);
+  const endpoint = transport.baseUrl;
+  const assembly = raw.contextAssembly;
+  if (assembly !== undefined && (!assembly || typeof assembly !== "object" || Array.isArray(assembly))) {
+    throw new Error("PowerContext contextAssembly must be an object");
+  }
   const tokenEnv =
     typeof raw.tokenEnv === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(raw.tokenEnv.trim())
       ? raw.tokenEnv.trim()
       : DEFAULT_CONFIG.tokenEnv;
-  const scopeMode = raw.scopeMode === "project" ? "project" : DEFAULT_CONFIG.scopeMode;
+  const scopeId = typeof raw.scopeId === "string" && raw.scopeId.trim() ? raw.scopeId.trim() : undefined;
   return {
     ...DEFAULT_CONFIG,
+    allowInsecureHttp: transport.allowInsecureHttp,
     ...(endpoint ? { endpoint } : {}),
+    ...(scopeId ? { scopeId } : {}),
     tokenEnv,
+    ...(assembly !== undefined ? { contextAssembly: structuredClone(assembly as Record<string, unknown>) } : {}),
     timeoutMs: boundedInteger(raw.timeoutMs, DEFAULT_CONFIG.timeoutMs, 250, 15000),
     prepareMaxBytes: boundedInteger(raw.prepareMaxBytes, DEFAULT_CONFIG.prepareMaxBytes, 512, 32768),
     autoRecall: raw.autoRecall !== false,
     autoCapture: raw.autoCapture !== false,
     captureMaxChars: boundedInteger(raw.captureMaxChars, DEFAULT_CONFIG.captureMaxChars, 128, 20000),
-    scopeMode,
   };
-}
-
-function encoded(value: string): string {
-  return encodeURIComponent(value.trim());
-}
-
-export function resolvePowerContextScope(
-  agentId: string,
-  config: PowerContextConfig,
-  activeProjectKeys?: readonly string[],
-): string {
-  const agent = encoded(agentId);
-  if (config.scopeMode !== "project" || activeProjectKeys?.length !== 1) {
-    return `openclaw:agent:${agent}`;
-  }
-  const projectHash = createHash("sha256").update(activeProjectKeys[0]).digest("hex").slice(0, 32);
-  return `openclaw:agent:${agent}:project:${projectHash}`;
 }
 
 export function opaqueSessionId(sessionId: string | undefined, sessionKey: string | undefined): string | undefined {

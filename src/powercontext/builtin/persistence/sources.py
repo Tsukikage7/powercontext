@@ -16,29 +16,52 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from contextlib import suppress
-from typing import Any, cast
+from typing import Any, Literal, cast
 
-from pydantic import BaseModel
-from sqlalchemy import func, insert, select, update
+import rfc8785
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
+from sqlalchemy import func, insert, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from powercontext.builtin.persistence.codec import dump_model, load_model, stored_bytes
+from powercontext.builtin.artifacts.experience import EXPERIENCE_INCUBATION_CURSOR_NAME
+from powercontext.builtin.artifacts.profile.models import PROFILE_SOURCE_WINDOW_BINDING
+from powercontext.builtin.artifacts.topic_memory import TOPIC_MEMORY_SOURCE_WINDOW_BINDING
+from powercontext.builtin.persistence.codec import load_model, stored_bytes
 from powercontext.builtin.persistence.errors import (
     IdentityMismatchError,
     InvalidRepositoryArgumentError,
     InvalidStoredColumnError,
+    InvalidStoredPayloadError,
     RepositoryNotFoundError,
     StoredPayloadConflictError,
 )
+from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
 from powercontext.builtin.persistence.tables import SOURCE_JOURNAL_HEADS_TABLE, SOURCES_TABLE
-from powercontext.errors import SourceAdapterNotFoundError, SourceConflictError
+from powercontext.builtin.sources.content import ContentSource
+from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
+from powercontext.errors import SourceDefinitionNotFoundError
 from powercontext.limits import MAX_SCOPE_ID_LENGTH
-from powercontext.sources import Source, SourceAdapter, SourceRef
+from powercontext.sources import Source, SourceAdapter, SourceDefinitionRegistry, SourceObservation, SourceRef
 
 _AnySourceAdapter = SourceAdapter[Any, Any, Any]
+_JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
+SOURCE_PROCESSING_BINDINGS = (
+    SOURCE_WINDOW_TRIGGER_NAME,
+    TOPIC_MEMORY_SOURCE_WINDOW_BINDING,
+    EXPERIENCE_INCUBATION_CURSOR_NAME,
+    PROFILE_SOURCE_WINDOW_BINDING,
+)
+
+
+class _StoredSourcePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    encoding: Literal["powercontext-source-v1"]
+    representation: Literal["native", "observation"]
+    value: dict[str, JsonValue]
 
 
 class StoredSource(BaseModel):
@@ -50,18 +73,18 @@ class StoredSource(BaseModel):
 
 
 class SourceRepository:
-    """Persist Sources using their concrete adapter routes."""
+    """Persist Sources using the Runtime's fixed Source Definition registry."""
 
-    def __init__(self, adapters: Iterable[_AnySourceAdapter], /) -> None:
-        self._by_name: dict[str, _AnySourceAdapter] = {}
-        self._by_source: dict[type[Source], _AnySourceAdapter] = {}
-        for adapter in adapters:
-            if adapter.name in self._by_name:
-                raise SourceConflictError("name", adapter.name)
-            if adapter.source_class in self._by_source:
-                raise SourceConflictError("source_class", adapter.source_class)
-            self._by_name[adapter.name] = adapter
-            self._by_source[adapter.source_class] = adapter
+    def __init__(
+        self,
+        definitions: SourceDefinitionRegistry | Iterable[_AnySourceAdapter],
+        /,
+    ) -> None:
+        self._registry = (
+            definitions
+            if isinstance(definitions, SourceDefinitionRegistry)
+            else SourceDefinitionRegistry.from_adapters(definitions)
+        )
 
     async def add(
         self,
@@ -72,16 +95,53 @@ class SourceRepository:
     ) -> StoredSource:
         """Add one stable Source or return an identical existing capture."""
 
+        stored, _created = await self.add_with_status(connection, scope_id, source)
+        return stored
+
+    async def add_with_status(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        source: Source,
+        /,
+    ) -> tuple[StoredSource, bool]:
+        """Add one Source and report whether this call inserted its journal row."""
+
         _require_identity("scope_id", scope_id, MAX_SCOPE_ID_LENGTH)
-        adapter = self._adapter_for_value(source)
-        ref = SourceRef(source_type=adapter.name, source_id=source.name)
-        payload = dump_model(source, kind="source", name=adapter.name)
+        if isinstance(source, SourceObservation):
+            ref = SourceRef(source_type=source.source_type, source_id=source.name)
+            representation: Literal["native", "observation"] = "observation"
+        else:
+            definition = self._registry.definition_for_source(source)
+            ref = SourceRef(source_type=definition.name, source_id=source.name)
+            representation = "native"
+        payload = _dump_source(source, representation=representation, name=ref.source_type)
         await _lock_journal_head(connection, scope_id)
         existing = await self._find_row(connection, scope_id, ref)
         if existing is not None:
-            if stored_bytes(existing["payload"], column="payload") != payload:
+            stored = self._decode_row(existing)
+            # A trusted acknowledgement may replay a pre-provenance receipt.
+            # Upgrade only its server-owned attestation, never its content or position.
+            if (
+                isinstance(source, ContentSource)
+                and source.handoff_receipt
+                and isinstance(stored.value, ContentSource)
+                and not stored.value.handoff_receipt
+                and stored.value.model_copy(update={"handoff_receipt": True}) == source
+            ):
+                await connection.execute(
+                    update(SOURCES_TABLE)
+                    .where(
+                        SOURCES_TABLE.c.scope_id == scope_id,
+                        SOURCES_TABLE.c.source_type == ref.source_type,
+                        SOURCES_TABLE.c.source_id == ref.source_id,
+                    )
+                    .values(payload=payload)
+                )
+                return StoredSource(ref=ref, value=source, journal_position=stored.journal_position), False
+            if stored.value != source:
                 raise StoredPayloadConflictError("source", (scope_id, ref))
-            return self._decode_row(existing)
+            return stored, False
 
         position = await _next_journal_position(connection, scope_id)
         try:
@@ -101,10 +161,17 @@ class SourceRepository:
             existing = await self._find_row(connection, scope_id, ref)
             if existing is None:
                 raise
-            if stored_bytes(existing["payload"], column="payload") != payload:
+            stored = self._decode_row(existing)
+            if stored.value != source:
                 raise StoredPayloadConflictError("source", (scope_id, ref)) from None
-            return self._decode_row(existing)
-        return StoredSource(ref=ref, value=source, journal_position=position)
+            return stored, False
+        # Centralized here so capture, record projection and import all publish
+        # discoverable input atomically. Replayed Source identities do not dirty
+        # a binding again. Disabled processors simply retain ordinary dirty.
+        intents = ArtifactProcessingIntentRepository()
+        for binding_name in SOURCE_PROCESSING_BINDINGS:
+            await intents.mark_dirty(connection, scope_id, binding_name)
+        return StoredSource(ref=ref, value=source, journal_position=position), True
 
     async def get(
         self,
@@ -121,6 +188,51 @@ class SourceRepository:
             raise RepositoryNotFoundError("source", (scope_id, ref))
         return self._decode_row(row)
 
+    async def get_many(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        refs: Sequence[SourceRef],
+        /,
+    ) -> tuple[StoredSource, ...]:
+        """Load exact Sources in first-requested order using one query."""
+
+        _require_identity("scope_id", scope_id, MAX_SCOPE_ID_LENGTH)
+        ordered: list[SourceRef] = []
+        identities: set[tuple[str, str]] = set()
+        for ref in refs:
+            identity = (ref.source_type, ref.source_id)
+            if identity not in identities:
+                ordered.append(ref)
+                identities.add(identity)
+        if not ordered:
+            return ()
+
+        rows = (
+            (
+                await connection.execute(
+                    select(SOURCES_TABLE).where(
+                        SOURCES_TABLE.c.scope_id == scope_id,
+                        tuple_(SOURCES_TABLE.c.source_type, SOURCES_TABLE.c.source_id).in_(tuple(identities)),
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+        decoded: dict[tuple[str, str], StoredSource] = {}
+        for row in rows:
+            try:
+                stored = self._decode_row(row)
+            except RepositoryNotFoundError:
+                ref = SourceRef(source_type=str(row["source_type"]), source_id=str(row["source_id"]))
+                raise RepositoryNotFoundError("source", (scope_id, ref)) from None
+            decoded[(stored.ref.source_type, stored.ref.source_id)] = stored
+        for ref in ordered:
+            if (ref.source_type, ref.source_id) not in decoded:
+                raise RepositoryNotFoundError("source", (scope_id, ref))
+        return tuple(decoded[(ref.source_type, ref.source_id)] for ref in ordered)
+
     async def list(
         self,
         connection: AsyncConnection,
@@ -128,26 +240,90 @@ class SourceRepository:
         /,
         *,
         after: int = 0,
+        through: int | None = None,
         limit: int | None = None,
+        source_type: str | None = None,
     ) -> tuple[StoredSource, ...]:
         """Return a stable journal-ordered page for one scope."""
+
+        return tuple([
+            item
+            async for item in self.iter_list(
+                connection,
+                scope_id,
+                after=after,
+                through=through,
+                limit=limit,
+                source_type=source_type,
+            )
+        ])
+
+    async def iter_list(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        /,
+        *,
+        after: int = 0,
+        through: int | None = None,
+        limit: int | None = None,
+        source_type: str | None = None,
+    ) -> AsyncGenerator[StoredSource, None]:
+        """Stream a stable journal-ordered page without decoding it eagerly."""
 
         _require_identity("scope_id", scope_id, MAX_SCOPE_ID_LENGTH)
         if after < 0:
             raise InvalidRepositoryArgumentError("after", "must be non-negative")
         if limit is not None and limit < 1:
             raise InvalidRepositoryArgumentError("limit", "must be positive")
-        statement = (
-            select(SOURCES_TABLE)
-            .where(
-                SOURCES_TABLE.c.scope_id == scope_id,
-                SOURCES_TABLE.c.journal_position > after,
-            )
-            .order_by(SOURCES_TABLE.c.journal_position)
-        )
+        if through is not None and through < after:
+            raise InvalidRepositoryArgumentError("through", "must not precede after")
+        predicates = [
+            SOURCES_TABLE.c.scope_id == scope_id,
+            SOURCES_TABLE.c.journal_position > after,
+        ]
+        if through is not None:
+            predicates.append(SOURCES_TABLE.c.journal_position <= through)
+        if source_type is not None:
+            predicates.append(SOURCES_TABLE.c.source_type == source_type)
+        statement = select(SOURCES_TABLE).where(*predicates).order_by(SOURCES_TABLE.c.journal_position)
         if limit is not None:
             statement = statement.limit(limit)
-        rows = (await connection.execute(statement)).mappings()
+        async with connection.stream(statement.execution_options(yield_per=1)) as result:
+            async for row in result.mappings():
+                yield self._decode_row(row)
+
+    async def list_window(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        /,
+        *,
+        after: int,
+        through: int,
+    ) -> tuple[StoredSource, ...]:
+        """Return the exact journal interval ``(after, through]``."""
+
+        _require_identity("scope_id", scope_id, MAX_SCOPE_ID_LENGTH)
+        if after < 0:
+            raise InvalidRepositoryArgumentError("after", "must be non-negative")
+        if through < after:
+            raise InvalidRepositoryArgumentError("through", "must not precede after")
+        rows = (
+            (
+                await connection.execute(
+                    select(SOURCES_TABLE)
+                    .where(
+                        SOURCES_TABLE.c.scope_id == scope_id,
+                        SOURCES_TABLE.c.journal_position > after,
+                        SOURCES_TABLE.c.journal_position <= through,
+                    )
+                    .order_by(SOURCES_TABLE.c.journal_position)
+                )
+            )
+            .mappings()
+            .all()
+        )
         return tuple(self._decode_row(row) for row in rows)
 
     async def journal_position(self, connection: AsyncConnection, scope_id: str, /) -> int:
@@ -163,17 +339,16 @@ class SourceRepository:
             raise InvalidStoredColumnError("journal_position", "an integer")
         return int(value)
 
-    def _adapter_for_value(self, source: Source) -> _AnySourceAdapter:
-        try:
-            return self._by_source[type(source)]
-        except KeyError:
-            raise SourceAdapterNotFoundError("source", type(source)) from None
+    async def read_value(self, source: Source, /) -> object:
+        """Read one decoded Source through the same registered adapter route."""
 
-    def _adapter_by_name(self, name: str) -> _AnySourceAdapter:
+        return await self._registry.read(source)
+
+    def _definition_by_name(self, name: str) -> _AnySourceAdapter:
         try:
-            return self._by_name[name]
-        except KeyError:
-            raise RepositoryNotFoundError("source-adapter", name) from None
+            return self._registry.definition_for_name(name)
+        except SourceDefinitionNotFoundError:
+            raise RepositoryNotFoundError("source-definition", name) from None
 
     async def _find_row(
         self,
@@ -198,22 +373,90 @@ class SourceRepository:
     def _decode_row(self, row: Mapping[Any, Any]) -> StoredSource:
         source_type = str(row["source_type"])
         source_id = str(row["source_id"])
-        adapter = self._adapter_by_name(source_type)
-        source = load_model(
-            adapter.source_class,
-            stored_bytes(row["payload"], column="payload"),
-            kind="source",
-            name=source_type,
-        )
+        payload = stored_bytes(row["payload"], column="payload")
+        try:
+            envelope = load_model(
+                _StoredSourcePayload,
+                payload,
+                kind="source-envelope",
+                name=source_type,
+            )
+        except InvalidStoredPayloadError:
+            source, decoded = self._decode_legacy_payload(source_type, payload)
+        else:
+            source, decoded = self._decode_envelope(source_type, envelope)
         indexed = SourceRef(source_type=source_type, source_id=source_id)
-        decoded = SourceRef(source_type=adapter.name, source_id=source.name)
         if indexed != decoded:
             raise IdentityMismatchError("source", indexed, decoded)
         return StoredSource(
             ref=indexed,
-            value=cast(Source, source),
+            value=source,
             journal_position=int(row["journal_position"]),
         )
+
+    def _decode_envelope(
+        self,
+        source_type: str,
+        envelope: _StoredSourcePayload,
+    ) -> tuple[Source, SourceRef]:
+        payload = rfc8785.dumps(envelope.value)
+        if envelope.representation == "observation":
+            source = load_model(
+                SourceObservation,
+                payload,
+                kind="projected-source",
+                name=source_type,
+            )
+            return source, SourceRef(source_type=source.source_type, source_id=source.name)
+
+        definition = self._definition_by_name(source_type)
+        source = load_model(
+            definition.source_class,
+            payload,
+            kind="source",
+            name=source_type,
+        )
+        self._registry.definition_for_source(source)
+        return source, SourceRef(source_type=definition.name, source_id=source.name)
+
+    def _decode_legacy_payload(self, source_type: str, payload: bytes) -> tuple[Source, SourceRef]:
+        try:
+            definition = self._definition_by_name(source_type)
+        except RepositoryNotFoundError:
+            source = load_model(
+                SourceObservation,
+                payload,
+                kind="projected-source",
+                name=source_type,
+            )
+            decoded = SourceRef(source_type=source.source_type, source_id=source.name)
+        else:
+            source = load_model(
+                definition.source_class,
+                payload,
+                kind="source",
+                name=source_type,
+            )
+            self._registry.definition_for_source(source)
+            decoded = SourceRef(source_type=definition.name, source_id=source.name)
+        return cast(Source, source), decoded
+
+
+def _dump_source(
+    source: Source,
+    *,
+    representation: Literal["native", "observation"],
+    name: str,
+) -> bytes:
+    try:
+        envelope = _StoredSourcePayload(
+            encoding="powercontext-source-v1",
+            representation=representation,
+            value=_JSON_OBJECT.validate_python(source.model_dump(mode="json", by_alias=True)),
+        )
+        return rfc8785.dumps(envelope.model_dump(mode="json"))
+    except (TypeError, ValueError) as error:
+        raise InvalidStoredPayloadError("source", name, "value is not JSON serializable") from error
 
 
 async def _next_journal_position(connection: AsyncConnection, scope_id: str) -> int:

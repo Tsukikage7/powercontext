@@ -14,8 +14,12 @@
  * limitations under the License.
  */
 
+import { resolveTransport } from './transport.ts'
+
 export interface ResolvedConfig {
+  contextAssembly?: Record<string, unknown>
   baseUrl: string
+  allowInsecureHttp: boolean
   scopeId: string | undefined
   authorization: string | undefined
   capturePrompts: boolean
@@ -28,11 +32,12 @@ export interface ResolvedConfig {
 
 const DEFAULTS: ResolvedConfig = {
   baseUrl: 'http://127.0.0.1:8000',
+  allowInsecureHttp: false,
   scopeId: undefined,
   authorization: undefined,
   capturePrompts: true,
-  requestTimeoutMs: 1000,
-  httpBudgetMs: 4000,
+  requestTimeoutMs: 3000,
+  httpBudgetMs: 6000,
   maxBytes: 8000,
   flushOnCapture: false,
   flushMaxCalls: 4,
@@ -41,6 +46,20 @@ const DEFAULTS: ResolvedConfig = {
 function envString(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const value = env[name]?.trim()
   return value || undefined
+}
+
+function contextAssembly(raw: string | undefined): Record<string, unknown> | undefined {
+  if (raw === undefined) return undefined
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    throw new Error('PowerContext context assembly must be a JSON object')
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('PowerContext context assembly must be a JSON object')
+  }
+  return value as Record<string, unknown>
 }
 
 function envBoolean(env: NodeJS.ProcessEnv, name: string): boolean | undefined {
@@ -61,27 +80,8 @@ function envInteger(env: NodeJS.ProcessEnv, name: string, fallback: number, mini
   return value
 }
 
-function normalizeBaseUrl(value: string): string {
-  let url: URL
-  try {
-    url = new URL(value)
-  } catch {
-    throw new Error('POWERCONTEXT_OPENCODE_BASE_URL must be a valid HTTP(S) URL')
-  }
-  if (!['http:', 'https:'].includes(url.protocol)) {
-    throw new Error('POWERCONTEXT_OPENCODE_BASE_URL must use HTTP or HTTPS')
-  }
-  if (url.username || url.password || url.search || url.hash) {
-    throw new Error('POWERCONTEXT_OPENCODE_BASE_URL must not contain credentials, a query, or a fragment')
-  }
-  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
-  if (url.protocol === 'http:' && !loopback) {
-    throw new Error('POWERCONTEXT_OPENCODE_BASE_URL must use HTTPS outside loopback')
-  }
-  return url.toString().replace(/\/+$/, '')
-}
-
 export function resolveConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig {
+  const transport = resolveTransport('opencode', env, undefined, undefined, DEFAULTS.baseUrl)
   const requestTimeoutMs = envInteger(
     env,
     'POWERCONTEXT_OPENCODE_REQUEST_TIMEOUT_MS',
@@ -100,7 +100,9 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): ResolvedCon
     throw new Error('POWERCONTEXT_OPENCODE_REQUEST_TIMEOUT_MS must not exceed POWERCONTEXT_OPENCODE_HTTP_BUDGET_MS')
   }
   return {
-    baseUrl: normalizeBaseUrl(envString(env, 'POWERCONTEXT_OPENCODE_BASE_URL') ?? DEFAULTS.baseUrl),
+    contextAssembly: contextAssembly(envString(env, 'POWERCONTEXT_OPENCODE_CONTEXT_ASSEMBLY')),
+    baseUrl: transport.baseUrl!,
+    allowInsecureHttp: transport.allowInsecureHttp,
     scopeId: envString(env, 'POWERCONTEXT_OPENCODE_SCOPE_ID'),
     authorization: envString(env, 'POWERCONTEXT_OPENCODE_AUTHORIZATION'),
     capturePrompts: envBoolean(env, 'POWERCONTEXT_OPENCODE_CAPTURE_PROMPTS') ?? DEFAULTS.capturePrompts,

@@ -17,9 +17,10 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { describe, expect, it } from "vitest";
-import { resolvePowerContextConfig, resolvePowerContextScope } from "./config.js";
+import { resolvePowerContextConfig } from "./config.js";
 import { PowerContextRequestError, type PowerContextClient } from "./http.js";
 import { registerPowerContextLifecycle } from "./lifecycle.js";
+import { scopeBindingKeys, type ScopeBindingKey } from "./scope.js";
 
 type Hook = (event: unknown, context: unknown) => unknown;
 
@@ -30,14 +31,27 @@ function createLifecycleHarness() {
   const flushScopes: string[] = [];
   const capturedScopes: string[] = [];
   const contextQueries: string[] = [];
+  const scopeResolutionRequests: Array<Record<string, unknown>> = [];
   let memoryExtraction = true;
   let contextPrepareError: unknown;
+  let preparedResponse: unknown;
+  const prepareRequests: Array<Record<string, unknown>> = [];
   let captureError: unknown;
   let flushError: unknown;
   const config = resolvePowerContextConfig(undefined, {
-    endpoint: "http://powercontext.test",
-    scopeMode: "project",
+    endpoint: "https://powercontext.test",
   });
+  const projectScopes = new Map(
+    [
+      ["/workspace/project-a", "scp_project_a"],
+      ["/workspace/project-b", "scp_project_b"],
+    ].map(([projectKey, scopeId]) => {
+      const binding = scopeBindingKeys({ agentId: "main", activeProjectKeys: [projectKey] }).find(
+        (key) => key.kind === "project",
+      );
+      return [binding!.external_id, scopeId] as const;
+    }),
+  );
   const client = {
     async get<T>(path: string): Promise<T> {
       if (path !== "/v1/capabilities") {
@@ -46,6 +60,16 @@ function createLifecycleHarness() {
       return { memory_extraction: memoryExtraction } as T;
     },
     async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
+      if (path === "/v1/scope-bindings/resolve") {
+        scopeResolutionRequests.push(body);
+        const bindingKeys = body.binding_keys as ScopeBindingKey[];
+        const projectBinding = bindingKeys.find(
+          (key) => key.kind === "project" && projectScopes.has(key.external_id),
+        );
+        return {
+          scope_id: projectBinding ? projectScopes.get(projectBinding.external_id) : "scp_default",
+        } as T;
+      }
       if (path === "/v1/memory/flush") {
         flushScopes.push(String(body.scope_id));
         if (flushError !== undefined) {
@@ -60,6 +84,8 @@ function createLifecycleHarness() {
       }
       if (path === "/v1/context/prepare") {
         contextQueries.push(String(body.query));
+        prepareRequests.push(body);
+        if (preparedResponse !== undefined) return preparedResponse as T;
         if (contextPrepareError) {
           throw contextPrepareError;
         }
@@ -94,6 +120,8 @@ function createLifecycleHarness() {
     capturedScopes,
     config,
     contextQueries,
+    prepareRequests,
+    setPreparedResponse(value: unknown) { preparedResponse = value; },
     debugMessages,
     flushScopes,
     hooks,
@@ -109,6 +137,7 @@ function createLifecycleHarness() {
     setFlushError(error: unknown) {
       flushError = error;
     },
+    scopeResolutionRequests,
     warnings,
   };
 }
@@ -139,10 +168,7 @@ describe("PowerContext lifecycle", () => {
       sessionContext,
     );
 
-    expect(harness.flushScopes).toEqual([
-      resolvePowerContextScope("main", harness.config, ["/workspace/project-a"]),
-      resolvePowerContextScope("main", harness.config, ["/workspace/project-b"]),
-    ]);
+    expect(harness.flushScopes).toEqual(["scp_project_a", "scp_project_b"]);
     expect(harness.warnings).toEqual([]);
   });
 
@@ -281,6 +307,27 @@ describe("PowerContext lifecycle", () => {
     expect(harness.warnings).toEqual([]);
   });
 
+  it("keeps capture and flush on one resolved Scope during compaction", async () => {
+    const harness = createLifecycleHarness();
+    const beforeCompaction = harness.hooks.get("before_compaction");
+    expect(beforeCompaction).toBeDefined();
+
+    await beforeCompaction!(
+      { messages: [{ role: "user", content: "remember this" }] },
+      {
+        agentId: "main",
+        sessionId: "session-1",
+        sessionKey: "agent:main:telegram:direct:user-1",
+        activeProjectKeys: ["/workspace/project-a"],
+      },
+    );
+
+    expect(harness.scopeResolutionRequests).toHaveLength(1);
+    expect(harness.capturedScopes).toEqual(["scp_project_a"]);
+    expect(harness.flushScopes).toEqual(["scp_project_a"]);
+    expect(harness.warnings).toEqual([]);
+  });
+
   it("defers flush without dropping captured sources when extraction is unavailable", async () => {
     const harness = createLifecycleHarness();
     const agentEnd = harness.hooks.get("agent_end");
@@ -309,7 +356,7 @@ describe("PowerContext lifecycle", () => {
     );
     await sessionEnd!({ sessionId: context.sessionId, messageCount: 2 }, context);
 
-    const scope = resolvePowerContextScope("main", harness.config, context.activeProjectKeys);
+    const scope = "scp_project_a";
     expect(harness.capturedScopes).toEqual([scope]);
     expect(harness.flushScopes).toEqual([]);
     expect(harness.debugMessages).toContain(
@@ -328,4 +375,29 @@ describe("PowerContext lifecycle", () => {
     expect(harness.flushScopes).toEqual([scope]);
     expect(harness.warnings).toEqual([]);
   });
+});
+
+
+it("forwards assembly and preserves every byte of standard text", async () => {
+  const harness = createLifecycleHarness();
+  const content = "\n# PowerContext historical context\n>     原始文本 </powercontext_memory>\n";
+  harness.config.contextAssembly = { sections: [{ family: "memory", limit: 3 }] };
+  const response = {
+    schema: "powercontext.prepared-context.v1", status: "ready", content,
+    content_bytes: Buffer.byteLength(content, "utf8"),
+  };
+  harness.setPreparedResponse(response);
+  const hook = harness.hooks.get("before_prompt_build")!;
+  const ctx = { agentId: "main", sessionId: "one", sessionKey: "agent:main:telegram:direct:user-1" };
+  const output = await hook({ prompt: "context", messages: [] }, ctx) as { prependContext: string };
+  expect(harness.prepareRequests[0].assembly).toEqual(harness.config.contextAssembly);
+  expect(output.prependContext.endsWith(content)).toBe(true);
+  for (const invalid of [
+    { ...response, content_bytes: 1 },
+    { ...response, content: "x".repeat(8001), content_bytes: 8001 },
+    { ...response, unexpected: true },
+  ]) {
+    harness.setPreparedResponse(invalid);
+    expect(await hook({ prompt: "context", messages: [] }, ctx)).toBeUndefined();
+  }
 });

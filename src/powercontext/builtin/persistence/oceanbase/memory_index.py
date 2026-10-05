@@ -44,12 +44,14 @@ from powercontext.builtin.artifacts.memory import (
 from powercontext.builtin.artifacts.memory.canonical import embedding_content_hash, validate_embedding
 from powercontext.builtin.persistence.memory_index import memory_channel_hits
 from powercontext.builtin.persistence.tables import (
+    ARTIFACT_HEADS_TABLE,
     MAX_MEMORY_ENTRY_ID_LENGTH,
     MAX_MEMORY_HASH_LENGTH,
     MEMORY_ENTRY_HEADS_TABLE,
     MEMORY_ENTRY_VERSIONS_TABLE,
     identity_string,
 )
+from powercontext.builtin.persistence.tags import memory_tag_parameters, memory_tag_sql, tag_predicate
 from powercontext.limits import MAX_ARTIFACT_ID_LENGTH, MAX_SCOPE_ID_LENGTH
 
 _OCEANBASE_FTS_INDEX_NAME = "ix_pc_memory_entry_heads_fts"
@@ -100,7 +102,7 @@ LIMIT :candidate_limit
 class OceanBaseMemoryFTSIndex:
     """OceanBase FULLTEXT strategy over the relational active-head projection."""
 
-    capabilities = MemoryCapabilities(fts=True)
+    capabilities = MemoryCapabilities(fts=True, tag_filter=True)
     tables: tuple[Table, ...] = ()
 
     async def initialize(self, connection: AsyncConnection, /) -> None:
@@ -116,6 +118,26 @@ class OceanBaseMemoryFTSIndex:
         await connection.execute(select(MEMORY_ENTRY_HEADS_TABLE.c.entry_version_id).where(probe).limit(1))
 
     async def replace(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        memory_ref: ArtifactRef,
+        projections: tuple[MemoryProjection, ...],
+        /,
+    ) -> None:
+        del connection, scope_id, memory_ref, projections
+
+    async def delete(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        memory_ref: ArtifactRef,
+        entry_ids: tuple[str, ...],
+        /,
+    ) -> None:
+        del connection, scope_id, memory_ref, entry_ids
+
+    async def upsert(
         self,
         connection: AsyncConnection,
         scope_id: str,
@@ -159,6 +181,20 @@ class OceanBaseMemoryFTSIndex:
                         tuple(memory.artifact_id for memory in request.memories)
                     ),
                     score,
+                    *(
+                        ()
+                        if request.tag_filter is None
+                        else (
+                            tag_predicate(
+                                scope_id,
+                                "memory",
+                                MEMORY_ENTRY_HEADS_TABLE.c.memory_artifact_id,
+                                "memory_entry",
+                                MEMORY_ENTRY_HEADS_TABLE.c.entry_id,
+                                request.tag_filter,
+                            ),
+                        )
+                    ),
                 )
                 .order_by(
                     score.desc(),
@@ -204,6 +240,7 @@ class OceanBaseMemoryVectorIndex:
             )
         self.profile = profile
         self.capabilities = MemoryCapabilities(
+            tag_filter=True,
             fts=False,
             vector=True,
             embedding_profile=profile,
@@ -238,6 +275,16 @@ class OceanBaseMemoryVectorIndex:
             bindparam("memory_artifact_ids", expanding=True),
             bindparam("query_vector", type_=VECTOR(profile.dimension)),
         )
+        self._tagged_search_sql = text(
+            _OCEANBASE_VECTOR_SEARCH_SQL.replace("ORDER BY", memory_tag_sql("m") + "ORDER BY").replace(
+                " APPROXIMATE", ""
+            )
+        ).bindparams(
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("tag_keys", expanding=True),
+            bindparam("tag_hashes", expanding=True),
+            bindparam("query_vector", type_=VECTOR(profile.dimension)),
+        )
 
     async def initialize(self, connection: AsyncConnection, /) -> None:
         if connection.dialect.name != "mysql":
@@ -268,6 +315,34 @@ class OceanBaseMemoryVectorIndex:
                 self.table.c.memory_artifact_id == memory_ref.artifact_id,
             )
         )
+        await self.upsert(connection, scope_id, memory_ref, projections)
+
+    async def delete(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        memory_ref: ArtifactRef,
+        entry_ids: tuple[str, ...],
+        /,
+    ) -> None:
+        if not entry_ids:
+            return
+        await connection.execute(
+            delete(self.table).where(
+                self.table.c.scope_id == scope_id,
+                self.table.c.memory_artifact_id == memory_ref.artifact_id,
+                self.table.c.entry_id.in_(entry_ids),
+            )
+        )
+
+    async def upsert(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        memory_ref: ArtifactRef,
+        projections: tuple[MemoryProjection, ...],
+        /,
+    ) -> None:
         values = []
         for projection in projections:
             if projection.embedding is None or projection.embedding_content_hash is None:
@@ -304,7 +379,7 @@ class OceanBaseMemoryVectorIndex:
             raise CapabilityNotSupportedError("vector")
         rows = (
             await connection.execute(
-                self._search_sql,
+                self._search_sql if request.tag_filter is None else self._tagged_search_sql,
                 {
                     "scope_id": scope_id,
                     "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
@@ -313,6 +388,7 @@ class OceanBaseMemoryVectorIndex:
                         dimension=self.profile.dimension,
                     ),
                     "candidate_limit": request.candidate_limit,
+                    **memory_tag_parameters(request.tag_filter),
                 },
             )
         ).mappings()
@@ -329,6 +405,17 @@ class OceanBaseMemoryVectorIndex:
         if profile != self.profile:
             return False
         for memory in memories:
+            current = await connection.scalar(
+                select(ARTIFACT_HEADS_TABLE.c.revision).where(
+                    ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
+                    ARTIFACT_HEADS_TABLE.c.family == "memory",
+                    ARTIFACT_HEADS_TABLE.c.artifact_id == memory.artifact_id,
+                )
+            )
+            if current is None or int(current) != memory.revision:
+                # The caller validated this head before the search. If it moved while
+                # this query ran, report a stale head so the runtime can retry with it.
+                raise CapabilityNotSupportedError("head")
             heads = (
                 await connection.execute(
                     select(
@@ -338,7 +425,6 @@ class OceanBaseMemoryVectorIndex:
                     ).where(
                         MEMORY_ENTRY_HEADS_TABLE.c.scope_id == scope_id,
                         MEMORY_ENTRY_HEADS_TABLE.c.memory_artifact_id == memory.artifact_id,
-                        MEMORY_ENTRY_HEADS_TABLE.c.head_revision == memory.revision,
                     )
                 )
             ).all()
@@ -352,7 +438,6 @@ class OceanBaseMemoryVectorIndex:
                     ).where(
                         self.table.c.scope_id == scope_id,
                         self.table.c.memory_artifact_id == memory.artifact_id,
-                        self.table.c.head_revision == memory.revision,
                     )
                 )
             ).all()

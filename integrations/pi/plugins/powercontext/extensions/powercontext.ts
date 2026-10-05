@@ -19,37 +19,31 @@ import { PowerContextClient } from '../src/client.ts'
 import { registerCommands } from '../src/commands.ts'
 import { resolveConfig } from '../src/config.ts'
 import { createPendingSourceFlusher } from '../src/flush.ts'
-import { createDiagnosticEmitter, failureEvent } from '../src/diagnostics.ts'
+import { createDiagnosticEmitter, diagnosticWriter, failureEvent } from '../src/diagnostics.ts'
 import { recallBeforeAgentStart, type PluginRuntime } from '../src/recall.ts'
-import { deriveScopeId } from '../src/scope.ts'
+import { resolveScopeId } from '../src/scope.ts'
 import { registerTools } from '../src/tools.ts'
+import { GUIDANCE } from '../src/guidance.ts'
 
 function createRuntime(): PluginRuntime {
   const config = resolveConfig()
   const client = new PowerContextClient({
     baseUrl: config.baseUrl,
+    allowInsecureHttp: config.allowInsecureHttp,
     authorization: config.authorization,
     requestTimeoutMs: config.requestTimeoutMs,
   })
-  const emitDiagnostic = createDiagnosticEmitter((line) => console.warn(line))
+  const emitDiagnostic = createDiagnosticEmitter(diagnosticWriter(config.diagnostics))
   const diagnostic = (event: string, error: unknown) => {
     const failure = failureEvent(event, error)
     if (failure) emitDiagnostic({ component: 'powercontext.pi', ...failure })
   }
   const flusher = createPendingSourceFlusher(client, config, diagnostic)
-  const scopes = new Map<string, Promise<string>>()
   return {
     client,
     config,
     resolveScope(cwd) {
-      const existing = scopes.get(cwd)
-      if (existing) return existing
-      const derived = deriveScopeId(cwd, { configuredScopeId: config.scopeId })
-      scopes.set(cwd, derived)
-      void derived.catch(() => {
-        if (scopes.get(cwd) === derived) scopes.delete(cwd)
-      })
-      return derived
+      return resolveScopeId(client, cwd, config.scopeId)
     },
     recordCapture: (scopeId, position) => flusher.record(scopeId, position),
     flushPending: (signal) => flusher.flush(signal),
@@ -72,15 +66,17 @@ export default function powercontextPi(pi: ExtensionAPI): void {
 
   pi.on('before_agent_start', async (event, ctx) => {
     if (!runtime) return undefined
-    return recallBeforeAgentStart({
+    const systemPrompt = `${event.systemPrompt}\n\n${GUIDANCE}`
+    const recalled = await recallBeforeAgentStart({
       prompt: event.prompt,
-      systemPrompt: event.systemPrompt,
+      systemPrompt,
       cwd: ctx.cwd,
       sessionId: ctx.sessionManager.getSessionId(),
       branch: ctx.sessionManager.getBranch(),
       signal: ctx.signal,
       runtime,
     })
+    return recalled ?? { systemPrompt }
   })
 
   pi.on('agent_end', (_event, ctx) => {

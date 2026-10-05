@@ -17,25 +17,30 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import shlex
 import shutil
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
+from importlib.metadata import version
 from pathlib import Path
-from typing import Annotated, Never
+from typing import TYPE_CHECKING, Annotated, Never
 from urllib.parse import urlsplit
 
 import typer
 from pydantic import ValidationError
 
 from powercontext.cli.env_file import EnvironmentFileError, parse_environment
+from powercontext.cli.inference_notice import write_inference_capability_notice
+
+if TYPE_CHECKING:
+    from powercontext.server.settings import ServerSettings
 
 HELP_OPTION_NAMES = ("-h", "--help")
 MANAGED_BEGIN = "# >>> powercontext managed configuration >>>"
@@ -70,16 +75,14 @@ class GeneratedConfiguration:
     """Canonical state rendered into one managed environment block."""
 
     config_version: int
-    scope_id: str
-    display_name: str
-    generation: ModelSelection
-    embedding: ModelSelection
-    embedding_profile_id: str
-    embedding_dimension: int
+    generation: ModelSelection | None
+    embedding: ModelSelection | None
+    embedding_profile_id: str | None
+    embedding_dimension: int | None
     database_kind: str
     database_url: str | None
     database_path: str | None
-    schedule_seconds: int
+    schedule_seconds: int | None
     credentials: tuple[str, ...] = ()
 
 
@@ -150,6 +153,21 @@ AGENTS: dict[str, tuple[str, str, str]] = {
         "opencode",
     ),
     "pi": ("Pi", "powercontext setup pi --source oceanbase/powercontext --ref master", "pi"),
+    "openclaw": (
+        "OpenClaw",
+        "powercontext setup openclaw --source oceanbase/powercontext --ref master",
+        "openclaw",
+    ),
+    "hermes": (
+        "Hermes",
+        "powercontext setup hermes --source oceanbase/powercontext --ref master",
+        "hermes",
+    ),
+    "workbuddy": (
+        "WorkBuddy",
+        "powercontext setup workbuddy --source oceanbase/powercontext --ref master",
+        "重启 WorkBuddy",
+    ),
 }
 
 # Input hints only, not a provider allowlist. Unknown prefixes can attach arbitrary variables.
@@ -165,8 +183,8 @@ _BASE_ENVIRONMENT: dict[str, str] = {
     "POWERCONTEXT_SERVER_HTTP_PORT": "8000",
     "POWERCONTEXT_SERVER_MCP_ENABLED": "true",
     "POWERCONTEXT_SERVER_MCP_PATH": "/mcp",
-    "POWERCONTEXT_SERVER_AUTH_ENABLED": "false",
-    "POWERCONTEXT_SERVER_DASHBOARD_ENABLED": "true",
+    "POWERCONTEXT_SERVER_DASHBOARD_ENABLED": "false",
+    "POWERCONTEXT_SERVER_ACCESS_MODE": "disabled",
     "POWERCONTEXT_SERVER_LOGGING_LEVEL": "INFO",
     "POWERCONTEXT_SERVER_LOGGING_FORMAT": "console",
     "POWERCONTEXT_SERVER_LOGGING_ACCESS": "true",
@@ -193,7 +211,7 @@ _BASE_ENVIRONMENT: dict[str, str] = {
     "POWERCONTEXT_OPENCODE_CAPTURE_PROMPTS": "true",
     "POWERCONTEXT_PI_CAPTURE_PROMPTS": "true",
 }
-_SCOPE_NAMES = (
+_EXPLICIT_SCOPE_NAMES = (
     "POWERCONTEXT_CODEX_SCOPE_ID",
     "POWERCONTEXT_CLAUDE_SCOPE_ID",
     "POWERCONTEXT_DSH_SCOPE_ID",
@@ -206,13 +224,19 @@ _OPTIONAL_MANAGED_NAMES = {
     "POWERCONTEXT_SERVER_DATABASE_URL",
     "POWERCONTEXT_SERVER_DATABASE_PATH",
 }
+_INFERENCE_REPLACEMENT_NAMES = {
+    "POWERCONTEXT_SERVER_RUNTIME_SCHEDULE_SECONDS",
+    "POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL",
+    "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL",
+    "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_PROFILE_ID",
+    "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION",
+}
 _ALL_FIXED_MANAGED_NAMES = (
     set(_BASE_ENVIRONMENT)
-    | set(_SCOPE_NAMES)
+    | set(_EXPLICIT_SCOPE_NAMES)
     | _KNOWN_PROVIDER_NAMES
     | _OPTIONAL_MANAGED_NAMES
     | {
-        "POWERCONTEXT_SERVER_DASHBOARD_SCOPES",
         "POWERCONTEXT_SERVER_DATABASE_KIND",
         "POWERCONTEXT_SERVER_RUNTIME_SCHEDULE_SECONDS",
         "POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL",
@@ -243,25 +267,47 @@ def main() -> None:
     """Manage environment-file configuration."""
 
 
+class WizardLanguage(StrEnum):
+    """Languages supported by the configuration wizard."""
+
+    ENGLISH = "en"
+    CHINESE = "zh"
+
+
 @app.command("init")
 def init_command(
     output: Annotated[Path, typer.Option("--output", "-o", help="Environment file to create.")] = Path(".env"),
-    force: Annotated[bool, typer.Option(help="Replace managed values in an existing file.")] = False,
-    advanced: Annotated[bool, typer.Option(help="Configure storage and scheduling choices.")] = False,
+    force: Annotated[
+        bool, typer.Option(help="Allow --template to replace an existing file after confirmation.")
+    ] = False,
+    advanced: Annotated[bool, typer.Option(help="Also ask about processing limits and logging.")] = False,
+    language: Annotated[
+        WizardLanguage | None,
+        typer.Option("--language", "-l", help="Wizard language; otherwise detect the system language."),
+    ] = None,
+    template: Annotated[
+        bool, typer.Option("--template", help="Use the basic model-free template instead of the guided setup.")
+    ] = False,
 ) -> None:
     """Create a working configuration through a short guided setup."""
+
+    if not template:
+        from powercontext.cli.config_wizard import run_wizard
+
+        run_wizard(output, language=None if language is None else language.value, advanced=advanced)
+        return
 
     if output.exists() and not force:
         _fail(f"{output} already exists; use --force")
     try:
+        existing = output.read_text(encoding="utf-8") if output.exists() else ""
         configuration = collect_configuration(advanced=advanced)
         _validate_operational_configuration(configuration)
         _print_summary(configuration)
-        if not typer.confirm(f"Write {output}?", default=True):
+        content = update_environment_document(existing, configuration)
+        if not _confirm_environment_write(output, existing=existing, updated=content):
             typer.echo("No changes written.")
             return
-        existing = output.read_text(encoding="utf-8") if output.exists() else ""
-        content = update_environment_document(existing, configuration)
         backup = write_environment(output, content, backup=output.exists())
     except (ConfigError, EnvironmentFileError, OSError, UnicodeError, ValidationError) as error:
         _fail(str(error))
@@ -291,31 +337,44 @@ def show_command(
 def validate_command(
     env_file: Annotated[Path, typer.Option(help="Environment file to validate.")] = Path(".env"),
 ) -> None:
-    """Validate syntax, model configuration, and Server settings."""
+    """Validate syntax, configured model adapters, and Server settings."""
 
     try:
         content = env_file.read_text(encoding="utf-8")
         values = parse_environment(content, source=str(env_file))
-        configuration = configuration_from_document(content)
-        _validate_operational_configuration(configuration, values=values)
+        if _has_complete_generated_configuration(values) or _managed_metadata(content):
+            configuration = configuration_from_document(content)
+            validate_configuration(configuration)
+        _validate_server_settings(values)
+        _validate_builtin_runtime(values)
     except (ConfigError, EnvironmentFileError, OSError, UnicodeError, ValidationError) as error:
         _fail(str(error))
     typer.echo(f"Configuration is valid: {env_file.resolve()}")
 
 
 def _print_summary(configuration: GeneratedConfiguration) -> None:
-    generation_url = next(
-        (variable.value for variable in configuration.generation.environment if _is_base_url_name(variable.name)),
-        "provider default",
+    generation_url = (
+        next(
+            (variable.value for variable in configuration.generation.environment if _is_base_url_name(variable.name)),
+            "provider default",
+        )
+        if configuration.generation is not None
+        else "not configured"
     )
-    embedding_url = next(
-        (variable.value for variable in configuration.embedding.environment if _is_base_url_name(variable.name)),
-        "provider default",
+    embedding_url = (
+        next(
+            (variable.value for variable in configuration.embedding.environment if _is_base_url_name(variable.name)),
+            "provider default",
+        )
+        if configuration.embedding is not None
+        else "not configured"
     )
     typer.secho("\nConfiguration", bold=True, fg=typer.colors.CYAN)
-    typer.echo(f"  Scope       {configuration.scope_id}")
-    typer.echo(f"  Generation  {configuration.generation.model.partition(':')[2]} ({generation_url})")
-    typer.echo(f"  Embedding   {configuration.embedding.model.partition(':')[2]} ({embedding_url})")
+    typer.echo("  Scope       Server default; integrations may bind a Session or workspace")
+    generation_model = "not configured" if configuration.generation is None else configuration.generation.model
+    embedding_model = "not configured" if configuration.embedding is None else configuration.embedding.model
+    typer.echo(f"  Generation  {generation_model} ({generation_url})")
+    typer.echo(f"  Embedding   {embedding_model} ({embedding_url})")
     typer.echo(f"  Database    {configuration.database_kind}")
 
 
@@ -323,49 +382,24 @@ def collect_configuration(
     *,
     advanced: bool = False,
 ) -> GeneratedConfiguration:
-    """Collect a short task-oriented configuration."""
+    """Collect a minimal deployment configuration without asking for model credentials."""
 
     typer.secho("\nPowerContext configuration", bold=True, fg=typer.colors.CYAN)
-    typer.echo("Press Enter to accept a default. Provider details are derived from the API protocol.\n")
-    scope_id = typer.prompt("Scope ID", default="project:quickstart").strip()
-    display_name = typer.prompt("Dashboard display name", default="Quick Start").strip()
-    generation, generation_credentials = _collect_connection("generation")
-    generation_protocol = _PROTOCOL_BY_ID.get(generation.protocol_id or "")
-    can_reuse = generation_protocol is not None and generation_protocol.embedding_adapter is not None
-    reuse = can_reuse and typer.confirm("Use this API connection for Embedding?", default=True)
-    if reuse and generation_protocol is not None:
-        embedding_model = typer.prompt(
-            "Embedding model", default=generation_protocol.default_embedding_model or "text-embedding-3-small"
-        ).strip()
-        embedding = ModelSelection(
-            model=f"{generation_protocol.embedding_adapter}:{embedding_model}",
-            environment=generation.environment,
-            protocol_id=generation_protocol.identifier,
-        )
-        embedding_credentials = generation_credentials
-    else:
-        embedding, embedding_credentials = _collect_connection("embedding")
-    dimension = typer.prompt("Embedding dimension", default=1536, type=int)
-    profile = _profile_id(embedding.model, dimension)
+    typer.echo("This setup creates a runnable Server without configuring an inference provider.\n")
     if advanced:
         database_kind, database_url, database_path = _collect_database()
-        schedule = typer.prompt("Source processing interval in seconds", default=60, type=int)
     else:
         database_kind, database_url, database_path = "sqlite", None, None
-        schedule = 60
     return GeneratedConfiguration(
         config_version=CONFIG_VERSION,
-        scope_id=scope_id,
-        display_name=display_name,
-        generation=generation,
-        embedding=embedding,
-        embedding_profile_id=profile,
-        embedding_dimension=dimension,
+        generation=None,
+        embedding=None,
+        embedding_profile_id=None,
+        embedding_dimension=None,
         database_kind=database_kind,
         database_url=database_url,
         database_path=database_path,
-        schedule_seconds=schedule,
-        credentials=tuple(dict.fromkeys(generation_credentials + embedding_credentials)),
+        schedule_seconds=None,
     )
 
 
@@ -373,26 +407,25 @@ def render_environment(configuration: GeneratedConfiguration) -> dict[str, str]:
     """Render canonical configuration into environment assignments."""
 
     values = dict(_BASE_ENVIRONMENT)
-    values.update({
-        "POWERCONTEXT_SERVER_DASHBOARD_SCOPES": json.dumps(
-            [{"scope_id": configuration.scope_id, "display_name": configuration.display_name}],
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ),
-        "POWERCONTEXT_SERVER_DATABASE_KIND": configuration.database_kind,
-        "POWERCONTEXT_SERVER_RUNTIME_SCHEDULE_SECONDS": str(configuration.schedule_seconds),
-        "POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL": configuration.generation.model,
-        "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL": configuration.embedding.model,
-        "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_PROFILE_ID": configuration.embedding_profile_id,
-        "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION": str(configuration.embedding_dimension),
-    })
-    values.update(dict.fromkeys(_SCOPE_NAMES, configuration.scope_id))
+    values["POWERCONTEXT_SERVER_DATABASE_KIND"] = configuration.database_kind
+    if configuration.schedule_seconds is not None:
+        values["POWERCONTEXT_SERVER_RUNTIME_SCHEDULE_SECONDS"] = str(configuration.schedule_seconds)
+    if configuration.generation is not None:
+        values["POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL"] = configuration.generation.model
+    if configuration.embedding is not None:
+        values["POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL"] = configuration.embedding.model
+        if configuration.embedding_profile_id is not None:
+            values["POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_PROFILE_ID"] = configuration.embedding_profile_id
+        if configuration.embedding_dimension is not None:
+            values["POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION"] = str(configuration.embedding_dimension)
     if configuration.database_url is not None:
         values["POWERCONTEXT_SERVER_DATABASE_URL"] = configuration.database_url
     if configuration.database_path is not None:
         values["POWERCONTEXT_SERVER_DATABASE_PATH"] = configuration.database_path
-    _merge_provider_values(values, configuration.generation)
-    _merge_provider_values(values, configuration.embedding)
+    if configuration.generation is not None:
+        _merge_provider_values(values, configuration.generation)
+    if configuration.embedding is not None:
+        _merge_provider_values(values, configuration.embedding)
     return values
 
 
@@ -401,9 +434,11 @@ def render_managed_block(configuration: GeneratedConfiguration) -> str:
 
     metadata = [
         f"# config-version={configuration.config_version}",
-        f"# generation-environment={_environment_names(configuration.generation)}",
-        f"# embedding-environment={_environment_names(configuration.embedding)}",
     ]
+    if configuration.generation is not None:
+        metadata.append(f"# generation-environment={_environment_names(configuration.generation)}")
+    if configuration.embedding is not None:
+        metadata.append(f"# embedding-environment={_environment_names(configuration.embedding)}")
     if configuration.credentials:
         metadata.append(f"# credentials={','.join(configuration.credentials)}")
     assignments = tuple(f"{name}={shlex.quote(value)}" for name, value in render_environment(configuration).items())
@@ -426,11 +461,10 @@ def update_environment_document(content: str, configuration: GeneratedConfigurat
         if end < start:
             raise ConfigError("PowerContext managed markers are out of order")  # noqa: TRY003
         return _join_document_parts(content[:start].rstrip(), block.rstrip(), content[end:].strip("\n"))
-    managed_names = _ALL_FIXED_MANAGED_NAMES | {
-        variable.name
-        for selection in (configuration.generation, configuration.embedding)
-        for variable in selection.environment
-    }
+    managed_names = set(_ALL_FIXED_MANAGED_NAMES)
+    for selection in (configuration.generation, configuration.embedding):
+        if selection is not None:
+            managed_names.update(variable.name for variable in selection.environment)
     retained = []
     for line in content.splitlines():
         match = _ASSIGNMENT_NAME.match(line.strip())
@@ -444,48 +478,62 @@ def configuration_from_document(content: str) -> GeneratedConfiguration:
 
     values = parse_environment(content)
     metadata = _managed_metadata(content)
-    generation_model = _required(values, "POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL")
-    embedding_model = _required(values, "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL")
-    scope_id, display_name = _scope(values)
+    generation_model = values.get("POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL")
+    embedding_model = values.get("POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL")
+    generation = (
+        ModelSelection(generation_model, _provider_variables("generation", generation_model, metadata, values))
+        if generation_model
+        else None
+    )
+    embedding = (
+        ModelSelection(embedding_model, _provider_variables("embedding", embedding_model, metadata, values))
+        if embedding_model
+        else None
+    )
+    embedding_dimension = values.get("POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION")
     return GeneratedConfiguration(
         config_version=_parse_integer(str(metadata.get("config-version", CONFIG_VERSION)), "config-version"),
-        scope_id=scope_id,
-        display_name=display_name,
-        generation=ModelSelection(
-            generation_model, _provider_variables("generation", generation_model, metadata, values)
-        ),
-        embedding=ModelSelection(embedding_model, _provider_variables("embedding", embedding_model, metadata, values)),
-        embedding_profile_id=_required(values, "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_PROFILE_ID"),
-        embedding_dimension=_parse_integer(
-            _required(values, "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION"),
-            "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION",
+        generation=generation,
+        embedding=embedding,
+        embedding_profile_id=values.get("POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_PROFILE_ID"),
+        embedding_dimension=(
+            None
+            if embedding_dimension is None
+            else _parse_integer(embedding_dimension, "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION")
         ),
         database_kind=values.get("POWERCONTEXT_SERVER_DATABASE_KIND", "sqlite"),
         database_url=values.get("POWERCONTEXT_SERVER_DATABASE_URL"),
         database_path=values.get("POWERCONTEXT_SERVER_DATABASE_PATH"),
-        schedule_seconds=_parse_integer(
-            values.get("POWERCONTEXT_SERVER_RUNTIME_SCHEDULE_SECONDS", "60"),
-            "POWERCONTEXT_SERVER_RUNTIME_SCHEDULE_SECONDS",
+        schedule_seconds=(
+            None
+            if "POWERCONTEXT_SERVER_RUNTIME_SCHEDULE_SECONDS" not in values
+            else _parse_integer(
+                values["POWERCONTEXT_SERVER_RUNTIME_SCHEDULE_SECONDS"],
+                "POWERCONTEXT_SERVER_RUNTIME_SCHEDULE_SECONDS",
+            )
         ),
         credentials=tuple(name for name in metadata.get("credentials", "").split(",") if name),
     )
 
 
 def validate_configuration(configuration: GeneratedConfiguration) -> None:
-    """Validate model, environment, database, Scope, and runtime contracts."""
+    """Validate model, environment, database, and runtime contracts."""
 
     if configuration.config_version != CONFIG_VERSION:
         raise ConfigError(f"unsupported config version: {configuration.config_version}")  # noqa: TRY003
-    if not configuration.scope_id.strip() or not configuration.display_name.strip():
-        raise ConfigError("Scope ID and Dashboard display name are required")  # noqa: TRY003
-    if len(configuration.scope_id) > 255:
-        raise ConfigError("Scope ID must contain at most 255 characters")  # noqa: TRY003
-    if len(configuration.display_name) > 80:
-        raise ConfigError("Dashboard display name must contain at most 80 characters")  # noqa: TRY003
-    if configuration.embedding_dimension < 1 or configuration.schedule_seconds < 1:
-        raise ConfigError("Embedding dimension and Source interval must be positive")  # noqa: TRY003
-    _validate_model_selection("Generation", configuration.generation)
-    _validate_model_selection("Embedding", configuration.embedding)
+    if configuration.generation is not None:
+        _validate_model_selection("Generation", configuration.generation)
+    if configuration.embedding is None:
+        if configuration.embedding_profile_id is not None or configuration.embedding_dimension is not None:
+            raise ConfigError("Embedding profile and dimension require an embedding model")  # noqa: TRY003
+    else:
+        if configuration.embedding_profile_id is None or configuration.embedding_dimension is None:
+            raise ConfigError("Embedding model requires profile ID and dimension")  # noqa: TRY003
+        if configuration.embedding_dimension < 1:
+            raise ConfigError("Embedding dimension must be positive")  # noqa: TRY003
+        _validate_model_selection("Embedding", configuration.embedding)
+    if configuration.schedule_seconds is not None and configuration.schedule_seconds < 1:
+        raise ConfigError("Source interval must be positive")  # noqa: TRY003
     if configuration.database_kind not in {"sqlite", "oceanbase", "seekdb"}:
         raise ConfigError(f"unsupported database: {configuration.database_kind}")  # noqa: TRY003
     if configuration.database_kind == "oceanbase" and not configuration.database_url:
@@ -500,7 +548,7 @@ def _validate_storage_location(configuration: GeneratedConfiguration) -> None:
         and configuration.database_path is not None
         and not Path(configuration.database_path).expanduser().is_absolute()
     ):
-        raise ConfigError("seekDB path must be absolute")  # noqa: TRY003
+        raise ConfigError("seekdb path must be absolute")  # noqa: TRY003
     if configuration.database_kind != "sqlite" or configuration.database_url is None:
         return
     from sqlalchemy.engine import make_url
@@ -522,23 +570,50 @@ def _validate_operational_configuration(
     validate_configuration(configuration)
     rendered = render_environment(configuration) if values is None else dict(values)
     _validate_server_settings(rendered)
-    _validate_provider_models(configuration, rendered)
+    _validate_builtin_runtime(rendered)
 
 
-def _validate_provider_models(configuration: GeneratedConfiguration, values: Mapping[str, str]) -> None:
-    with _temporary_environment(values, clear=set()):
+def _validate_builtin_runtime(values: Mapping[str, str]) -> None:
+    server_environment = {name for name in os.environ if name.startswith("POWERCONTEXT_SERVER_")}
+    with _temporary_environment(values, clear=server_environment):
         try:
-            asyncio.run(_construct_provider_models(configuration))
+            settings = _server_settings_from_environment()
+            from powercontext.builtin.runtime.composition import preflight_builtin_runtime
+            from powercontext.builtin.runtime.config import BuiltinConfig
+
+            asyncio.run(
+                preflight_builtin_runtime(
+                    BuiltinConfig(
+                        runtime=settings.runtime,
+                        database=settings.database,
+                        handoff_report=settings.handoff_report,
+                        inference=settings.inference,
+                        external_skills=settings.external_skills,
+                    )
+                )
+            )
+        except ConfigError:
+            raise
         except Exception as error:
-            raise ConfigError(f"provider models cannot be configured: {error}") from error  # noqa: TRY003
+            raise ConfigError(f"built-in runtime cannot be configured: {error}") from error  # noqa: TRY003
 
 
-async def _construct_provider_models(configuration: GeneratedConfiguration) -> None:
-    from pydantic_ai.embeddings import infer_embedding_model
-    from pydantic_ai.models import infer_model
+def _server_settings_from_environment() -> ServerSettings:
+    from powercontext.server.settings import ServerSettings
 
-    async with infer_model(configuration.generation.model):
-        infer_embedding_model(configuration.embedding.model)
+    return ServerSettings()
+
+
+def _has_complete_generated_configuration(values: Mapping[str, str]) -> bool:
+    return all(
+        name in values
+        for name in (
+            "POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL",
+            "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL",
+            "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_PROFILE_ID",
+            "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION",
+        )
+    )
 
 
 def write_environment(path: Path, content: str, *, backup: bool) -> Path | None:
@@ -763,7 +838,7 @@ def _select_value(prompt: str, choices: Sequence[tuple[str, str]], default: str)
 
 def _collect_database() -> tuple[str, str | None, str | None]:
     choices = ("sqlite", "oceanbase", "seekdb")
-    labels = ("SQLite", "OceanBase", "embedded seekDB")
+    labels = ("SQLite", "OceanBase", "embedded seekdb")
     kind = choices[_choose("Database", labels, 1) - 1]
     if kind == "oceanbase":
         value = typer.prompt(
@@ -774,7 +849,7 @@ def _collect_database() -> tuple[str, str | None, str | None]:
         ).strip()
         return kind, value or None, None
     if kind == "seekdb":
-        value = typer.prompt("seekDB path (empty uses user data directory)", default="").strip()
+        value = typer.prompt("seekdb path (empty uses user data directory)", default="").strip()
         return kind, None, value or None
     value = typer.prompt("SQLite URL (empty uses user data database)", default="").strip()
     return kind, value or None, None
@@ -837,17 +912,6 @@ def _environment_names(selection: ModelSelection) -> str:
     return ",".join(variable.name for variable in selection.environment)
 
 
-def _scope(values: Mapping[str, str]) -> tuple[str, str]:
-    raw = _required(values, "POWERCONTEXT_SERVER_DASHBOARD_SCOPES")
-    try:
-        first = json.loads(raw)[0]
-        return str(first["scope_id"]), str(first["display_name"])
-    except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
-        raise ConfigError(  # noqa: TRY003
-            "Dashboard scopes must contain one scope_id and display_name"
-        ) from error
-
-
 def _required(values: Mapping[str, str], name: str) -> str:
     value = values.get(name)
     if value is None or not value.strip():
@@ -858,7 +922,7 @@ def _required(values: Mapping[str, str], name: str) -> str:
 def _is_secret_name(name: str) -> bool:
     return (
         name in _SECRET_NAMES
-        or name.endswith(("_KEY", "_PASSWORD", "_SECRET", "_TOKEN"))
+        or name.endswith(("_KEY", "_PASSWORD", "_SECRET", "_TOKEN", "_AUTHORIZATION"))
         or "_KEY_" in name
         or name.endswith(_CREDENTIAL_CONTAINER_SUFFIXES)
     )
@@ -914,7 +978,7 @@ def _validate_server_settings(values: Mapping[str, str]) -> None:
 
 
 @contextmanager
-def _temporary_environment(values: Mapping[str, str], *, clear: set[str]) -> Iterator[None]:
+def _temporary_environment(values: Mapping[str, str], *, clear: set[str]) -> Generator[None, None, None]:
     original = {name: os.environ.get(name) for name in clear | set(values)}
     try:
         for name in clear:
@@ -935,12 +999,56 @@ def _report_written(path: Path, backup: Path | None) -> None:
         typer.echo(f"Backup: {backup.resolve()}")
 
 
+def _confirm_environment_write(path: Path, *, existing: str, updated: str) -> bool:
+    if not _removes_inference_configuration(existing, updated):
+        return typer.confirm(f"Write {path}?", default=True)
+    typer.secho(
+        f"\nWarning: replacing {path} will remove existing model, embedding, inference schedule, "
+        "or provider credential settings.",
+        bold=True,
+        fg=typer.colors.YELLOW,
+    )
+    typer.echo("A mode-0600 backup will be created before the file is replaced.")
+    return typer.confirm("Replace them with a model-free configuration?", default=False)
+
+
+def _removes_inference_configuration(existing: str, updated: str) -> bool:
+    if not existing:
+        return False
+    before = parse_environment(existing)
+    after = parse_environment(updated)
+    metadata = _managed_metadata(existing)
+    candidates = set(_INFERENCE_REPLACEMENT_NAMES) | _KNOWN_PROVIDER_NAMES
+    for key in ("generation-environment", "embedding-environment", "credentials"):
+        candidates.update(name for name in metadata.get(key, "").split(",") if name)
+    return any(name in before and name not in after for name in candidates)
+
+
 def _print_next_steps(path: Path) -> None:
     quoted = shlex.quote(str(path.resolve()))
+    typer.secho("\nEnvironment file", bold=True, fg=typer.colors.CYAN)
+    typer.echo(f"  Path          {path.resolve()} (mode 0600)")
+    typer.echo("  Authentication disabled by default.")
+    typer.echo(
+        "  If Bearer authentication is enabled, read POWERCONTEXT_SERVER_AUTH_TOKEN from this file;"
+        " the value is never printed."
+    )
     typer.echo(f"\nStart Server:\n  powercontext server run --env-file {quoted}")
+    write_inference_capability_notice(generation_model=None, embedding_model=None)
     typer.secho("\nSupported Coding Agents (choose one):", bold=True, fg=typer.colors.CYAN)
-    for name, setup, launch in AGENTS.values():
-        typer.echo(f"\n{name}:\n  {setup}\n  set -a; . {quoted}; set +a; {launch}")
+    for host, (name, setup, launch) in AGENTS.items():
+        if host == "dsh":
+            installed = version("powercontext")
+            setup = (
+                f"powercontext setup dsh --source oceanbase/powercontext --ref powercontext-v{installed}"
+                if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:(?:a|b|rc)[0-9]+)?", installed)
+                else "powercontext setup dsh --source /path/to/matching-powercontext-checkout"
+            )
+        typer.echo(f"\n{name}:\n  {setup}")
+        if launch.startswith("重启"):
+            typer.echo(f"  {launch}")
+        else:
+            typer.echo(f"  set -a; . {quoted}; set +a; {launch}")
 
 
 def _fail(message: str) -> Never:

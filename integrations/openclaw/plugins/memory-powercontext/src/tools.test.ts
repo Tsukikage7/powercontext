@@ -42,7 +42,7 @@ describe("PowerContext tools", () => {
     } as OpenClawPluginToolContext;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
     };
 
@@ -60,7 +60,7 @@ describe("PowerContext tools", () => {
     } as OpenClawPluginToolContext;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
     };
 
@@ -84,7 +84,7 @@ describe("PowerContext tools", () => {
     const manager = {} as never;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
       managerFor: () => manager,
     };
@@ -107,7 +107,7 @@ describe("PowerContext tools", () => {
     } as OpenClawPluginToolContext;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
     };
     const tool = createMemorySearchTool(context, deps);
@@ -130,7 +130,7 @@ describe("PowerContext tools", () => {
     } as OpenClawPluginToolContext;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
     };
     const tool = createMemoryGetTool(context, deps);
@@ -150,7 +150,7 @@ describe("PowerContext tools", () => {
       entry_id: "entry-1",
       entry_version_id: "version-1",
     });
-    const config = () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" });
+    const config = () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" });
     const domainClient = (status: number) => ({
       async post() {
         throw new PowerContextRequestError("/v1/memory/entries/get", "domain error", status);
@@ -178,5 +178,40 @@ describe("PowerContext tools", () => {
       isPrivateSession: () => true,
     })!.execute("call-3", { text: "fact", kind: "fact" });
     expect(invalidRequest.details).toMatchObject({ status: "invalid_request", code: "invalid_request" });
+  });
+
+  it("uses the Server-resolved Scope for a memory mutation", async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const client = {
+      async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
+        requests.push({ path, body });
+        if (path === "/v1/scope-bindings/resolve") {
+          return { scope_id: "scp_resolved" } as T;
+        }
+        return {
+          memory: { family: "memory", artifact_id: "artifact-1", revision: 1 },
+          entry: null,
+        } as T;
+      },
+    } as unknown as PowerContextClient;
+    const context = {
+      agentId: "main",
+      sessionKey: "agent:main:telegram:direct:user-1",
+      activeProjectKeys: ["/workspace/project"],
+    } as OpenClawPluginToolContext;
+    const deps = {
+      client,
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
+      isPrivateSession: () => true,
+    };
+
+    const result = await createMemoryStoreTool(context, deps)!.execute("call-1", { text: "durable fact" });
+
+    expect(result.details).toMatchObject({ status: "stored", revision: 1 });
+    expect(requests.map((request) => request.path)).toEqual([
+      "/v1/scope-bindings/resolve",
+      "/v1/memory/remember",
+    ]);
+    expect(requests[1].body).toMatchObject({ scope_id: "scp_resolved", text: "durable fact" });
   });
 });

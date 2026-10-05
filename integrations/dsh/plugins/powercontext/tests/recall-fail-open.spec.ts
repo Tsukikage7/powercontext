@@ -19,10 +19,11 @@ import { PowerContextClient } from '../src/client.ts'
 import { ServerResponseError, UnavailableError } from '../src/errors.ts'
 import { runRecallPreStep, type RecallInput } from '../src/recall.ts'
 import type { ResolvedConfig } from '../src/config.ts'
-import { deriveScopeId } from '../src/scope.ts'
 
 const config: ResolvedConfig = {
+  sources: { baseUrl: 'plugin', authorization: 'default', scopeId: 'plugin' },
   baseUrl: 'http://127.0.0.1:8000',
+  allowInsecureHttp: false,
   authorization: undefined,
   scopeId: 'project:demo',
   timeoutMs: 4000,
@@ -241,23 +242,19 @@ describe('runRecallPreStep fail-open', () => {
     }
   })
 
-  it('skips recall when cwd is missing and scopeId is not configured', async () => {
+  it('recalls from the Server default when cwd and scopeId are absent', async () => {
     const next = vi.fn(async () => ({ kind: 'enter' as const, messages: [{ id: 'user' }] }))
     const log = vi.fn()
     const result = await runRecallPreStep(input({
       next,
       cwd: undefined,
       config: { ...config, scopeId: undefined },
-      resolveScope: (cwd) => deriveScopeId(cwd),
+      resolveScope: async () => 'default-scope',
       log,
     }))
     expect(next).toHaveBeenCalledOnce()
     expect(result).toEqual({ kind: 'enter', messages: [{ id: 'user' }] })
-    expect(log).toHaveBeenCalledWith({
-      event: 'context_prepare',
-      outcome: 'skipped',
-      reason: 'missing_session_cwd',
-    })
+    expect(log).toHaveBeenCalled()
   })
 
   it('recalls with configured scopeId and omits a fabricated cwd from Source', async () => {
@@ -280,7 +277,7 @@ describe('runRecallPreStep fail-open', () => {
     await runRecallPreStep(input({
       cwd: undefined,
       client: { request } as never,
-      resolveScope: (cwd) => deriveScopeId(cwd, { configuredScopeId: 'project:demo' }),
+      resolveScope: async () => 'project:demo',
     }))
     const capture = request.mock.calls.find((call) => call[0] === 'capture_content_source')
     expect(capture?.[0]).toBe('capture_content_source')
@@ -421,4 +418,22 @@ describe('runRecallPreStep fail-open', () => {
     })
     expect(log).toHaveBeenCalledWith({ event: 'capture_content_source', outcome: 'ok', status: 202 })
   })
+})
+
+
+it('forwards explicit assembly and delivers standard text intact', async () => {
+  const content = '\n# PowerContext historical context\n>     原始文本\n'
+  const assembly = { sections: [{ family: 'memory', limit: 3 }], show: ['recall_rank'] }
+  const request = vi.fn(async () => ({
+    kind: 'json' as const, status: 200, requestId: undefined,
+    value: { schema: 'powercontext.prepared-context.v1', status: 'ready', content, content_bytes: Buffer.byteLength(content, 'utf8') },
+  }))
+  const wrapContent = vi.fn((text: string) => ({ role: 'user', content: [{ type: 'text', text }] }))
+  await runRecallPreStep(input({
+    client: { request } as never,
+    config: { ...config, contextAssembly: assembly, capturePrompts: false },
+    wrapContent,
+  }))
+  expect(request).toHaveBeenCalledWith('prepare_context', expect.objectContaining({ assembly }), undefined)
+  expect(wrapContent.mock.calls[0][0].endsWith(content)).toBe(true)
 })

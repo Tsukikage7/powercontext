@@ -19,6 +19,9 @@ import re
 import shlex
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -29,6 +32,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+import powercontext.builtin.runtime.composition as runtime_composition
 from powercontext.builtin.artifacts.experience import ExperienceCandidateInput
 from powercontext.builtin.artifacts.memory import EmbeddingProfile
 from powercontext.builtin.inference import EmbeddingResult, InferenceConfigurationError
@@ -37,16 +41,51 @@ from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
 from powercontext.builtin.persistence.seekdb import SeekDBConfig
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
-from powercontext.builtin.runtime import InferenceConfig, MemoryExtractionProfile, RuntimeConfig
+from powercontext.builtin.runtime import (
+    BuiltinRuntime,
+    ExperienceIncubationResult,
+    InferenceConfig,
+    MemoryExtractionProfile,
+    RuntimeConfig,
+)
+from powercontext.builtin.runtime.readiness import READINESS_PROBE_TIMEOUT_SECONDS
 from powercontext.http import (
     Capabilities,
     ReadinessResponse,
     ReadinessStatus,
 )
 from powercontext.server.app import create_app
-from powercontext.server.factory import create_server_app
-from powercontext.server.settings import BearerAuthConfig, McpConfig, ServerSettings
+from powercontext.server.authz import AccessControlService, PrincipalRef
+from powercontext.server.factory import _scheduled_access_runners, create_server_app
+from powercontext.server.settings import (
+    AccessControlConfig,
+    BearerAuthConfig,
+    McpConfig,
+    ServerSettings,
+)
 from powercontext.sources import Source
+
+_ACCESS_FAMILIES = "experience:enabled,handoff:enabled,memory:enabled,profile:enabled,prompt:enabled,skill:enabled"
+
+
+class _StartupOnlyAccessControl:
+    async def committed_receipt_identity(self, _scope_id: str, _source_id: str, /) -> None:
+        return None
+
+
+def _access_readiness_checks(
+    *,
+    mode: str = "disabled",
+    provider: str = "disabled",
+    authentication: str = "disabled",
+) -> dict[str, str]:
+    return {
+        "access_mode": mode,
+        "authentication_provider": authentication,
+        "access_provider": provider,
+        "access_resource_kinds": "server,scope,artifact",
+        "access_artifact_families": _ACCESS_FAMILIES,
+    }
 
 
 class _NoopExperiencePipeline:
@@ -87,21 +126,36 @@ class _SequencedEmbeddingModel:
         return EmbeddingResult(vectors=tuple((1.0, 0.0, 0.0) for _ in texts))
 
 
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_configured_assembly_total_limit_rejects_nonpositive_values(monkeypatch, limit):
+    monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_CONTEXT_ASSEMBLY_MAX_ENTRIES", limit)
+    with pytest.raises(ValidationError, match="context_assembly_max_entries"):
+        ServerSettings()
+
+
 def test_settings_load_server_environment(monkeypatch) -> None:
-    monkeypatch.delenv("POWERCONTEXT_SERVER_DASHBOARD_ENABLED", raising=False)
-    monkeypatch.delenv("POWERCONTEXT_SERVER_DASHBOARD_SCOPES", raising=False)
     monkeypatch.setenv("POWERCONTEXT_SERVER_HTTP_HOST", "127.0.0.2")
     monkeypatch.setenv("POWERCONTEXT_SERVER_HTTP_PORT", "9000")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_PUBLIC_URL", " https://powercontext.example.com/base/ ")
     monkeypatch.setenv(
         "POWERCONTEXT_SERVER_DATABASE_URL",
         "sqlite+aiosqlite:////var/lib/powercontext/test.db",
     )
     monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_SCOPE_CACHE_SIZE", "64")
     monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_SOURCE_WINDOW_LIMIT", "25")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_CONTEXT_ASSEMBLY_MAX_ENTRIES", "16")
     monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_MEMORY_EXTRACTION_PROFILE", "conversation")
     monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_MEMORY_RERANK_ENABLED", "true")
     monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_MEMORY_RERANK_CANDIDATE_LIMIT", "40")
     monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_EXPERIENCE_SCHEDULE_SECONDS", "45")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_TOPIC_MEMORY_SCHEDULE_SECONDS", "30")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_TOPIC_MEMORY_SOURCE_WINDOW_LIMIT", "7")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_TOPIC_MEMORY_HISTORY_MAX_CANDIDATES", "16")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_TOPIC_MEMORY_HISTORY_RRF_THRESHOLD", "65")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_TOPIC_MEMORY_HISTORY_MIN_CANDIDATES", "4")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_ARTIFACT_PROCESSING_MAX_WORKERS", "6")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_RUNTIME_ARTIFACT_PROCESSING_WORKER_TIMEOUT_SECONDS", "90")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_CURSOR_SIGNING_SECRET", "cursor-secret-with-at-least-thirty-two-bytes")
     monkeypatch.setenv("POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL", " test ")
     monkeypatch.setenv(
         "POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL_SETTINGS",
@@ -109,6 +163,7 @@ def test_settings_load_server_environment(monkeypatch) -> None:
     )
     monkeypatch.setenv("POWERCONTEXT_SERVER_INFERENCE_GENERATION_TIMEOUT_SECONDS", "12.5")
     monkeypatch.setenv("POWERCONTEXT_SERVER_INFERENCE_GENERATION_MAX_REQUESTS", "4")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL_CONTEXT_WINDOW_TOKENS", "64000")
     monkeypatch.setenv("POWERCONTEXT_SERVER_MCP_ENABLED", "false")
     monkeypatch.setenv("POWERCONTEXT_SERVER_MCP_PATH", "/context/")
     monkeypatch.setenv(
@@ -116,7 +171,10 @@ def test_settings_load_server_environment(monkeypatch) -> None:
         (
             '{"host_id":"workstation-1","targets":['
             '{"target_id":"codex-project","agent_kind":"codex","installation_scope":"project",'
-            '"path":"/srv/project/.agents/skills","allow_managed_publish":true},'
+            '"path":"/srv/project/.agents/skills","allow_managed_publish":true,"environment":{'
+            '"operating_system":"linux","architecture":"x86_64","commands":{"python":"3.13.2"},'
+            '"network_policy":"restricted","writable_roots":["workspace"],'
+            '"dependency_install_policy":"denied","environment_names":["CI"]}},'
             '{"target_id":"claude-user","agent_kind":"claude_code","installation_scope":"user",'
             '"path":"/home/example/.claude/skills"}]}'
         ),
@@ -126,30 +184,165 @@ def test_settings_load_server_environment(monkeypatch) -> None:
 
     assert settings.http.host == "127.0.0.2"
     assert settings.http.port == 9000
+    assert settings.public_url == "https://powercontext.example.com/base"
     assert isinstance(settings.database, SQLiteConfig)
     assert settings.database.url == "sqlite+aiosqlite:////var/lib/powercontext/test.db"
     assert settings.runtime.scope_cache_size == 64
     assert settings.runtime.source_window_limit == 25
+    assert settings.runtime.context_assembly_max_entries == 16
     assert settings.runtime.memory_extraction_profile is MemoryExtractionProfile.CONVERSATION
     assert settings.runtime.memory_rerank_enabled is True
     assert settings.runtime.memory_rerank_candidate_limit == 40
     assert settings.runtime.experience_schedule_seconds == 45
+    assert settings.runtime.topic_memory_schedule_seconds == 30
+    assert settings.runtime.topic_memory_source_window_limit == 7
+    assert settings.runtime.topic_memory_history_max_candidates == 16
+    assert settings.runtime.topic_memory_history_rrf_threshold == 65
+    assert settings.runtime.topic_memory_history_min_candidates == 4
+    assert settings.runtime.artifact_processing_max_workers == 6
+    assert settings.runtime.artifact_processing_worker_timeout_seconds == 90
+    assert settings.cursor_signing_secret == SecretStr("cursor-secret-with-at-least-thirty-two-bytes")
     assert settings.inference.generation_model == "test"
     assert settings.inference.generation_model_settings == {
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}
     }
     assert settings.inference.generation_timeout_seconds == 12.5
     assert settings.inference.generation_max_requests == 4
+    assert settings.inference.generation_model_context_window_tokens == 64_000
     assert settings.mcp.enabled is False
     assert settings.mcp.path == "/context"
-    assert settings.dashboard.enabled is True
-    assert settings.dashboard.scopes == []
     assert settings.external_skills.host_id == "workstation-1"
     assert settings.external_skills.targets[0].target_id == "codex-project"
     assert settings.external_skills.targets[0].path.as_posix() == "/srv/project/.agents/skills"
     assert settings.external_skills.targets[0].allow_managed_publish is True
+    assert settings.external_skills.targets[0].environment is not None
+    assert settings.external_skills.targets[0].environment.commands == {"python": "3.13.2"}
+    assert settings.external_skills.targets[0].environment.environment_names == ("CI",)
     assert settings.external_skills.targets[1].agent_kind == "claude_code"
     assert settings.external_skills.targets[1].path.as_posix() == "/home/example/.claude/skills"
+
+
+def test_server_settings_configure_default_project_skill_targets(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("POWERCONTEXT_SERVER_WORKSPACE", raising=False)
+    monkeypatch.delenv("POWERCONTEXT_SERVER_EXTERNAL_SKILLS", raising=False)
+
+    settings = ServerSettings()
+
+    assert settings.workspace == tmp_path
+    assert settings.external_skills.host_id == "local-workspace"
+    assert [target.target_id for target in settings.external_skills.targets] == ["codex-project", "claude-project"]
+    assert [target.path for target in settings.external_skills.targets] == [
+        tmp_path / ".agents" / "skills",
+        tmp_path / ".claude" / "skills",
+    ]
+    assert all(target.installation_scope == "project" for target in settings.external_skills.targets)
+    assert all(target.allow_managed_publish for target in settings.external_skills.targets)
+
+
+def test_server_reuses_file_backed_cursor_secret_across_restarts(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("powercontext.server.cursor_secret.secrets.token_bytes", lambda size: b"\n" * size)
+    database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}")
+    settings = ServerSettings(
+        database=database,
+        auth=BearerAuthConfig(enabled=False),
+        mcp=McpConfig(enabled=False),
+    )
+    first_app = create_server_app(settings=settings)
+    with TestClient(first_app) as client:
+        scope_id = client.get("/v1/scopes/default").json()["scope_id"]
+        content = {"entries": [{"kind": "working_note", "text": "Verify cursor reuse after restart"}]}
+        for _ in range(2):
+            response = client.post(
+                f"/v1/scopes/{scope_id}/artifacts",
+                json={"family": "memory", "content": content},
+            )
+            assert response.status_code == 201
+        first_page = client.get(f"/v1/scopes/{scope_id}/artifacts/memory", params={"limit": 1})
+        assert first_page.status_code == 200
+        cursor = first_page.json()["next_cursor"]
+        assert cursor is not None
+
+    second_app = create_server_app(settings=settings)
+    with TestClient(second_app) as client:
+        second_page = client.get(
+            f"/v1/scopes/{scope_id}/artifacts/memory",
+            params={"limit": 1, "cursor": cursor},
+        )
+
+    assert second_page.status_code == 200
+    assert len(second_page.json()["items"]) == 1
+
+
+def test_server_settings_use_configured_workspace_for_default_skill_targets(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("POWERCONTEXT_SERVER_WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("POWERCONTEXT_SERVER_EXTERNAL_SKILLS", raising=False)
+
+    settings = ServerSettings()
+
+    assert settings.workspace == tmp_path
+    assert [target.path for target in settings.external_skills.targets] == [
+        tmp_path / ".agents" / "skills",
+        tmp_path / ".claude" / "skills",
+    ]
+
+
+def test_explicit_external_skill_configuration_overrides_default_targets(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("POWERCONTEXT_SERVER_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("POWERCONTEXT_SERVER_EXTERNAL_SKILLS", '{"host_id":null,"targets":[]}')
+
+    settings = ServerSettings()
+
+    assert settings.external_skills.agent_targets == ()
+
+
+def test_server_settings_reject_missing_workspace(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("POWERCONTEXT_SERVER_WORKSPACE", str(tmp_path / "missing"))
+
+    with pytest.raises(ValidationError, match="workspace"):
+        ServerSettings()
+
+
+@pytest.mark.parametrize(
+    "public_url",
+    [
+        "http://powercontext.example.com",
+        "ftp://powercontext.example.com",
+        "https://user:secret@powercontext.example.com",
+        "https://powercontext.example.com?scope=one",
+        "https://powercontext.example.com#fragment",
+    ],
+)
+def test_server_settings_reject_unsafe_public_url(monkeypatch, public_url: str) -> None:
+    monkeypatch.setenv("POWERCONTEXT_SERVER_PUBLIC_URL", public_url)
+
+    with pytest.raises(ValidationError, match="public URL"):
+        ServerSettings()
+
+
+@pytest.mark.parametrize("public_url", ["http://localhost:8000", "http://127.0.0.1:8000", "http://[::1]:8000"])
+def test_server_settings_allow_loopback_http_public_url(monkeypatch, public_url: str) -> None:
+    monkeypatch.setenv("POWERCONTEXT_SERVER_PUBLIC_URL", public_url)
+
+    assert ServerSettings().public_url == public_url
+
+
+def test_server_settings_allow_explicit_remote_http_public_url(monkeypatch) -> None:
+    monkeypatch.setenv("POWERCONTEXT_SERVER_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_PUBLIC_URL", "http://11.162.218.22:8765")
+
+    settings = ServerSettings()
+
+    assert settings.allow_insecure_http is True
+    assert settings.public_url == "http://11.162.218.22:8765"
+
+
+def test_server_settings_insecure_http_switch_does_not_allow_malformed_public_url(monkeypatch) -> None:
+    monkeypatch.setenv("POWERCONTEXT_SERVER_ALLOW_INSECURE_HTTP", "true")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_PUBLIC_URL", "ftp://11.162.218.22:8765")
+
+    with pytest.raises(ValidationError, match="public URL"):
+        ServerSettings()
 
 
 def test_env_example_loads_server_settings(monkeypatch) -> None:
@@ -169,9 +362,11 @@ def test_env_example_loads_server_settings(monkeypatch) -> None:
     settings = ServerSettings()
 
     assert isinstance(settings.database, SQLiteConfig)
-    assert settings.dashboard.scopes[0].scope_id == "project:quickstart"
     assert settings.runtime.schedule_seconds == 60
+    assert settings.runtime.topic_memory_schedule_seconds == 60
+    assert settings.runtime.artifact_processing_role == "all"
     assert settings.inference.generation_model == "openai:gpt-4.1-mini"
+    assert settings.inference.generation_model_context_window_tokens == 125_000
     assert settings.inference.embedding_dimension == 1536
 
 
@@ -233,31 +428,108 @@ def test_server_settings_reject_custom_embedded_seekdb_database(tmp_path, monkey
         ServerSettings()
 
 
-def test_server_scheduler_uses_the_powercontext_data_directory(tmp_path, monkeypatch) -> None:
+def test_supervisor_uses_primary_database_without_scheduler_sidecar(tmp_path, monkeypatch) -> None:
     data_dir = tmp_path / "powercontext-data"
     monkeypatch.setenv("POWERCONTEXT_HOME", str(data_dir))
     app = create_server_app(
         settings=ServerSettings(
             runtime=RuntimeConfig(experience_schedule_seconds=3_600),
+            inference=InferenceConfig(generation_model="test"),
             mcp=McpConfig(enabled=False),
         ),
-        experience_pipeline=_NoopExperiencePipeline(),
     )
 
     with TestClient(app):
-        assert (data_dir / "scheduler.db").is_file()
+        assert (data_dir / "powercontext.db").is_file()
+        assert not (data_dir / "scheduler.db").exists()
+
+
+def test_scheduled_experience_owns_only_candidates_created_by_its_incubation() -> None:
+    async def scenario() -> None:
+        result = ExperienceIncubationResult(
+            previous_cursor=0,
+            high_watermark=2,
+            current_cursor=2,
+            source_count=1,
+            candidate_count=1,
+            candidate_ids=("scheduled-candidate",),
+        )
+        incubate = AsyncMock(return_value=result)
+        runtime = SimpleNamespace(
+            experience=SimpleNamespace(for_scope=lambda _scope_id: SimpleNamespace(incubate=incubate))
+        )
+        access = AsyncMock(spec=AccessControlService)
+        settings = ServerSettings(
+            runtime=RuntimeConfig(experience_schedule_seconds=1),
+            access=AccessControlConfig(
+                mode="enforced",
+                background_principal_id="scheduled-experience",
+            ),
+            mcp=McpConfig(enabled=False),
+        )
+        source_runner, experience_runner = _scheduled_access_runners(
+            settings,
+            access,
+            legacy_static_principal=None,
+        )
+
+        assert source_runner is None
+        assert experience_runner is not None
+        assert await experience_runner("scope-1", cast(BuiltinRuntime, runtime)) == result
+        access.attest_candidate_owner.assert_awaited_once_with(
+            scope_id="scope-1",
+            candidate_id="scheduled-candidate",
+            family="experience",
+            proposed_owner=PrincipalRef(type="service", id="scheduled-experience"),
+            target=None,
+            idempotency_key="background-candidate-owner:scope-1:scheduled-candidate",
+        )
+
+    asyncio.run(scenario())
 
 
 def test_settings_load_bearer_authentication_without_exposing_token(monkeypatch) -> None:
-    monkeypatch.setenv("POWERCONTEXT_SERVER_AUTH_ENABLED", "true")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_ACCESS_MODE", "enforced")
     monkeypatch.setenv("POWERCONTEXT_SERVER_AUTH_TOKEN", "server-secret")
 
     settings = ServerSettings()
 
-    assert settings.auth.enabled is True
+    assert settings.access.mode == "enforced"
     assert settings.auth.token is not None
     assert settings.auth.token.get_secret_value() == "server-secret"
     assert "server-secret" not in repr(settings)
+
+
+def test_legacy_auth_token_cannot_silently_enable_access(monkeypatch) -> None:
+    monkeypatch.delenv("POWERCONTEXT_SERVER_ACCESS_MODE", raising=False)
+    monkeypatch.delenv("POWERCONTEXT_SERVER_AUTH_ENABLED", raising=False)
+    monkeypatch.setenv("POWERCONTEXT_SERVER_AUTH_TOKEN", "orphaned-server-secret")
+
+    with pytest.raises(ValidationError, match="AUTH_TOKEN requires ACCESS_MODE=enforced"):
+        ServerSettings()
+
+
+def test_legacy_static_bearer_environment_maps_to_server_admin(monkeypatch) -> None:
+    monkeypatch.delenv("POWERCONTEXT_SERVER_ACCESS_MODE", raising=False)
+    monkeypatch.setenv("POWERCONTEXT_SERVER_AUTH_ENABLED", "true")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_AUTH_TOKEN", "legacy-server-secret")
+
+    settings = ServerSettings(database=SQLiteConfig(), mcp=McpConfig(enabled=False))
+
+    assert settings.access.mode == "enforced"
+    assert "legacy-server-secret" not in repr(settings)
+
+    with TestClient(create_server_app(settings=settings)) as client:
+        missing = client.get("/v1/capabilities")
+        principal = client.get(
+            "/v1/access/me",
+            headers={"Authorization": "Bearer legacy-server-secret"},
+        )
+
+    assert missing.status_code == 401
+    assert principal.status_code == 200
+    assert principal.json()["mode"] == "enforced"
+    assert principal.json()["principal"]["id"] == "server-token"
 
 
 def test_enabled_bearer_authentication_requires_a_token() -> None:
@@ -300,19 +572,20 @@ def test_scalar_reference_embeds_the_canonical_openapi_contract() -> None:
 def test_server_factory_optionally_requires_bearer_authentication() -> None:
     app = create_server_app(
         settings=ServerSettings(
-            auth=BearerAuthConfig(enabled=True, token=SecretStr("server-secret")),
+            auth=BearerAuthConfig(token=SecretStr("server-secret")),
+            access=AccessControlConfig(mode="enforced"),
+            database=SQLiteConfig(),
             mcp=McpConfig(enabled=False),
         )
     )
-    client = TestClient(app)
-
-    missing = client.get("/v1/capabilities")
-    invalid = client.get("/v1/capabilities", headers={"Authorization": "Bearer wrong"})
-    accepted = client.get("/v1/capabilities", headers={"Authorization": "Bearer server-secret"})
-    protected_metrics = client.get("/metrics")
-    accepted_metrics = client.get("/metrics", headers={"Authorization": "Bearer server-secret"})
-    liveness = client.get("/health/live")
-    scalar_reference = client.get("/docs")
+    with TestClient(app) as client:
+        missing = client.get("/v1/capabilities")
+        invalid = client.get("/v1/capabilities", headers={"Authorization": "Bearer wrong"})
+        accepted = client.get("/v1/capabilities", headers={"Authorization": "Bearer server-secret"})
+        protected_metrics = client.get("/metrics")
+        accepted_metrics = client.get("/metrics", headers={"Authorization": "Bearer server-secret"})
+        liveness = client.get("/health/live")
+        scalar_reference = client.get("/docs")
 
     assert missing.status_code == 401
     assert missing.headers["WWW-Authenticate"] == "Bearer"
@@ -320,7 +593,7 @@ def test_server_factory_optionally_requires_bearer_authentication() -> None:
     assert missing.json() == {
         "error": {
             "code": "unauthorized",
-            "message": "A valid bearer token is required.",
+            "message": "A valid credential is required.",
             "details": None,
         }
     }
@@ -330,6 +603,64 @@ def test_server_factory_optionally_requires_bearer_authentication() -> None:
     assert accepted_metrics.status_code == 200
     assert liveness.status_code == 200
     assert scalar_reference.status_code == 200
+
+
+def test_enforced_mode_fails_closed_if_the_authorization_provider_disappears(tmp_path) -> None:
+    app = create_server_app(
+        settings=ServerSettings(
+            auth=BearerAuthConfig(token=SecretStr("server-secret")),
+            access=AccessControlConfig(mode="enforced"),
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}"),
+            mcp=McpConfig(enabled=False),
+        ),
+        access_control=cast(AccessControlService, _StartupOnlyAccessControl()),
+    )
+    headers = {"Authorization": "Bearer server-secret"}
+
+    with TestClient(app) as client:
+        app.state.access_control = None
+        readiness = client.get("/health/ready")
+        protected = (
+            client.get("/v1/capabilities", headers=headers),
+            client.get("/metrics", headers=headers),
+        )
+
+    assert readiness.status_code == 503
+    assert readiness.json()["checks"]["access_provider"] == "not_ready"
+    assert all(response.status_code == 503 for response in protected)
+    assert all(response.json()["error"]["code"] == "access_unavailable" for response in protected)
+
+
+def test_server_factory_maps_static_token_to_bootstrap_principal() -> None:
+    app = create_server_app(
+        settings=ServerSettings(
+            auth=BearerAuthConfig(token=SecretStr("server-secret")),
+            access=AccessControlConfig(mode="enforced"),
+            database=SQLiteConfig(),
+            mcp=McpConfig(enabled=False),
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/v1/access/me", headers={"Authorization": "Bearer server-secret"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["principal"] == {
+        "type": "service",
+        "id": "server-token",
+        "description": "PowerContext static bearer",
+    }
+    assert payload["mode"] == "enforced"
+    assert payload["resource_kinds"] == ["server", "scope", "artifact"]
+    assert payload["provider_capabilities"] == {
+        "safe_resource_filtering": True,
+        "multi_requirement_check": True,
+        "relationship_management": True,
+        "group_subjects": False,
+        "multi_principal": False,
+        "max_direct_resource_keys": 10000,
+    }
 
 
 def test_readiness_reports_unavailable_bindings() -> None:
@@ -344,7 +675,7 @@ def test_readiness_reports_unavailable_bindings() -> None:
     assert response.status_code == 503
     assert response.json() == {
         "status": "not_ready",
-        "checks": {"database": "unavailable"},
+        "checks": {"database": "unavailable", **_access_readiness_checks(mode="disabled")},
     }
     assert response.headers["X-PowerContext-Request-ID"]
 
@@ -361,7 +692,7 @@ def test_readiness_keeps_degraded_bindings_in_traffic() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "status": "degraded",
-        "checks": {"inference.embedding": "unavailable"},
+        "checks": {"inference.embedding": "unavailable", **_access_readiness_checks(mode="disabled")},
     }
 
 
@@ -387,17 +718,36 @@ def test_server_factory_reports_database_failure_as_not_ready(monkeypatch, tmp_p
         "checks": {
             "runtime": "ready",
             "database": "unavailable",
+            "artifact_processing_supervisor": "disabled",
+            **_access_readiness_checks(),
         },
     }
     assert "powercontext_server_runtime_ready 0.0" in metrics.text
     assert "secret database URL" not in response.text
 
 
-def test_server_factory_reports_database_and_configured_generation_readiness(tmp_path) -> None:
+def test_server_factory_reports_database_and_configured_generation_readiness(monkeypatch, tmp_path) -> None:
+    probe_timeouts: list[float] = []
+    readiness_timeouts: list[float] = []
+    original_readiness_probe = runtime_composition.dependency_readiness_probe
+
+    async def probe_generation(_model, /, *, timeout_seconds: float, model_settings=None) -> None:
+        probe_timeouts.append(timeout_seconds)
+        assert model_settings is None
+
+    def capture_readiness_timeout(operation, *, timeout_seconds=READINESS_PROBE_TIMEOUT_SECONDS):
+        readiness_timeouts.append(timeout_seconds)
+        return original_readiness_probe(operation, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(
+        "powercontext.builtin.inference.pydantic_ai.probe_pydantic_ai_model",
+        probe_generation,
+    )
+    monkeypatch.setattr(runtime_composition, "dependency_readiness_probe", capture_readiness_timeout)
     app = create_server_app(
         settings=ServerSettings(
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}"),
-            inference=InferenceConfig(generation_model="test"),
+            inference=InferenceConfig(generation_model="test", generation_timeout_seconds=12.5),
             mcp=McpConfig(enabled=False),
         )
     )
@@ -412,8 +762,16 @@ def test_server_factory_reports_database_and_configured_generation_readiness(tmp
             "runtime": "ready",
             "database": "ready",
             "inference.generation": "ready",
+            "artifact_processing_supervisor": "leader",
+            "artifact_processing.memory": "leader",
+            "artifact_processing.experience": "leader",
+            "artifact_processing.profile": "leader",
+            "artifact_processing.topic-memory": "leader",
+            **_access_readiness_checks(),
         },
     }
+    assert probe_timeouts == [12.5]
+    assert 12.5 in readiness_timeouts
 
 
 def test_server_factory_applies_generation_model_settings_to_readiness(monkeypatch, tmp_path) -> None:
@@ -423,7 +781,7 @@ def test_server_factory_applies_generation_model_settings_to_readiness(monkeypat
         observed_settings.append(None if info.model_settings is None else dict(info.model_settings))
         return ModelResponse(parts=[])
 
-    monkeypatch.setattr("pydantic_ai.models.infer_model", lambda _name: FunctionModel(respond))
+    monkeypatch.setattr("pydantic_ai.models.infer_model", lambda _name, **_kwargs: FunctionModel(respond))
     app = create_server_app(
         settings=ServerSettings(
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}"),
@@ -444,7 +802,7 @@ def test_server_factory_applies_generation_model_settings_to_readiness(monkeypat
     assert observed_settings == [
         {
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
-            "max_tokens": 1,
+            "max_tokens": 16,
         }
     ]
 
@@ -453,7 +811,7 @@ def test_server_factory_reports_generation_failure_as_degraded(monkeypatch, tmp_
     async def rate_limited(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
         raise ModelHTTPError(429, "test-model", {"secret": "provider response"})
 
-    monkeypatch.setattr("pydantic_ai.models.infer_model", lambda _name: FunctionModel(rate_limited))
+    monkeypatch.setattr("pydantic_ai.models.infer_model", lambda _name, **_kwargs: FunctionModel(rate_limited))
     app = create_server_app(
         settings=ServerSettings(
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}"),
@@ -472,6 +830,11 @@ def test_server_factory_reports_generation_failure_as_degraded(monkeypatch, tmp_
             "runtime": "ready",
             "database": "ready",
             "inference.generation": "unavailable",
+            "artifact_processing_supervisor": "leader",
+            "artifact_processing.memory": "leader",
+            "artifact_processing.experience": "leader",
+            "artifact_processing.profile": "leader",
+            **_access_readiness_checks(),
         },
     }
     assert "provider response" not in response.text
@@ -502,6 +865,8 @@ def test_server_factory_caches_and_redacts_degraded_embedding_readiness(caplog, 
                 "runtime": "ready",
                 "database": "ready",
                 "inference.embedding": "misconfigured",
+                "artifact_processing_supervisor": "disabled",
+                **_access_readiness_checks(),
             },
         }
     )
@@ -530,6 +895,8 @@ def test_server_factory_reports_a_rejected_embedding_request_with_a_redacted_rea
             "runtime": "ready",
             "database": "ready",
             "inference.embedding": "misconfigured: provider-rejected (HTTP 400)",
+            "artifact_processing_supervisor": "disabled",
+            **_access_readiness_checks(),
         },
     }
 
@@ -564,6 +931,8 @@ def test_server_factory_reports_transient_embedding_failures_as_degraded(
             "runtime": "ready",
             "database": "ready",
             "inference.embedding": expected_status,
+            "artifact_processing_supervisor": "disabled",
+            **_access_readiness_checks(),
         },
     }
     assert "secret" not in response.text
@@ -668,6 +1037,8 @@ def test_server_factory_reports_missing_embedding_api_prefix_as_degraded(caplog,
                 "runtime": "ready",
                 "database": "ready",
                 "inference.embedding": "misconfigured: provider-rejected (HTTP 404)",
+                "artifact_processing_supervisor": "disabled",
+                **_access_readiness_checks(),
             },
         }
     )
@@ -770,6 +1141,7 @@ def test_stats_returns_inclusive_utc_periods_for_empty_scope(tmp_path) -> None:
     )
 
     with TestClient(app) as client:
+        default_scope_id = client.get("/v1/scopes/default").json()["scope_id"]
         responses = []
         for requested_period, expected_preset, expected_days in (
             (None, "30d", 30),
@@ -777,13 +1149,18 @@ def test_stats_returns_inclusive_utc_periods_for_empty_scope(tmp_path) -> None:
             ("7d", "7d", 7),
             ("30d", "30d", 30),
         ):
-            params = {"scope_id": "project:test"}
+            payload: dict[str, object] = {
+                "selection": {"mode": "exact", "scope_ids": [default_scope_id]},
+            }
             if requested_period is not None:
-                params["period"] = requested_period
-            responses.append((client.get("/v1/stats", params=params), expected_preset, expected_days))
-        invalid = client.get(
+                payload["period"] = requested_period
+            responses.append((client.post("/v1/stats", json=payload), expected_preset, expected_days))
+        invalid = client.post(
             "/v1/stats",
-            params={"scope_id": "project:test", "period": "all"},
+            json={
+                "selection": {"mode": "exact", "scope_ids": [default_scope_id]},
+                "period": "all",
+            },
         )
 
     assert invalid.status_code == 422
@@ -804,7 +1181,15 @@ def test_stats_returns_inclusive_utc_periods_for_empty_scope(tmp_path) -> None:
         }
         expected_dates = [(start_date + timedelta(days=offset)).isoformat() for offset in range(expected_days)]
 
-        assert body["scope_id"] == "project:test"
+        assert body["selection"] == {
+            "mode": "exact",
+            "scope_ids": [default_scope_id],
+        }
+        assert body["scope_ids"] == [default_scope_id]
+        assert [item["scope_id"] for item in body["by_scope"]] == [default_scope_id]
+        assert body["by_scope"][0]["inventory"] == body["inventory"]
+        assert body["by_scope"][0]["usage"] == body["usage"]
+        assert body["by_scope"][0]["recall"] == body["recall"]
         assert body["usage"]["period"] == expected_period
         assert body["recall"]["period"] == expected_period
         assert [day["date"] for day in body["usage"]["daily"]] == expected_dates
@@ -832,6 +1217,7 @@ def test_application_failure_log_uses_operation_context(caplog) -> None:
     assert record.request_id == response.headers["X-PowerContext-Request-ID"]
     assert record.unit == "application"
     assert record.error_code == "internal_error"
+    assert record.exc_info is not None
 
 
 def test_logging_failure_does_not_change_the_response(monkeypatch) -> None:
