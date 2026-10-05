@@ -14,7 +14,7 @@ title: "RFC 1435: Explainable PreparedContext Receipts"
 This RFC adds an optional, bounded PreparedContext Receipt to request-time recall. The existing
 `powercontext.prepared-context.v1` injection value stays `status`, `content`, and `content_bytes`. Callers that opt in
 receive a companion Receipt that identifies what the Runtime selected, what it omitted, which retrieval path it used,
-and which byte budget it consumed, without retaining query text or Memory/Experience bodies.
+and which byte budget it consumed, without retaining query text or selected bodies.
 
 The first policy is `powercontext.prepared-context-receipt.v1`. Receipts are ephemeral diagnostics attached to one
 `prepare` response. They are not Artifacts, have no Revision, are not persisted by default, and are not a second
@@ -98,11 +98,12 @@ Handoff Revision. A PreparedContext Receipt explains one ephemeral recall.
 The compact Receipt is the first disclosure level. Progressive inspection reuses existing exact-read operations:
 
 1. Receipt: selected refs, omission counts, retrieval path, digest, budget.
-2. Exact Memory or Experience read by the cited identity.
+2. Exact Memory entry, Topic Memory, Experience, or Profile read by the Scope-qualified identity; code read by its
+   fingerprint, repository-relative path, file hash, and line range.
 3. Exact Source evidence already attached to that Artifact, when the caller is authorized to read it.
 
 The Receipt does not cache item bodies for later expansion. If the caller needs the text, it loads the current exact
-identity through the ordinary Memory and Experience APIs. If that identity has since been retired, the exact-read
+identity through the ordinary Artifact and code APIs. If that identity has since been retired, the exact-read
 failure is the explanation; the Receipt is not a time-travel store.
 
 ## Failure stays fail-open
@@ -153,86 +154,179 @@ PreparedContextReceipt
   schema: powercontext.prepared-context-receipt.v1
   receipt_id: opaque UUID
   policy_id: powercontext.prepared-context-receipt.v1
-  query_digest: sha256 hex of normalized query
+  query_digest: sha256 hex of normalized original query
   content_digest: sha256 hex of injected UTF-8 content, or null when status=empty
   requested_max_bytes: integer
   used_bytes: integer, equal to content_bytes
   truncated: true when any selected item was size-truncated
+  non_deterministic: true when model-backed rerank or query expansion was invoked
   retrieval:
-    memory_mode: auto | fts | vector | hybrid | none
-    rerank_policy_id: string | null
-    rerank_fallback: boolean
-    experience_configured: boolean
-  selected: [SelectedItem]  # schema max 16; current Builder emits at most 8
-  omitted: [OmittedGroup]   # max 16 groups
-  stages: [StageTiming]     # memory.search, experience.search, context.build
+    rounds: [RecallRound]          # max 3: round 0 and at most 2 expansions
+    searches: [SearchGroup]        # max 32 groups across all rounds
+    rerank_configs: [RerankConfig] # max 8 distinct configurations
+    reranks: [RerankGroup]         # max 32 groups across all rounds
+  selected: [SelectedItem]         # max 32, including code evidence
+  omitted: [OmittedGroup]           # max 16 groups
+  stages: [StageTiming]             # max 8 aggregate stage timings
 ```
 
 `receipt_id` correlates this Receipt with the HTTP `X-PowerContext-Request-ID` in logs. It is not an Artifact ID and
-must not be used as a durable fetch key in v1.
+must not be used as a durable fetch key in v1. `non_deterministic` describes execution, not merely configuration:
+model-backed rerank remains non-deterministic at temperature zero; a configured reranker that never ran does not set it.
 
-`SelectedItem`:
+### Exact selected identities
 
-| Field | Contract |
+| `SelectedItem.kind` | Required identity |
 | --- | --- |
-| `kind` | `memory` or `experience` |
-| `memory_citation` or `artifact_ref` | Exact identity already admitted by the Builder |
-| `rendered_bytes` | UTF-8 size of that item's rendered fragment, not the source body |
-| `truncated` | Whether the Builder truncated that item to fit |
+| `memory` | `memory_entry_address`: Scope-qualified Memory Artifact address, entry ID, entry version ID |
+| `topic-memory` | `artifact_address`: Scope ID and exact Topic Memory Artifact ref |
+| `experience` | `artifact_address`: Scope ID and exact Experience Artifact ref |
+| `profile` | `artifact_address`: Scope ID and exact committed Profile Artifact ref |
+| `code` | `code_evidence`: Scope ID, workspace fingerprint, repository-relative path, file SHA-256, inclusive start/end lines, snippet SHA-256 |
 
-Selected items are listed in injection order. The set of selected identities must equal `PreparedContextBuild.origins`.
-A Receipt whose selected refs do not match the injected origins is invalid and must not be returned; the Server then
-follows the Receipt-assembly failure path.
+An Artifact address contains `scope_id` and `artifact` (`family`, `artifact_id`, `revision`). Every selected item also
+has `rendered_bytes` (UTF-8 size of its rendered fragment, excluding separators between items) and `truncated`.
+The identity fields are mutually exclusive. Even a current-Scope Memory citation or Artifact ref is expanded to its
+Scope-qualified address; the same Artifact or entry ID in two Scopes must remain two different identities.
+`memory_entry_address` uses the existing `MemoryEntryAddress` shape (`memory`, `entry_id`, `entry_version_id`), with
+`memory` an Artifact address. `code_evidence` uses the existing `CodeEvidenceRef` fields (`scope_id`, `fingerprint`,
+`path`, `file_sha256`, `start_line`, `end_line`, `snippet_sha256`); it is not an Artifact ref.
 
-The OpenAPI array cap is 16 so a later Builder change does not require a schema bump. The current Coding Agent Builder
-admits at most eight Memory items and two Experience items, interleaves Memory first, and caps the injected list at
-eight. A v1 Receipt lists exactly that injected list, never a superset.
+Selected items follow injection order. After normalizing short refs to addresses, their ordered identities must equal
+`PreparedContextBuild.origins` followed by `PreparedContextBuild.code_origins`, including the final line range and
+snippet hash of any truncated code item. A code-only ready result has empty `origins` and non-empty `code_origins`.
+Neither a set comparison nor an `origins`-only comparison satisfies this invariant. Missing, extra, reordered, or
+ambiguous identities invalidate the entire Receipt and follow the Receipt-assembly failure path.
 
-`OmittedGroup`:
+The 32-item cap covers the current explicit assembly maximum of 26 historical items (eight Memory, eight Topic Memory,
+eight Profile, two Experience), plus up to four code items. The default builder's combined historical entry limit is
+eight and it also supports Topic Memory; neither default is a universal selected-item bound. Runtime entry limits and
+the byte budget still control actual selection. The Receipt never changes those limits to make its own schema fit.
 
-| Field | Contract |
-| --- | --- |
-| `reason` | Closed enum below |
-| `count` | Distinct dropped identities, except empty-set flags which always use `1` |
+### Retrieval evidence across Scopes and rounds
 
-Closed `reason` values:
+`RecallRound` contains `round` (0, 1, or 2), `outcome` (`completed` or `expansion_failed`), and `retained` (whether that
+round's candidate pool contributes to the final build). It reuses the execution outcomes already tracked for recall
+expansion. If expansion fails and the Runtime returns round-zero candidates, round zero is retained and every
+abandoned expansion is marked not retained. An attempted but failed expansion is not reported as a successful search.
+Expanded query text and its model response are never included.
+
+`SearchGroup` aggregates calls with the same `round`, `family`, actual `mode`, `outcome`, and `fallback_reason`, and
+contains a positive `count`. Families are `memory`, `topic-memory`, `experience`, `profile`, and `code`; modes are
+`fts`, `vector`, `hybrid`, `snapshot`, `code`, or `none`. `snapshot` describes a Profile read and `code` the existing code
+query operation. `outcome` is `completed`, `not_run`, or `failed`; `none` means no retrieval mode was executed. An
+Experience adapter must provide its actual retrieval mode; the Runtime must not infer it from the adapter's presence.
+A disabled family has no group; a requested family with no configured reader or no searchable head has a `not_run`
+group. A completed zero-hit search is still `completed` with its actual mode. `count` counts actual calls for completed or
+failed groups, and skipped retrieval opportunities for not-run groups. Profile and code operations outside the
+expansion loop belong to round zero and are counted once per actual invocation.
+
+`fallback_reason` is `none`, `inference_unavailable`, `inference_timeout`, or `reused_fts_fallback`. Choosing FTS normally
+under `auto` uses `none`; dropping the vector channel after an inference error uses the observed error class. If a later
+round reuses the FTS-only outcome of that failure, it uses `reused_fts_fallback`. Expansion failure belongs in
+`RecallRound`, not in this search fallback enum. `auto` is a request policy, never an actual mode in a Receipt.
+
+For example, Memory searches in two authorized Scopes can produce these groups in the same round:
+
+```json
+[
+  {"round": 0, "family": "memory", "mode": "hybrid", "outcome": "completed", "fallback_reason": "none", "count": 1},
+  {"round": 0, "family": "memory", "mode": "fts", "outcome": "completed", "fallback_reason": "inference_timeout", "count": 1}
+]
+```
+
+Grouping intentionally omits per-search Scope IDs: ContextReferences have no fixed count cap. Selected identities
+always retain Scope, while aggregate counts describe all executed calls, including calls in rounds later abandoned.
+Do not multiply Topic Memory, Profile, or code calls by the number of referenced Scopes: record the calls that actually
+ran. Grouping is deterministic by the tuple of grouping fields, and cannot collapse different modes or fallback causes.
+
+### Rerank evidence
+
+`RerankConfig` has `config_id`, `policy_id`, `model`, `effective_settings`, `timeout_seconds`, `max_requests`,
+`config_digest`, `prompt`, and `non_deterministic`. `policy_id` identifies the rerank instruction policy;
+it is insufficient to identify the model or configuration. `model` is the credential-free provider/model identity (null for a declared deterministic, non-model reranker).
+`effective_settings` contains the non-content model settings actually passed after inheritance, overrides, and
+normalization, including explicit defaults such as temperature zero. It is not a dump of deployment configuration.
+The implementation must define a versioned allowlist of safe setting names and types, and validate their values;
+headers, credentials, URLs, arbitrary provider payloads, and content-bearing settings are excluded.
+
+`config_digest` is SHA-256 over RFC 8785 canonical JSON of a versioned record containing the policy, model, effective
+non-content settings, timeout, request limit, and Prompt identity below. Safe execution-affecting settings cannot be
+silently omitted from this record. An adapter whose effective configuration cannot be represented completely and safely
+must omit the Receipt, with a content-free diagnostic, rather than claim exact evidence using a partial config digest.
+This digest is configuration evidence, not a promise that the provider will reproduce identical results.
+
+`prompt` comes from the `ResolvedPrompt` bound to the actual invocation, not the latest Prompt head read afterward.
+It contains `scope_id`, `key`, `definition_version`, `builtin_version`, `selection` (`built_in` or `artifact`),
+`selected_version`, `compiled_digest`, and `artifact_address` (null for a built-in Prompt; Scope-qualified exact Prompt
+Artifact address otherwise). Compiled instructions and demonstrations are excluded. Two Scopes with different Prompt
+selections cannot share a config entry merely because the rerank instruction policy ID matches.
+
+`RerankGroup` contains `round`, `config_id`, `outcome` (`selected`, `fallback`, or `failed`), `fallback_reason`
+(`none`, `empty_selection`, `inference_unavailable`, `inference_timeout`, or `invalid_output`), and positive `count`.
+These fields summarize actual rerank invocations; identical configurations and outcomes are grouped and share one
+config entry. A fallback still records the configuration that was invoked. No invocation means no group or config.
+A model-backed config has `non_deterministic=true`, even when its invocation fails or falls back. An injected reranker
+must supply equivalent evidence and declare whether it is model-backed; unavailable evidence is a Receipt failure,
+not permission to invent a built-in Prompt or mark the call deterministic. A declared deterministic non-model
+reranker uses `prompt=null` and `non_deterministic=false`, and identifies its actual algorithm/version and effective
+safe settings in the configuration record. Merely lacking model metadata does not establish determinism.
+
+`config_id` is the `config_digest` itself; config entries are sorted by this digest and every rerank group must resolve
+to exactly one entry. Group reranks by all four grouping fields and sort by that tuple.
+
+### Omission and timing summaries
+
+`OmittedGroup` contains `family`, `reason`, and positive `count`; equal family/reason pairs are grouped. Families use
+the same five-value enum as selected items. Reasons are closed:
 
 | Reason | Meaning |
 | --- | --- |
-| `duplicate` | Same Memory entry version or Experience revision already admitted |
+| `duplicate` | Repeated Scope-qualified exact candidate identity excluded by deduplication |
 | `blank` | Empty identity or empty renderable text |
-| `family_limit` | Exceeded the Builder's Memory or Experience admission cap |
-| `entry_limit` | Exceeded the combined injection item cap |
-| `over_budget` | Could not fit even at the minimum truncated size |
-| `rerank_not_selected` | Present in the coarse Memory pool and dropped by listwise rerank before the Builder |
-| `memory_not_retrieved` | No Memory head, or Memory search returned zero hits |
-| `experience_not_retrieved` | Experience recall is not configured, or it returned zero hits |
+| `family_limit` | Candidate excluded by that family's or assembly section's admission cap |
+| `entry_limit` | Candidate excluded by the combined injection item cap |
+| `below_min_bytes` | Candidate too short to truncate into the remaining budget |
+| `no_fitting_truncation` | No permitted truncation fits the remaining byte budget |
+| `rerank_not_selected` | Candidate in the coarse Memory pool excluded by listwise rerank before the Builder |
+| `not_retrieved` | Requested family produced no candidates across the retained rounds |
 
-`memory_not_retrieved` and `experience_not_retrieved` are empty-set flags, not scans of the Artifact. Each appears at
-most once, with `count` equal to `1`. They are omitted when that source produced a non-empty candidate list, even if
-every candidate is later dropped for another reason. Other reasons count distinct candidate identities in the pool that
-reached the Builder or were excluded immediately before admission. Omission counts never try to count the entire Memory
-Artifact.
+`below_min_bytes` and `no_fitting_truncation` preserve the Builder's existing `dropped_below_min_bytes` and
+`dropped_no_fitting_truncation` distinction. Their sum is `dropped_items`; do not add that total again as a separate
+omission. Successful truncation is recorded on the selected item and Receipt, not counted as an omitted candidate.
 
-`StageTiming` records milliseconds for `memory.search`, `experience.search`, and `context.build`. Missing stages are
-omitted. Stage names match the existing Runtime span names so a Receipt can be correlated with a trace without copying
-span payloads.
+`not_retrieved` is an empty-set flag per requested family with `count=1`, including a missing reader/head. It is absent
+when that family produced any candidates for the final build, even if every candidate was later dropped. Other reasons
+count exclusion events in the bounded candidate lists processed for the retained rounds and final build, not distinct
+Artifacts in storage. A repeated identity increments `duplicate` when it is excluded. Abandoned expansion pools do not
+inflate these counts. Reuse existing omission and recall-effort counters where they represent the same event; count
+other exclusions while traversing the same bounded pools, without extra database searches or whole-Artifact scans.
 
-Rerank: when Memory search produced a `MemoryRerankTrace`, the Receipt copies `policy_id` and `used_fallback` only. It
-does not copy candidate hits, selected ranks, usage, or any Memory text from that trace.
+`StageTiming` contains `stage`, `duration_ms`, and `count`. Aggregate repeated instances of the same existing Runtime
+stage by summing durations and recording the instance count; this sum need not equal wall-clock prepare latency.
+Include only stages that ran, including abandoned rounds. Do not copy span payloads or add per-Scope timing lists.
 
 ## Bounds
 
 | Limit | Value |
 | ---: | ---: |
-| `selected` | 16 items in the schema; current Builder output is at most 8 |
-| `omitted` groups | 16 |
-| `stages` | 8 |
+| `selected` | 32 items |
+| `retrieval.rounds` | 3 |
+| `retrieval.searches` | 32 groups total |
+| `retrieval.rerank_configs` | 8 distinct configurations |
+| `retrieval.reranks` | 32 groups total |
+| `omitted` | 16 groups |
+| `stages` | 8 aggregate timings |
 | `receipt` JSON UTF-8 size | 8192 bytes |
-| item bodies, query text, prompts, vectors, secrets, tokens, absolute paths | forbidden |
+| item bodies, original or expanded query text, prompt bodies, model responses, vectors, secrets, tokens, absolute paths | forbidden |
 
-If a valid Receipt would exceed 8192 bytes, the Server drops the Receipt rather than truncating selected identities.
-A truncated identity list would disagree with the injected bytes.
+Check the byte budget on the exact serialized Receipt returned to the caller. The count caps do not guarantee that
+32 complete identities plus configuration evidence fit into 8192 bytes. Any count overflow, byte overflow, incomplete
+identity, or missing execution evidence drops the entire Receipt with a content-free diagnostic and leaves injection
+unchanged. Never truncate identities, replace configuration evidence with a generic policy ID, or ignore extra calls.
+Implementation acceptance must measure representative mixed-family, cross-Scope, and rerank-config payloads using
+real identity lengths. If ordinary workloads frequently exceed the byte budget, revise that budget using the measured
+results before shipping; do not silently ship consistently absent diagnostics.
 
 ## Persistence and MCP
 
@@ -266,21 +360,37 @@ change that sets `include_receipt`.
 
 ## Implementation sketch
 
-1. Extend `PrepareContextRequest` and `PreparedContext` in OpenAPI, then regenerate bindings.
-2. Keep `PreparedContextBuilder.build_result()` as the origin of selected items. Count omitted identities while
-   walking the same candidate lists the Builder already walks.
-3. Copy retrieval mode and rerank summary from the Memory search result already produced in
-   `ScopedContextApplication._prepare`.
-4. Hash the Memory-search-normalized query and the injected `content` after the Builder returns.
-5. If Receipt validation fails, log a content-free error and return the four-field PreparedContext with no `receipt`
-   key.
-6. Leave official host recall requests unchanged. Update a host validator only in a change that opts that host into
-   Receipts.
+Implementation begins only after this design is accepted, as required by the tracking issue.
 
-Focused tests cover empty, ready, truncated, deduplicated, reranked, fallback, `include_receipt=false` (no `receipt`
-key), `memory_not_retrieved` / `experience_not_retrieved` flags, and Receipt-assembly failure. Each ready case asserts
-`content_digest` matches the returned `content` and selected refs match `origins`. Host recall fixtures keep asserting
-exactly four response keys.
+1. Extend `PrepareContextRequest` and `PreparedContext` in OpenAPI, then regenerate bindings.
+2. Preserve ordered selected identities and per-item rendering metadata from `build_scopes_result()` and code assembly.
+   Count exclusions in the same bounded pools and reuse existing budget-omission and recall-effort counters.
+3. Carry request-local execution evidence out of each search and inference invocation before `_recall_scope` and
+   `_recall_round` discard it. Aggregate actual modes and fallback causes by round; retain failed expansion outcomes.
+   Bind rerank configuration evidence to the effective model settings and actual resolved Prompt at invocation time.
+4. Hash the normalized original query and final injected `content` after the Builder returns. Validate ordered complete
+   origins, referential integrity of rerank groups/configs, all count caps, and exact serialized byte size.
+5. On any Receipt failure, log a content-free diagnostic and return the unchanged PreparedContext without `receipt`.
+6. Leave official host recall requests unchanged. Update a host validator only in a change that opts that host into
+   Receipts. Do not add a Receipt table or progressive-content cache.
+
+Implementation acceptance covers:
+
+- Empty, ready, truncated, deduplicated, reranked, fallback, and receipt-construction failure results; default, false,
+  and null flags continue to return exactly four response keys.
+- Topic Memory in default recall; mixed Memory/Topic Memory/Experience/Profile assembly with 18 and 26 selected
+  historical items; code-only and mixed code results, including final truncated code ranges and hashes.
+- Ordered complete selected identities across both origins collections, identical short IDs in different Scopes,
+  exact-read reuse, and `content_digest` equal to the hash of returned UTF-8 `content`.
+- Hybrid and FTS in different Scopes in the same round, completed zero-hit versus not-run searches, normal FTS versus
+  inference fallback, reused FTS fallback, and failed expansion returning only the round-zero candidate pool.
+- Effective inherited and separate rerank models/settings, distinct Scope Prompts and revisions, changed settings or
+  compiled Prompt changing the config digest, repeated config deduplication, temperature-zero non-determinism, and
+  injected rerankers with missing evidence causing fail-open Receipt omission.
+- Both budget-drop sub-counts, all five families' empty-set flags, no double counting of abandoned rounds, each count
+  cap, representative serialized payload sizes, and byte overflow dropping the whole Receipt without identity loss.
+- Equivalent Receipt semantics on SQLite and OceanBase, no schema migration, no additional recall/model calls caused
+  by `include_receipt`, and no forbidden content in successful Receipts or failure diagnostics.
 
 # Drawbacks
 
@@ -320,7 +430,7 @@ logs, and later packing experiments will have no shared omission vocabulary.
 
 PowerContext already has four related but distinct records:
 
-- `PreparedContextBuild.origins` is the exact selected set, discarded at the HTTP boundary.
+- `PreparedContextBuild.origins` and `code_origins` retain the exact selected identities, discarded at the HTTP boundary.
 - Runtime `memory.search`, `experience.search`, and `context.build` spans record counts and modes, not citations.
 - `MemoryRerankTrace` explains listwise Memory search inside the process.
 - Handoff Receipts acknowledge an exact Handoff Revision in Work Continuity.

@@ -13,7 +13,7 @@ title: "RFC 1435：可解释的 PreparedContext Receipt"
 
 本 RFC 为请求时召回增加可选、有界的 PreparedContext Receipt。现有 `powercontext.prepared-context.v1` 注入值仍只有
 `status`、`content` 和 `content_bytes`。选择加入的调用方会得到一份伴随 Receipt，说明 Runtime 选中了什么、省略了什么、
-使用了哪条检索路径、消耗了多少 byte 预算，且不保留 query 原文或 Memory/Experience 正文。
+使用了哪条检索路径、消耗了多少 byte 预算，且不保留 query 原文或被选中内容的正文。
 
 首个策略为 `powercontext.prepared-context-receipt.v1`。Receipt 是附着在一次 `prepare` 响应上的短暂诊断，不是
 Artifact，没有 Revision，默认不持久化，也不是事实的第二权威。OpenTelemetry span 仍负责耗时与结果；Receipt 是一份
@@ -87,10 +87,11 @@ PreparedContext Receipt 不是 Handoff Receipt。后者是 Work Continuity 对�
 紧凑 Receipt 是第一层披露。更细的查看复用现有精确读取：
 
 1. Receipt：选中引用、省略计数、检索路径、digest、预算。
-2. 按引用身份精确读取 Memory 或 Experience。
+2. 按带 Scope 的身份精确读取 Memory entry、Topic Memory、Experience 或 Profile；代码则按 fingerprint、
+   仓库相对路径、文件哈希和行范围读取。
 3. 在调用方有权读取时，查看该 Artifact 上已有的精确 Source 证据。
 
-Receipt 不为以后展开而缓存条目正文。需要正文时，通过普通 Memory/Experience API 加载当前精确身份。若该身份已被
+Receipt 不为以后展开而缓存条目正文。需要正文时，通过普通 Artifact/code API 加载当前精确身份。若该身份已被
 retire，精确读取失败就是解释；Receipt 不是时光机。
 
 ## 失败保持 fail-open
@@ -138,80 +139,161 @@ PreparedContextReceipt
   schema: powercontext.prepared-context-receipt.v1
   receipt_id: opaque UUID
   policy_id: powercontext.prepared-context-receipt.v1
-  query_digest: 规范化 query 的 sha256 hex
+  query_digest: 规范化后的原始 query 的 sha256 hex
   content_digest: 注入 UTF-8 内容的 sha256 hex；status=empty 时为 null
   requested_max_bytes: integer
   used_bytes: integer，等于 content_bytes
   truncated: 任一选中条目被按大小截断时为 true
+  non_deterministic: 调用了模型 rerank 或 query 扩展时为 true
   retrieval:
-    memory_mode: auto | fts | vector | hybrid | none
-    rerank_policy_id: string | null
-    rerank_fallback: boolean
-    experience_configured: boolean
-  selected: [SelectedItem]  # schema 最多 16；当前 Builder 最多产出 8
-  omitted: [OmittedGroup]   # 最多 16 组
-  stages: [StageTiming]     # memory.search, experience.search, context.build
+    rounds: [RecallRound]          # 最多 3 轮：round 0 加至多 2 轮扩展
+    searches: [SearchGroup]        # 所有轮次合计最多 32 组
+    rerank_configs: [RerankConfig] # 最多 8 个不同配置
+    reranks: [RerankGroup]         # 所有轮次合计最多 32 组
+  selected: [SelectedItem]         # 最多 32 条，包括代码证据
+  omitted: [OmittedGroup]           # 最多 16 组
+  stages: [StageTiming]             # 最多 8 个阶段耗时聚合
 ```
 
-`receipt_id` 用于在日志中与 HTTP `X-PowerContext-Request-ID` 关联。它不是 Artifact ID，v1 也不得把它当作可持久
-获取的键。
+`receipt_id` 用于在日志中与 HTTP `X-PowerContext-Request-ID` 关联。它不是 Artifact ID，v1 不得将它当作耐久获取键。
+`non_deterministic` 描述实际执行，而非仅仅配置：模型 rerank 即使 temperature 为零仍是非确定性的；配置了但未运行的
+reranker 不会将该值设为 true。
 
-`SelectedItem`：
+### 精确选中身份
 
-| 字段 | 契约 |
+| `SelectedItem.kind` | 必需身份 |
 | --- | --- |
-| `kind` | `memory` 或 `experience` |
-| `memory_citation` 或 `artifact_ref` | Builder 已接纳的精确身份 |
-| `rendered_bytes` | 该条目渲染片段的 UTF-8 大小，不是源正文 |
-| `truncated` | Builder 是否为适配预算截断了该条目 |
+| `memory` | `memory_entry_address`：带 Scope 的 Memory Artifact 地址、entry ID、entry version ID |
+| `topic-memory` | `artifact_address`：Scope ID 与精确 Topic Memory Artifact ref |
+| `experience` | `artifact_address`：Scope ID 与精确 Experience Artifact ref |
+| `profile` | `artifact_address`：Scope ID 与精确已提交 Profile Artifact ref |
+| `code` | `code_evidence`：Scope ID、workspace fingerprint、仓库相对路径、文件 SHA-256、包含端点的起止行、片段 SHA-256 |
 
-选中条目按注入顺序排列。选中身份集合必须等于 `PreparedContextBuild.origins`。若 Receipt 的选中引用与注入 origins
-不一致，则该 Receipt 无效，不得返回；Server 走 Receipt 组装失败路径。
+Artifact 地址包含 `scope_id` 和 `artifact`（`family`、`artifact_id`、`revision`）。每个选中条目还包含
+`rendered_bytes`（渲染片段的 UTF-8 大小，不含条目之间的分隔符）和 `truncated`。身份字段互斥。即使是当前 Scope 的
+Memory citation 或 Artifact ref，也要扩展成带 Scope 的地址；两个 Scope 中相同的 Artifact 或 entry ID 必须是两个身份。
+`memory_entry_address` 使用现有 `MemoryEntryAddress` 形状（`memory`、`entry_id`、`entry_version_id`），
+其中 `memory` 是 Artifact 地址。`code_evidence` 使用现有 `CodeEvidenceRef` 字段（`scope_id`、`fingerprint`、
+`path`、`file_sha256`、`start_line`、`end_line`、`snippet_sha256`）；它不是 Artifact ref。
 
-OpenAPI 数组上限为 16，避免以后调整 Builder 时立刻改 schema。当前 Coding Agent Builder 最多接纳 8 条 Memory 和
-2 条 Experience，Memory 优先交错，注入列表上限为 8。v1 Receipt 列出的就是这份注入列表，不是超集。
+选中条目按注入顺序排列。将简短 ref 规范化为地址后，其有序身份必须等于 `PreparedContextBuild.origins` 接上
+`PreparedContextBuild.code_origins`，包括截断代码条目最终的行范围和片段哈希。只有代码的 ready 结果会有空 `origins`
+和非空 `code_origins`。集合比较或只比较 `origins` 都不满足此不变量。缺少、多出、重排或歧义身份使整份 Receipt 无效，
+并进入 Receipt 组装失败路径。
 
-`OmittedGroup`：
+32 条上限覆盖当前显式 assembly 最多 26 条历史内容（Memory、Topic Memory、Profile 各八条，Experience 两条），
+再加最多四条代码。默认 Builder 的历史条目合计上限是八，且也支持 Topic Memory；这些默认值不是所有请求的选中上限。
+Runtime 条目限制和 byte 预算仍控制实际选择。Receipt 不得为适配自身 schema 而改变这些限制。
 
-| 字段 | 契约 |
-| --- | --- |
-| `reason` | 下列封闭枚举 |
-| `count` | 被丢掉的候选身份数；空集标志固定为 `1` |
+### 跨 Scope、跨轮次的检索证据
 
-封闭 `reason` 值：
+`RecallRound` 包含 `round`（0、1、2）、`outcome`（`completed` 或 `expansion_failed`）和 `retained`（该轮候选池
+是否参与最终构建）。它复用召回扩展已追踪的执行结果。扩展失败且 Runtime 返回 round-zero 候选时，round zero 被保留，
+每个被放弃的扩展轮次都标记为未保留。尝试过但失败的扩展不得报告为成功搜索。扩展 query 原文和模型响应均不进入 Receipt。
+
+`SearchGroup` 聚合 `round`、`family`、实际 `mode`、`outcome`、`fallback_reason` 相同的调用，包含正整数 `count`。
+family 为 `memory`、`topic-memory`、`experience`、`profile`、`code`；mode 为 `fts`、`vector`、`hybrid`、
+`snapshot`、`code` 或 `none`。`snapshot` 描述 Profile 读取，`code` 描述现有代码 query 操作。
+`outcome` 为 `completed`、`not_run` 或 `failed`；`none` 表示没有执行检索模式。Experience adapter 必须提供实际模式，
+Runtime 不得根据 adapter 是否存在来推断。未启用的 family 不产生组；请求了但没有配置 reader 或可搜索 head 的 family
+产生 `not_run` 组。已完成但零命中的搜索仍为 `completed`，保留实际模式。
+completed/failed 组的 `count` 统计实际调用；not-run 组统计跳过的检索机会。扩展循环外的 Profile 和 code 操作归入
+round zero，每次实际调用只计一次。
+
+`fallback_reason` 为 `none`、`inference_unavailable`、`inference_timeout` 或 `reused_fts_fallback`。
+`auto` 正常选择 FTS 使用 `none`；推理错误后放弃 vector 通道则使用实际错误类别。后续轮次复用该失败留下的 FTS-only
+结果时使用 `reused_fts_fallback`。扩展失败属于 `RecallRound`，不属于搜索回退枚举。`auto` 是请求策略，不是 Receipt
+中的实际执行模式。
+
+例如，同一轮对两个已授权 Scope 的 Memory 搜索可以产生以下组：
+
+```json
+[
+  {"round": 0, "family": "memory", "mode": "hybrid", "outcome": "completed", "fallback_reason": "none", "count": 1},
+  {"round": 0, "family": "memory", "mode": "fts", "outcome": "completed", "fallback_reason": "inference_timeout", "count": 1}
+]
+```
+
+聚合有意不列每次搜索的 Scope ID：ContextReferences 没有固定数量上限。选中身份始终保留 Scope；聚合计数描述所有实际
+执行的调用，包括最终放弃的轮次。不得把 Topic Memory、Profile 或 code 的调用数乘以引用 Scope 数；只记录实际执行的
+调用。按分组字段元组确定性排序，且不得合并不同模式或回退原因。
+
+### Rerank 证据
+
+`RerankConfig` 包含 `config_id`、`policy_id`、`model`、`effective_settings`、`timeout_seconds`、`max_requests`、
+`config_digest`、`prompt` 和 `non_deterministic`。`policy_id` 标识 rerank 指令策略，不足以标识模型或配置。
+`model` 是不带凭据的 provider/model 身份（明确声明为确定性、非模型 reranker 时为 null）。`effective_settings` 包含继承、覆盖和规范化后实际传入的非正文模型参数，
+包括 temperature 为零等显式默认值；不是部署配置的完整转储。实现必须定义带版本的安全参数名和类型白名单，并校验值；
+header、凭据、URL、任意 provider payload 和承载正文的参数均排除。
+
+`config_digest` 是带版本记录经 RFC 8785 canonical JSON 编码后的 SHA-256；该记录包含策略、模型、有效非正文参数、
+timeout、request limit 和下述 Prompt 身份。影响执行的安全参数不得被悄悄省略。adapter 若无法完整、安全地表达有效
+配置，必须省略 Receipt 并记录无正文诊断，不能用部分配置 digest 声称精确证据。该 digest 是配置证据，不保证 provider
+重现相同结果。
+
+`prompt` 来自实际调用已绑定的 `ResolvedPrompt`，不能在调用结束后读取最新 Prompt head 代替。它包含 `scope_id`、
+`key`、`definition_version`、`builtin_version`、`selection`（`built_in` 或 `artifact`）、`selected_version`、
+`compiled_digest` 和 `artifact_address`（内置 Prompt 为 null；否则是带 Scope 的精确 Prompt Artifact 地址）。
+编译后的指令和 demonstrations 排除。两个 Scope 的 Prompt 选择不同，不能仅因 rerank 指令策略 ID 相同就共用配置条目。
+
+`RerankGroup` 包含 `round`、`config_id`、`outcome`（`selected`、`fallback` 或 `failed`）、`fallback_reason`
+（`none`、`empty_selection`、`inference_unavailable`、`inference_timeout` 或 `invalid_output`）和正整数 `count`。
+这些字段汇总实际 rerank 调用；相同配置和结果进行聚合并共用一个配置条目。回退仍记录调用过的配置。没有调用就没有组或
+配置。模型配置的 `non_deterministic=true`，即使调用失败或回退也一样。注入的 reranker 必须提供等价证据，并声明是否
+使用模型；证据不可得就是 Receipt 失败，不能虚构内置 Prompt 或把调用标成确定性。明确声明的确定性非模型
+reranker 使用 `prompt=null`、`non_deterministic=false`，并在配置记录中标识实际算法/版本及有效安全参数。
+仅仅缺少模型元数据不代表确定性。
+
+`config_id` 就是 `config_digest`；配置条目按 digest 排序，每个 rerank 组必须恰好引用一个条目。rerank 按四个
+分组字段聚合，并按该元组排序。
+
+### 省略与耗时摘要
+
+`OmittedGroup` 包含 `family`、`reason` 和正整数 `count`；相同 family/reason 聚合。family 与选中条目共用五值枚举。
+reason 为封闭枚举：
 
 | 原因 | 含义 |
 | --- | --- |
-| `duplicate` | 同一 Memory entry version 或 Experience revision 已被接纳 |
+| `duplicate` | 去重排除了重复的、带 Scope 的精确候选身份 |
 | `blank` | 空身份或无可渲染文本 |
-| `family_limit` | 超过 Builder 的 Memory 或 Experience 接纳上限 |
-| `entry_limit` | 超过合计注入条目上限 |
-| `over_budget` | 即使按最小截断大小也无法放入 |
-| `rerank_not_selected` | 出现在粗排 Memory 池中，在进入 Builder 前被 listwise rerank 丢掉 |
-| `memory_not_retrieved` | 没有 Memory head，或 Memory 搜索返回零命中 |
-| `experience_not_retrieved` | 未配置 Experience 召回，或召回返回零命中 |
+| `family_limit` | 候选超过该 family 或 assembly section 的接纳上限 |
+| `entry_limit` | 候选超过合计注入条目上限 |
+| `below_min_bytes` | 候选太短，无法截断进剩余预算 |
+| `no_fitting_truncation` | 没有允许的截断方式能放入剩余 byte 预算 |
+| `rerank_not_selected` | 粗排 Memory 池中的候选在进入 Builder 前被 listwise rerank 排除 |
+| `not_retrieved` | 请求的 family 在保留轮次中没有产生候选 |
 
-`memory_not_retrieved` 和 `experience_not_retrieved` 是空集标志，不是对 Artifact 的扫描。各自最多出现一次，`count`
-固定为 `1`。该来源已经产生非空候选列表时省略这组，即使这些候选后来因其他原因被丢掉。其他原因统计到达 Builder、
-或在接纳前立即排除的候选身份数。省略计数从不试图统计整个 Memory Artifact。
+`below_min_bytes` 和 `no_fitting_truncation` 保留 Builder 已有的 `dropped_below_min_bytes` 与
+`dropped_no_fitting_truncation` 区别。两者相加等于 `dropped_items`；不得再将总数计为另一种省略。
+成功截断记录在选中条目与 Receipt 上，不计为省略候选。
 
-`StageTiming` 记录 `memory.search`、`experience.search` 和 `context.build` 的毫秒耗时。缺失阶段省略。阶段名与现有
-Runtime span 名一致，以便在不复制 span 载荷的情况下与 trace 关联。
+`not_retrieved` 是每个请求 family 的空集标志，`count=1`，包括 reader/head 缺失。该 family 为最终构建产生过候选时，
+即使全部候选后来被丢掉，也不出现该组。其他原因统计保留轮次和最终构建处理的有界候选列表中的排除事件，而非存储中的
+不同 Artifact 数。重复身份被排除时增加 `duplicate`。放弃的扩展候选池不增加省略计数。现有 omission 和 recall-effort
+计数表达同一事件时直接复用；其余排除在遍历同一有界候选池时计数，不增加数据库搜索或整份 Artifact 扫描。
 
-Rerank：当 Memory 搜索产生 `MemoryRerankTrace` 时，Receipt 只复制 `policy_id` 和 `used_fallback`。不复制 candidate
-hits、selected ranks、usage 或任何 Memory 文本。
+`StageTiming` 包含 `stage`、`duration_ms` 和 `count`。对同一现有 Runtime stage 的多次执行累加耗时并记录次数；
+其总和不必等于 prepare 的 wall-clock latency。只包含实际执行的阶段，包括放弃的轮次。不复制 span payload，
+也不增加每个 Scope 的耗时列表。
 
 ## 边界
 
 | 限制 | 取值 |
 | ---: | ---: |
-| `selected` | schema 16 条；当前 Builder 输出最多 8 条 |
-| `omitted` 分组 | 16 |
-| `stages` | 8 |
+| `selected` | 32 条 |
+| `retrieval.rounds` | 3 |
+| `retrieval.searches` | 合计 32 组 |
+| `retrieval.rerank_configs` | 8 个不同配置 |
+| `retrieval.reranks` | 合计 32 组 |
+| `omitted` | 16 组 |
+| `stages` | 8 个阶段耗时聚合 |
 | `receipt` JSON UTF-8 大小 | 8192 bytes |
-| 条目正文、query 原文、prompt、向量、密钥、token、绝对路径 | 禁止 |
+| 条目正文、原始或扩展 query 原文、prompt 正文、模型响应、向量、密钥、token、绝对路径 | 禁止 |
 
-若一份合法 Receipt 将超过 8192 bytes，Server 丢弃 Receipt，而不是截断选中身份。截断后的身份列表会与注入字节不一致。
+在实际返回给调用方的 Receipt 序列化字节上检查预算。数量上限不保证 32 个完整身份加配置证据能放入 8192 bytes。
+任何数量超限、byte 超限、身份不完整或执行证据缺失都省略整份 Receipt，记录无正文诊断，保持注入不变。
+不得截断身份、用通用 policy ID 代替配置证据，或忽略额外调用。实现验收必须用实际身份长度，测量有代表性的混合 family、
+跨 Scope 和 rerank 配置载荷。普通工作负载若频繁超出预算，应在发布前依据测量结果调整预算，不能悄悄发布持续缺失的诊断。
 
 ## 持久化与 MCP
 
@@ -243,16 +325,34 @@ Receipt，在同一改动里更新校验器并设置 `include_receipt`。
 
 ## 实现要点
 
-1. 在 OpenAPI 中扩展 `PrepareContextRequest` 和 `PreparedContext`，再生成绑定。
-2. 继续以 `PreparedContextBuilder.build_result()` 作为选中条目来源。在 Builder 已遍历的同一候选列表上统计省略身份。
-3. 从 `ScopedContextApplication._prepare` 已得到的 Memory 搜索结果复制检索模式和 rerank 摘要。
-4. 在 Builder 返回后对 Memory 搜索已规范化的 query 和注入 `content` 做哈希。
-5. Receipt 校验失败时，记录无正文错误，并返回没有 `receipt` 键的四字段 PreparedContext。
-6. 官方宿主召回请求保持不变。只有在该宿主选择加入 Receipt 的同一改动里，才更新其校验器。
+按 Tracking Issue 的要求，仅在设计被接受后开始实现。
 
-聚焦测试覆盖 empty、ready、truncated、deduplicated、reranked、fallback、`include_receipt=false`（没有 `receipt`
-键）、`memory_not_retrieved` / `experience_not_retrieved` 标志，以及 Receipt 组装失败。每个 ready 用例断言
-`content_digest` 与返回的 `content` 一致，且选中引用与 `origins` 一致。宿主召回夹具继续断言响应恰好四个键。
+1. 在 OpenAPI 中扩展 `PrepareContextRequest` 和 `PreparedContext`，再生成绑定。
+2. 从 `build_scopes_result()` 和代码组装保留有序选中身份及逐条渲染元数据。在同一有界候选池统计排除事件，复用已有
+   budget-omission 与 recall-effort 计数。
+3. 在 `_recall_scope` 和 `_recall_round` 丢弃元数据之前，从每次搜索和推理调用保留请求内的执行证据。按轮次聚合实际
+   模式和回退原因，保留失败扩展结果。rerank 配置证据绑定到调用时的有效模型参数与实际解析 Prompt。
+4. Builder 返回后对规范化原始 query 和最终注入 `content` 做哈希。校验有序完整 origins、rerank 组与配置的引用关系、
+   所有数量上限及实际序列化 byte 大小。
+5. Receipt 任一校验失败时，记录无正文诊断，返回未改变的 PreparedContext，并省略 `receipt`。
+6. 官方宿主召回请求保持不变。只有在宿主选择加入 Receipt 的同一改动里才更新校验器。不增加 Receipt 表或渐进内容缓存。
+
+实现验收覆盖：
+
+- empty、ready、truncated、deduplicated、reranked、fallback 和 Receipt 构造失败；默认、false、null 标志仍返回
+  恰好四个响应键。
+- 默认召回的 Topic Memory；选中 18 和 26 条历史内容的 Memory/Topic Memory/Experience/Profile 混合 assembly；
+  纯代码与混合代码结果，包括代码截断后的最终行范围和哈希。
+- 两个 origins 集合的有序完整选中身份、不同 Scope 中相同简短 ID、精确读取复用，以及 `content_digest` 等于返回
+  `content` 的 UTF-8 哈希。
+- 同一轮不同 Scope 中的 hybrid 与 FTS、已完成零命中与未运行的区别、正常 FTS 与推理回退、FTS 回退复用，以及扩展
+  失败时仅返回 round-zero 候选池。
+- 继承与独立 rerank 模型/参数、不同 Scope Prompt 与 revision、参数或编译 Prompt 变化导致配置 digest 变化、重复
+  配置去重、temperature 为零仍非确定性，以及注入 reranker 缺证据时 fail-open 省略 Receipt。
+- 两种预算丢弃子计数、五类来源的空集标志、放弃轮次不重复计数、每个数量上限、有代表性的序列化大小，以及 byte 超限
+  时整份省略而不丢失身份。
+- SQLite 与 OceanBase 的 Receipt 语义一致，无 schema migration，`include_receipt` 不增加召回/模型调用，成功 Receipt
+  与失败诊断均无禁止内容。
 
 # Drawbacks
 
@@ -287,7 +387,7 @@ PreparedContext 选择发生在 Memory 搜索和 Experience 搜索之后，并�
 
 PowerContext 已有四种相关但不同的记录：
 
-- `PreparedContextBuild.origins` 是精确选中集合，在 HTTP 边界被丢弃。
+- `PreparedContextBuild.origins` 与 `code_origins` 保留精确选中身份，在 HTTP 边界被丢弃。
 - Runtime 的 `memory.search`、`experience.search`、`context.build` span 记录计数和模式，不记录引用。
 - `MemoryRerankTrace` 解释进程内的 listwise Memory 搜索。
 - Handoff Receipt 在 Work Continuity 中确认精确 Handoff Revision。
