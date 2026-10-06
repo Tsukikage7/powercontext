@@ -135,6 +135,35 @@ def test_long_release_names_remain_distinct():
     assert names[0].isdisjoint(names[1])
 
 
+@pytest.mark.parametrize("release", ["true", "false", "on", "off"])
+def test_boolean_style_release_names_keep_string_labels_and_matching_selectors(release):
+    result = render("ingress.enabled=true", "ingress.host=context.example.com", release=release)
+    assert result.returncode == 0, result.stderr
+    documents = [item for item in yaml.safe_load_all(result.stdout) if item]
+    for resource in documents:
+        labels = resource["metadata"]["labels"]
+        assert all(isinstance(value, str) for value in labels.values())
+        assert labels["app.kubernetes.io/instance"] == release
+    deployments = [item for item in documents if item["kind"] == "Deployment"]
+    for deployment in deployments:
+        selector = deployment["spec"]["selector"]["matchLabels"]
+        pod_labels = deployment["spec"]["template"]["metadata"]["labels"]
+        assert all(isinstance(value, str) for value in selector.values())
+        assert all(isinstance(value, str) for value in pod_labels.values())
+        assert selector["app.kubernetes.io/instance"] == release
+        assert selector.items() <= pod_labels.items()
+    service = next(item for item in documents if item["kind"] == "Service")
+    selector = service["spec"]["selector"]
+    assert all(isinstance(value, str) for value in selector.values())
+    assert selector["app.kubernetes.io/instance"] == release
+    selected_roles = {
+        deployment["metadata"]["labels"]["app.kubernetes.io/component"]
+        for deployment in deployments
+        if selector.items() <= deployment["spec"]["template"]["metadata"]["labels"].items()
+    }
+    assert selected_roles == {"api"}
+
+
 def test_acceptance_profile_renders_two_apis_and_one_background():
     result = render(values=CHART / "values-acceptance.yaml")
     assert result.returncode == 0, result.stderr

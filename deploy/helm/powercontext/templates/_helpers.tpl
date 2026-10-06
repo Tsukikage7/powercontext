@@ -24,7 +24,7 @@ limitations under the License.
 {{- end -}}
 {{- define "powercontext.labels" -}}
 app.kubernetes.io/name: powercontext
-app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
 {{- end -}}
