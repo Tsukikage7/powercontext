@@ -18,7 +18,9 @@ import { Context } from "@deepseek-ai/cordis";
 
 //#region src/config.d.ts
 interface PluginConfig {
+  contextAssembly?: Record<string, unknown>;
   baseUrl?: string;
+  allowInsecureHttp?: boolean;
   authorization?: string;
   scopeId?: string;
   timeoutMs?: number;
@@ -27,17 +29,6 @@ interface PluginConfig {
   capturePrompts?: boolean;
   flushOnCapture?: boolean;
   flushMaxCalls?: number;
-}
-interface ResolvedConfig {
-  baseUrl: string;
-  authorization: string | undefined;
-  scopeId: string | undefined;
-  timeoutMs: number;
-  requestTimeoutMs: number;
-  maxBytes: number;
-  capturePrompts: boolean;
-  flushOnCapture: boolean;
-  flushMaxCalls: number;
 }
 //#endregion
 //#region src/index.d.ts
@@ -49,7 +40,7 @@ declare const Config: {
     version: 1;
     vendor: string;
     validate(value: unknown): {
-      value: ResolvedConfig;
+      value: PluginConfig;
       issues?: undefined;
     } | {
       issues: {

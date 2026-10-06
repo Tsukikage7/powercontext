@@ -48,9 +48,10 @@ class DshSetupResult:
     plugin: str
     plugin_path: str
     data_dir: str
+    authorization_state: str = "not_attempted"
 
 
-def install_dsh_plugin(*, source: str, ref: str) -> DshSetupResult:
+def install_dsh_plugin(*, source: str, ref: str, server_url: str = "http://127.0.0.1:8000") -> DshSetupResult:
     """Install the plugin from a PowerContext checkout or Git source."""
 
     dsh_executable()
@@ -62,10 +63,20 @@ def install_dsh_plugin(*, source: str, ref: str) -> DshSetupResult:
     plugin_dir = resolve_dsh_plugin_dir(source=source, ref=ref)
     require_built_plugin(plugin_dir)
     _run_dsh("plugin", "--profile", DSH_PROFILE, "add", str(plugin_dir))
+    from powercontext.cli.authorization import (
+        configure_stored_authorization,
+        setup_authorization_value,
+    )
+
     return DshSetupResult(
         plugin=DSH_PLUGIN_NAME,
         plugin_path=str(plugin_dir),
         data_dir=str(data_dir),
+        authorization_state=configure_stored_authorization(
+            "dsh",
+            server_url=server_url,
+            value=setup_authorization_value("dsh"),
+        ),
     )
 
 
@@ -114,8 +125,27 @@ def run_dsh_diagnostics() -> dict[str, Diagnostic]:
     try:
         output = _run_dsh("--profile", DSH_PROFILE, "--dump-config")
     except SetupError as error:
+        cause = error.__cause__
+        checks = {"dump_config": "failed"}
+        detail = "dsh --profile web --dump-config failed"
+        if isinstance(cause, subprocess.TimeoutExpired):
+            checks["dump_config"] = "timeout"
+            detail = "dsh --profile web --dump-config exceeded the 120-second deadline"
+        elif isinstance(cause, subprocess.CalledProcessError):
+            checks["exit_code"] = str(cause.returncode)
+            detail = f"dsh --profile web --dump-config exited with code {cause.returncode}"
+        elif isinstance(cause, OSError):
+            checks["dump_config"] = "launch_failed"
+            detail = "could not launch dsh --profile web --dump-config; verify the executable and its permissions"
         return {
-            "dsh": Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error)),
+            "dsh": Diagnostic(
+                status=DiagnosticStatus.FAILED,
+                detail=(
+                    f"{detail}; inspect the Web profile locally for configuration "
+                    "or plugin-load errors. Raw host output is withheld because it can contain credentials."
+                ),
+                checks=checks,
+            ),
             "plugin": Diagnostic(status=DiagnosticStatus.SKIPPED, detail="plugin list is unavailable"),
         }
     installed = plugin_id_installed(output)
@@ -123,7 +153,20 @@ def run_dsh_diagnostics() -> dict[str, Diagnostic]:
         "dsh": Diagnostic(status=DiagnosticStatus.OK, detail=executable),
         "plugin": Diagnostic(
             status=DiagnosticStatus.OK if installed else DiagnosticStatus.FAILED,
-            detail=(f"{DSH_PLUGIN_NAME} is installed" if installed else "PowerContext DSH plugin is not installed"),
+            detail=(
+                f"{DSH_PLUGIN_NAME} is registered in the Web profile. This standalone check cannot observe "
+                "the running DSH process environment or overrides; run /pc doctor inside that session."
+                if installed
+                else "PowerContext DSH plugin is not registered in the Web profile; run powercontext setup dsh."
+            ),
+            checks={
+                "registration": "present" if installed else "missing",
+                "running_host_configuration": "not_observed",
+                "server_liveness": "not_checked",
+                "server_readiness": "not_checked",
+                "route_compatibility": "not_checked",
+                "session_scope": "not_checked",
+            },
         ),
     }
 
@@ -228,7 +271,9 @@ def _run_dsh(*arguments: str) -> str:
         detail = (
             (completed.stderr or "").strip() or (completed.stdout or "").strip() or f"exit code {completed.returncode}"
         )
-        raise SetupError.command_failed(command, detail)
+        raise SetupError.command_failed(command, detail) from subprocess.CalledProcessError(
+            completed.returncode, command
+        )
     return completed.stdout or ""
 
 

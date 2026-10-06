@@ -19,10 +19,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from pathlib import Path
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.routing import APIRoute
 from starlette.middleware import Middleware
 
@@ -30,45 +30,128 @@ from powercontext._logging import log_safely
 from powercontext.builtin.artifacts.experience import ExperienceCandidatePipeline, ExperienceGenerator
 from powercontext.builtin.artifacts.handoff import HandoffGenerationPipeline
 from powercontext.builtin.artifacts.memory import CandidatePipeline
+from powercontext.builtin.artifacts.profile.service import ProfileGenerator
 from powercontext.builtin.artifacts.skill import ExternalSkillProvider, SkillGenerator
+from powercontext.builtin.dream.generation import DreamGenerator
 from powercontext.builtin.inference import EmbeddingModel
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
-from powercontext.builtin.runtime import BuiltinRuntime
+from powercontext.builtin.runtime import (
+    BuiltinRuntime,
+    ExperienceIncubationResult,
+    MemoryEntryRecord,
+    MemoryFlushResult,
+)
+from powercontext.builtin.runtime.application import ScheduledExperienceRunner, ScheduledSourceRunner
 from powercontext.builtin.runtime.composition import open_builtin_runtime
 from powercontext.builtin.runtime.config import BuiltinConfig
+from powercontext.builtin.runtime.processing_registry import processing_capabilities
 from powercontext.builtin.sources import CONTENT_SOURCE_NAME
-from powercontext.http import Capabilities, MemorySearchMode, PreparedContextSchema, ReadinessResponse, ReadinessStatus
+from powercontext.http import (
+    Capabilities,
+    MemorySearchMode,
+    PreparedContextSchema,
+    PromptCapability,
+    ReadinessResponse,
+    ReadinessStatus,
+)
 from powercontext.paths import default_scheduler_path
 from powercontext.server.access import HttpAccessLogMiddleware
 from powercontext.server.app import create_app
+from powercontext.server.authentication import (
+    AuthenticationProvider,
+    StaticBearerAuthenticationProvider,
+)
+from powercontext.server.authz import (
+    AccessAction,
+    AccessAuditContext,
+    AccessControlService,
+    MemoryEntrySelector,
+    PrincipalRef,
+    ResourceRef,
+    access_control_for_mode,
+)
+from powercontext.server.authz.composition import open_builtin_access_control
+from powercontext.server.context import current_principal, current_request_id
+from powercontext.server.cursor_secret import resolve_cursor_secret
+from powercontext.server.dashboard import mount_dashboard
+from powercontext.server.dream_access import DreamAccess
 from powercontext.server.mcp import mount_mcp
 from powercontext.server.metrics import CONTENT_TYPE_LATEST, HttpMetricsMiddleware, ServerMetrics
-from powercontext.server.middleware import StaticBearerMiddleware
-from powercontext.server.settings import ServerSettings
+from powercontext.server.middleware import AuthenticationMiddleware
+from powercontext.server.processing_security import build_worker_security
+from powercontext.server.settings import MissingAuthenticationProviderError, ServerSettings
 from powercontext.server.tracing import HttpTracingMiddleware, ServerTracing
-from powercontext.server.web import mount_web_ui
 
 logger = logging.getLogger(__name__)
 
 
-def create_server_app(
+class BackgroundRoleRequiresBackgroundRunnerError(RuntimeError):
+    """Prevent a background-only process from accidentally exposing HTTP/MCP."""
+
+    def __init__(self) -> None:
+        super().__init__("artifact processing role 'background' must use the background service runner")
+
+
+class _MetricsEndpoint:
+    def __init__(self, metrics: ServerMetrics) -> None:
+        self._metrics = metrics
+
+    async def __call__(self, request: Request) -> Response:
+        access = access_control_for_mode(
+            request.app.state.access_control,
+            mode=request.app.state.access_mode,
+        )
+        if access is not None:
+            await access.require(
+                current_principal(),
+                AccessAction.SERVER_OBSERVE,
+                ResourceRef.server(access.deployment_id),
+                context=AccessAuditContext(
+                    transport="http",
+                    operation="get_metrics",
+                    request_id=current_request_id(),
+                ),
+            )
+        runtime = request.app.state.application
+        supervisor = None if runtime is None else runtime.artifact_processing_supervisor
+        self._metrics.set_processing_families({} if supervisor is None else supervisor.family_status)
+        return Response(self._metrics.render(), media_type=CONTENT_TYPE_LATEST)
+
+
+def create_server_app(  # noqa: C901
     *,
     settings: ServerSettings | None = None,
     scheduler_path: str | Path | None = None,
     candidate_pipeline: CandidatePipeline | None = None,
     experience_pipeline: ExperienceCandidatePipeline | None = None,
     experience_generator: ExperienceGenerator | None = None,
+    profile_generator: ProfileGenerator | None = None,
     skill_generator: SkillGenerator | None = None,
+    dream_generator: DreamGenerator | None = None,
     external_skill_provider: ExternalSkillProvider | None = None,
     handoff_pipeline: HandoffGenerationPipeline | None = None,
     embedding_model: EmbeddingModel | None = None,
     middleware: Sequence[Middleware] = (),
     tracing: ServerTracing | None = None,
+    access_control: AccessControlService | None = None,
+    authentication_provider: AuthenticationProvider | None = None,
 ) -> FastAPI:
     """Build the Server process and mount MCP when configured."""
 
     resolved = ServerSettings() if settings is None else settings
+    if resolved.dashboard.enabled and (authentication_provider is not None or access_control is not None):
+        raise ValueError("Dashboard supports only the built-in static Bearer profile")  # noqa: TRY003
+    if resolved.runtime.artifact_processing_role == "background":
+        raise BackgroundRoleRequiresBackgroundRunnerError
+    static_principal, configured_authentication, configured_access_control, legacy_static_admin = (
+        _resolve_security_providers(
+            resolved,
+            access_control=access_control,
+            authentication_provider=authentication_provider,
+        )
+    )
     config = BuiltinConfig(
+        code=resolved.code,
         runtime=resolved.runtime,
         database=resolved.database,
         handoff_report=resolved.handoff_report,
@@ -84,24 +167,93 @@ def create_server_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _log_lifecycle("server.starting", "PowerContext Server is starting")
+        if resolved.allow_insecure_http:
+            _log_insecure_remote_http_warning()
         if isinstance(config.database, SQLiteConfig) and config.database.is_in_memory:
             _log_in_memory_database_warning()
-        async with open_builtin_runtime(
-            config,
-            scheduler_path=default_scheduler_path() if scheduler_path is None else scheduler_path,
-            candidate_pipeline=candidate_pipeline,
-            experience_pipeline=experience_pipeline,
-            experience_generator=experience_generator,
-            skill_generator=skill_generator,
-            external_skill_provider=external_skill_provider,
-            handoff_pipeline=handoff_pipeline,
-            embedding_model=embedding_model,
-            instrumentation=resolved_tracing.instrumentation,
-            scope_cache_observer=None if metrics is None else metrics.set_runtime_scopes,
-            tracing=resolved_tracing,
-        ) as runtime:
+        configured_cursor_secret = (
+            None if resolved.cursor_signing_secret is None else resolved.cursor_signing_secret.get_secret_value()
+        )
+        cursor_secret = resolve_cursor_secret(config.database, configured_cursor_secret)
+        async with AsyncExitStack() as resources:
+            active_access_control = configured_access_control
+            if active_access_control is None and resolved.access.mode == "enforced":
+                active_access_control = await resources.enter_async_context(
+                    open_builtin_access_control(
+                        resolved.database,
+                        bootstrap_administrators=(static_principal,) if legacy_static_admin else (),
+                        deployment_id=resolved.access.deployment_id,
+                    )
+                )
+            scheduled_source_runner, scheduled_experience_runner = _scheduled_access_runners(
+                resolved,
+                active_access_control,
+                legacy_static_principal=static_principal if legacy_static_admin else None,
+            )
+            dream_access = (
+                DreamAccess(active_access_control)
+                if resolved.access.mode == "enforced" and isinstance(active_access_control, AccessControlService)
+                else None
+            )
+            worker_security = build_worker_security(
+                resolved,
+                active_access_control,
+                legacy_static_principal=static_principal if legacy_static_admin else None,
+                enabled=config.runtime.artifact_processing_role != "api" and bool(processing_capabilities(config)),
+                injected=configured_access_control is not None,
+            )
+            runtime = await resources.enter_async_context(
+                open_builtin_runtime(
+                    config,
+                    scheduler_path=default_scheduler_path() if scheduler_path is None else scheduler_path,
+                    candidate_pipeline=candidate_pipeline,
+                    experience_pipeline=experience_pipeline,
+                    experience_generator=experience_generator,
+                    profile_generator=profile_generator,
+                    skill_generator=skill_generator,
+                    dream_generator=dream_generator,
+                    dream_authorizer=None if dream_access is None else dream_access.authorize,
+                    dream_authorization_context=nullcontext
+                    if dream_access is None
+                    else dream_access.access.defer_decision_audit,
+                    dream_candidate_attester=None if dream_access is None else dream_access.attest_candidate,
+                    external_skill_provider=external_skill_provider,
+                    handoff_pipeline=handoff_pipeline,
+                    embedding_model=embedding_model,
+                    instrumentation=resolved_tracing.instrumentation,
+                    scope_cache_observer=None if metrics is None else metrics.set_runtime_scopes,
+                    topic_memory_search_observer=None if metrics is None else metrics.observe_topic_memory_search,
+                    tracing=resolved_tracing,
+                    scheduled_source_runner=scheduled_source_runner,
+                    scheduled_experience_runner=scheduled_experience_runner,
+                    worker_security=worker_security,
+                    scheduled_profile_runner=_scheduled_profile_runner(
+                        resolved,
+                        active_access_control,
+                        enabled=config.runtime.profile_schedule_enabled
+                        and (profile_generator is not None or config.inference.generation_model is not None),
+                        legacy_static_principal=static_principal if legacy_static_admin else None,
+                    ),
+                    cursor_secret=cursor_secret,
+                    handoff_verification_keys=tuple(
+                        secret.get_secret_value().encode()
+                        for secret in resolved.handoff_generation_verification_secrets
+                    ),
+                )
+            )
+            _bind_dream_access(dream_access, runtime)
+            if active_access_control is not None:
+                migrated, unresolved = await runtime._records().migrate_handoff_receipts(
+                    active_access_control.committed_receipt_identity,
+                )
+                _log_lifecycle(
+                    "server.receipt_migration",
+                    f"Receipt migration: {migrated} attested, {unresolved} pending in pc_receipt_migration_review",
+                )
             readiness_probe.bind(runtime)
             app.state.application = runtime
+            app.state.access_control = active_access_control
+            app.state.authentication_provider = configured_authentication
             app.state.capabilities = await _server_capabilities(runtime)
             await readiness_probe()
             try:
@@ -110,6 +262,8 @@ def create_server_app(
                 _log_lifecycle("server.stopping", "PowerContext Server is stopping")
                 readiness_probe.unbind()
                 app.state.application = None
+                app.state.access_control = configured_access_control
+                app.state.authentication_provider = configured_authentication
                 app.state.capabilities = Capabilities(
                     source_types=[],
                     artifact_families=[],
@@ -124,11 +278,14 @@ def create_server_app(
         _log_lifecycle("server.stopped", "PowerContext Server stopped")
 
     configured_middleware = list(middleware)
-    auth_token = resolved.auth.token
-    if resolved.auth.enabled and auth_token is not None:
+    if configured_authentication is not None:
         configured_middleware.insert(
             0,
-            Middleware(StaticBearerMiddleware, token=auth_token.get_secret_value()),
+            Middleware(
+                AuthenticationMiddleware,
+                provider=configured_authentication,
+                dashboard_enabled=resolved.dashboard.enabled,
+            ),
         )
 
     app = create_app(
@@ -138,12 +295,15 @@ def create_server_app(
         metrics=metrics,
         tracing=resolved_tracing,
         handoff_report_enabled=resolved.handoff_report.enabled,
+        access_control=configured_access_control,
+        access_mode=resolved.access.mode,
+        authentication_provider=configured_authentication,
+        allow_insecure_remote_http=resolved.allow_insecure_http,
     )
-    _mount_optional_web_ui(app, resolved)
     if metrics is not None:
         app.add_api_route(
             "/metrics",
-            lambda: Response(metrics.render(), media_type=CONTENT_TYPE_LATEST),
+            _MetricsEndpoint(metrics),
             include_in_schema=False,
         )
         operations = _http_operations(app)
@@ -172,35 +332,170 @@ def create_server_app(
             metrics=metrics,
             tracing=resolved_tracing,
         )
+    if resolved.dashboard.enabled:
+        mount_dashboard(app)
     return app
 
 
-def _mount_optional_web_ui(app: FastAPI, settings: ServerSettings) -> None:
-    app.state.dashboard_started = False
-    app.state.dashboard_startup_error = None
-    if not (settings.dashboard.enabled or settings.handoff_report.enabled):
-        return
-    try:
-        mount_web_ui(
-            app,
-            scopes={scope.scope_id: scope.display_name for scope in settings.dashboard.scopes},
-            dashboard_enabled=settings.dashboard.enabled,
-            handoff_report_enabled=settings.handoff_report.enabled,
-            authentication_required=settings.auth.enabled,
-            agent_skill_targets=settings.external_skills.agent_targets,
+def _resolve_security_providers(
+    settings: ServerSettings,
+    *,
+    access_control: AccessControlService | None,
+    authentication_provider: AuthenticationProvider | None,
+) -> tuple[PrincipalRef, AuthenticationProvider | None, AccessControlService | None, bool]:
+    static_principal = PrincipalRef(
+        type="service",
+        id="server-token",
+        description="PowerContext static bearer",
+    )
+    if settings.access.mode == "disabled":
+        if access_control is not None or authentication_provider is not None:
+            raise ValueError("disabled Access Mode cannot load security Providers")  # noqa: TRY003
+        return static_principal, None, None, False
+    if authentication_provider is not None:
+        return static_principal, authentication_provider, access_control, False
+    if settings.auth.token is None:
+        raise MissingAuthenticationProviderError
+    authentication = StaticBearerAuthenticationProvider(
+        settings.auth.token.get_secret_value(),
+        static_principal,
+    )
+    return static_principal, authentication, access_control, True
+
+
+def _bind_dream_access(access: DreamAccess | None, runtime: BuiltinRuntime) -> None:
+    if access is not None:
+        access.bind(runtime)
+
+
+def _scheduled_access_runners(
+    settings: ServerSettings,
+    access: AccessControlService | None,
+    *,
+    legacy_static_principal: PrincipalRef | None,
+) -> tuple[ScheduledSourceRunner | None, ScheduledExperienceRunner | None]:
+    source_scheduled = settings.runtime.schedule_seconds is not None
+    experience_scheduled = settings.runtime.experience_schedule_seconds is not None
+    if settings.access.mode == "disabled" or not (source_scheduled or experience_scheduled):
+        return None, None
+    if access is None:
+        raise ValueError("scheduled processing in enforced mode requires an Authorization Provider")  # noqa: TRY003
+    principal = _scheduled_principal(settings, legacy_static_principal=legacy_static_principal)
+
+    async def process_sources(scope_id: str, runtime: BuiltinRuntime) -> MemoryFlushResult:
+        context = AccessAuditContext(transport="background", operation="process_source_window")
+        await access.bootstrap_static_scope(principal, scope_id, context=context)
+        await access.require(principal, AccessAction.SCOPE_CONTRIBUTE, ResourceRef.scope(scope_id), context=context)
+        memory = runtime.memory.for_scope(scope_id)
+        before = await memory.list(include_inactive=True)
+        before_keys = {_memory_resource(scope_id, entry).key for entry in before.entries}
+        await access.require_all(
+            principal,
+            tuple((AccessAction.ARTIFACT_WRITE, _memory_resource(scope_id, entry)) for entry in before.entries),
+            context=context,
         )
-        if settings.dashboard.enabled:
-            app.state.dashboard_started = True
-    except Exception as error:
-        app.state.dashboard_startup_error = str(error)
-        unit = "Dashboard" if settings.dashboard.enabled else "Handoff Report"
-        log_safely(
-            logger,
-            logging.WARNING,
-            f"PowerContext {unit} failed to start: {error}",
-            exc_info=error,
-            extra={"event": "web_ui.start_failed", "unit": "web_ui"},
+        result = await memory.flush()
+        after = await memory.list(include_inactive=True)
+        for entry in after.entries:
+            resource = _memory_resource(scope_id, entry)
+            if resource.key not in before_keys:
+                await access.establish_artifact_owner(
+                    resource,
+                    principal,
+                    idempotency_key=f"background-memory-owner:{scope_id}:{resource.artifact_id}:{entry.citation.entry_id}",
+                    context=context,
+                )
+        return result
+
+    async def incubate_experience(scope_id: str, runtime: BuiltinRuntime) -> ExperienceIncubationResult:
+        context = AccessAuditContext(transport="background", operation="incubate_experience_candidates")
+        await access.bootstrap_static_scope(principal, scope_id, context=context)
+        await access.require(principal, AccessAction.SCOPE_CONTRIBUTE, ResourceRef.scope(scope_id), context=context)
+        result = await runtime.experience.for_scope(scope_id).incubate()
+        for candidate_id in result.candidate_ids:
+            await access.attest_candidate_owner(
+                scope_id=scope_id,
+                candidate_id=candidate_id,
+                family="experience",
+                proposed_owner=principal,
+                target=None,
+                idempotency_key=f"background-candidate-owner:{scope_id}:{candidate_id}",
+            )
+        return result
+
+    return (
+        process_sources if source_scheduled else None,
+        incubate_experience if experience_scheduled else None,
+    )
+
+
+def _scheduled_profile_runner(settings, access, *, enabled, legacy_static_principal):
+    if settings.access.mode == "disabled" or not enabled:
+        return None
+    if access is None:
+        raise ValueError("Profile scheduling requires an Authorization Provider")  # noqa: TRY003
+    principal = _scheduled_principal(settings, legacy_static_principal=legacy_static_principal)
+
+    async def run(scope_id, high, profiles):
+        context = AccessAuditContext(transport="background", operation="flush_profile")
+        await access.bootstrap_static_scope(principal, scope_id, context=context)
+        await access.require(principal, AccessAction.SCOPE_CONTRIBUTE, ResourceRef.scope(scope_id), context=context)
+        resource = ResourceRef.artifact(scope_id, family="profile", artifact_id="profile")
+
+        async def authorize_snapshot(current):
+            if current is not None:
+                await access.require(principal, AccessAction.ARTIFACT_WRITE, resource, context=context)
+
+        async def on_commit(connection, artifact, candidate):
+            bound = access.with_connection(connection)
+            if artifact is not None and await bound.artifact_owner(resource) is None:
+                await bound.establish_artifact_owner(
+                    resource,
+                    principal,
+                    idempotency_key=f"profile-owner:{scope_id}",
+                    context=context,
+                )
+            if candidate is not None:
+                await bound.attest_candidate_owner(
+                    scope_id=scope_id,
+                    candidate_id=candidate.candidate_id,
+                    family="profile",
+                    proposed_owner=principal,
+                    target=None if candidate.target is None else resource,
+                    idempotency_key=f"candidate-owner:{scope_id}:{candidate.candidate_id}",
+                )
+
+        return await profiles.flush(
+            scope_id, high_watermark=high, authorize_snapshot=authorize_snapshot, on_commit=on_commit
         )
+
+    return run
+
+
+def _scheduled_principal(
+    settings: ServerSettings,
+    *,
+    legacy_static_principal: PrincipalRef | None,
+) -> PrincipalRef:
+    if settings.access.background_principal_id is not None:
+        return PrincipalRef(
+            type="service",
+            id=settings.access.background_principal_id,
+            description=settings.access.background_principal_description,
+        )
+    if legacy_static_principal is not None:
+        return legacy_static_principal
+    raise ValueError("scheduled processing in enforced mode requires ACCESS_BACKGROUND_PRINCIPAL_ID")  # noqa: TRY003
+
+
+def _memory_resource(scope_id: str, entry: MemoryEntryRecord) -> ResourceRef:
+    citation = entry.citation
+    return ResourceRef.artifact(
+        scope_id,
+        family="memory",
+        artifact_id=citation.memory_ref.artifact_id,
+        selector=MemoryEntrySelector(entry_id=citation.entry_id),
+    )
 
 
 class _ServerReadinessProbe:
@@ -280,6 +575,16 @@ def _log_in_memory_database_warning() -> None:
     )
 
 
+def _log_insecure_remote_http_warning() -> None:
+    log_safely(
+        logger,
+        logging.WARNING,
+        "PowerContext remote Skill Receiver cleartext HTTP opt-in is enabled; "
+        "use it only on a protected private test network",
+        extra={"event": "server.remote_skills.insecure_http_enabled", "unit": "server"},
+    )
+
+
 def _http_operations(app: FastAPI) -> dict[tuple[str, str], str]:
     return {
         (method, route.path): route.operation_id
@@ -293,10 +598,15 @@ async def _server_capabilities(runtime: BuiltinRuntime) -> Capabilities:
     capabilities = await runtime.capabilities()
     return Capabilities(
         source_types=[CONTENT_SOURCE_NAME],
-        artifact_families=["memory", "experience", "skill", "handoff"],
+        artifact_families=["memory", "topic-memory", "experience", "skill", "handoff", "profile", "prompt"],
+        prompts={
+            key: PromptCapability.model_validate_json(value.model_dump_json())
+            for key, value in capabilities.prompts.items()
+        },
         memory_extraction=capabilities.memory_extraction,
         experience_generation=capabilities.experience_generation,
         managed_skill_generation=capabilities.managed_skill_generation,
+        artifact_dreaming=capabilities.artifact_dreaming,
         external_skill_registry=capabilities.external_skill_registry,
         handoff_generation=capabilities.handoff_generation,
         search_modes=[MemorySearchMode(mode) for mode in capabilities.memory_search_modes],

@@ -32,7 +32,7 @@ from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import InferenceConfig, RuntimeConfig
 from powercontext.builtin.sources import ContentSource
 from powercontext.client import PowerContextClient
-from powercontext.http import CaptureContentSourceRequest
+from powercontext.http import CaptureContentSourceRequest, CreateScopeRequest, ResolveScopeBindingRequest
 from powercontext.server.factory import create_server_app
 from powercontext.server.settings import McpConfig, ServerSettings
 
@@ -57,7 +57,6 @@ def test_pydantic_ai_capture_checkpoint_recall_and_search_chain(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    scope_id = "pydantic-ai-chain"
     app = create_server_app(
         settings=ServerSettings(
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'pydantic-ai.db'}"),
@@ -109,6 +108,18 @@ def test_pydantic_ai_capture_checkpoint_recall_and_search_chain(
                 base_url="http://testserver",
             ) as transport,
         ):
+            scope_client = PowerContextClient(
+                "http://testserver",
+                http_client=transport,
+                trust_transport_security=True,
+            )
+            scope = await scope_client.create_scope(
+                CreateScopeRequest(
+                    title="Pydantic AI chain",
+                    summary="Explicit Scope for the Pydantic AI capture and recall chain.",
+                    idempotency_key="pydantic-ai-chain",
+                )
+            )
 
             class AsgiPowerContextClient(PowerContextClient):
                 def __init__(
@@ -117,9 +128,16 @@ def test_pydantic_ai_capture_checkpoint_recall_and_search_chain(
                     *,
                     token: str | None = None,
                     timeout: float = 10,
+                    allow_insecure_http: bool | None = None,
                 ) -> None:
                     del timeout
-                    super().__init__(base_url, token=token, http_client=transport, trust_transport_security=True)
+                    super().__init__(
+                        base_url,
+                        token=token,
+                        http_client=transport,
+                        trust_transport_security=True,
+                        allow_insecure_http=allow_insecure_http,
+                    )
 
             monkeypatch.setattr(toolset_module, "PowerContextClient", AsgiPowerContextClient)
             settings = PowerContextSettings(
@@ -132,7 +150,7 @@ def test_pydantic_ai_capture_checkpoint_recall_and_search_chain(
                 output_type=str,
                 deps_type=object,
                 tools=[produce_evidence],
-                capabilities=[PowerContext[object](settings=settings, scope_id=scope_id)],
+                capabilities=[PowerContext[object](settings=settings, scope_id=scope.scope_id)],
             )
             return (await agent.run("Find checkpoint-evidence with a tool, then recall and search it.")).output
 
@@ -149,7 +167,6 @@ def test_pydantic_ai_final_flush_catches_up_across_more_than_ten_source_windows(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    scope_id = "pydantic-ai-deep-backlog"
     evidence = "deep-backlog-evidence is immediately recallable"
     app = create_server_app(
         settings=ServerSettings(
@@ -197,6 +214,8 @@ def test_pydantic_ai_final_flush_catches_up_across_more_than_ten_source_windows(
             ) as transport,
         ):
             seed_client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
+            resolved_scope = await seed_client.resolve_scope_binding(ResolveScopeBindingRequest())
+            scope_id = resolved_scope.scope_id
             for index in range(20):
                 await seed_client.capture_content_source(
                     CaptureContentSourceRequest(
@@ -214,9 +233,16 @@ def test_pydantic_ai_final_flush_catches_up_across_more_than_ten_source_windows(
                     *,
                     token: str | None = None,
                     timeout: float = 10,
+                    allow_insecure_http: bool | None = None,
                 ) -> None:
                     del timeout
-                    super().__init__(base_url, token=token, http_client=transport, trust_transport_security=True)
+                    super().__init__(
+                        base_url,
+                        token=token,
+                        http_client=transport,
+                        trust_transport_security=True,
+                        allow_insecure_http=allow_insecure_http,
+                    )
 
             monkeypatch.setattr(toolset_module, "PowerContextClient", AsgiPowerContextClient)
             capture_settings = PowerContextSettings(
@@ -230,7 +256,7 @@ def test_pydantic_ai_final_flush_catches_up_across_more_than_ten_source_windows(
                 output_type=str,
                 deps_type=object,
                 tools=[produce_evidence],
-                capabilities=[PowerContext[object](settings=capture_settings, scope_id=scope_id)],
+                capabilities=[PowerContext[object](settings=capture_settings)],
             )
             assert (
                 await capture_agent.run("Capture deep-backlog-evidence with the tool.")
@@ -239,7 +265,7 @@ def test_pydantic_ai_final_flush_catches_up_across_more_than_ten_source_windows(
             recall_settings = PowerContextSettings(base_url="http://testserver")
             recall_agent = Agent(
                 FunctionModel(recall_respond),
-                capabilities=[PowerContext(settings=recall_settings, scope_id=scope_id)],
+                capabilities=[PowerContext(settings=recall_settings)],
             )
             return (await recall_agent.run("Recall deep-backlog-evidence now.")).output
 

@@ -14,11 +14,21 @@
 
 """Process configuration for the PowerContext LangChain middleware."""
 
-from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import ClassVar
+
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import SettingsConfigDict
+
+from powercontext.client.transport_policy import ClientTransportSettings
+
+try:
+    from powercontext.http import ContextAssembly
+except ImportError:
+    # Older core releases support legacy recall but cannot accept assembly settings.
+    from types import NoneType as ContextAssembly
 
 
-class PowerContextLangChainSettings(BaseSettings):
+class PowerContextLangChainSettings(ClientTransportSettings):
     """PowerContext settings read from ``POWERCONTEXT_LANGCHAIN_*`` variables."""
 
     model_config = SettingsConfigDict(
@@ -29,11 +39,23 @@ class PowerContextLangChainSettings(BaseSettings):
         hide_input_in_errors=True,
     )
 
+    transport_host: ClassVar[str] = "langchain"
     base_url: str = "http://127.0.0.1:8000"
     token: SecretStr | None = Field(default=None, repr=False)
     scope_id: str | None = None
     timeout: float = Field(default=10.0, gt=0)
     max_bytes: int = Field(default=8000, ge=512, le=32768)
+    context_assembly: ContextAssembly | None = None
+
+    @field_validator("context_assembly", mode="before")
+    @classmethod
+    def validate_assembly_support(cls, value: object) -> object:
+        if value is not None and ContextAssembly is type(None):
+            raise ValueError(  # noqa: TRY003
+                "context_assembly requires a PowerContext core with text assembly support; "
+                "install the core and adapter from the same checkout"
+            )
+        return value
 
 
 __all__ = ["PowerContextLangChainSettings"]

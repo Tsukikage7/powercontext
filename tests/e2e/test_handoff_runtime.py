@@ -20,9 +20,17 @@ from pathlib import Path
 
 import pytest
 
-from powercontext.builtin.artifacts.handoff import HandoffScopeMismatchError
+from powercontext.artifacts import ArtifactRef
+from powercontext.builtin.artifacts.handoff import (
+    HandoffEvidenceUnavailableError,
+    HandoffScopeMismatchError,
+    PrepareHandoff,
+    PrepareHandoffHint,
+)
 from powercontext.builtin.artifacts.memory import MemoryEntryInput
-from powercontext.builtin.persistence.sqlite import SQLiteConfig
+from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
+from powercontext.builtin.persistence.tables import BUILTIN_TABLES
+from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.runtime import (
     ActivateHandoff,
     BuiltinConfig,
@@ -33,11 +41,17 @@ from powercontext.builtin.runtime import (
     HandoffOmission,
     HandoffSourceCitation,
     HandoffStatement,
+    InferenceConfig,
     PreparedHandoff,
     RememberMemoryRequest,
     open_builtin_runtime,
 )
+from powercontext.builtin.runtime.relational import RelationalContexts
+from powercontext.builtin.scope import ScopeDraft
+from powercontext.builtin.source_eligibility import SourceNotEligibleError
 from powercontext.errors import RevisionConflictError
+from powercontext.sources import SourceDefinitionRegistry, SourceRef
+from tests.builtin.persistence.contract import SOURCE_ADAPTERS, CommitAdapter, CommitInput, NoteInput
 
 
 class _EchoHandoffPipeline:
@@ -59,20 +73,132 @@ class _EchoHandoffPipeline:
         )
 
 
+@pytest.mark.parametrize("family", ["unregistered-family", "experience"])
+def test_handoff_batch_error_identifies_missing_artifact_after_valid_source(family) -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(
+            BuiltinConfig(database=SQLiteConfig()),
+            handoff_pipeline=_EchoHandoffPipeline(),
+        ) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Batch evidence", summary="Error identity", idempotency_key="batch-error")
+            )
+            source = await runtime.sources.for_scope(scope.scope_id).capture(
+                CaptureSource(source_id="valid", content="Valid evidence.", metadata={})
+            )
+            missing = HandoffArtifactCitation(
+                artifact_ref=ArtifactRef(family=family, artifact_id="missing", revision=1)
+            )
+            with pytest.raises(HandoffEvidenceUnavailableError) as error:
+                await runtime.handoff.for_scope(scope.scope_id).prepare(
+                    PrepareHandoff(
+                        objective="Report missing evidence.",
+                        evidence=(HandoffSourceCitation(source_ref=source.source_ref), missing),
+                    )
+                )
+            assert error.value.citation == missing
+            assert await runtime.handoff.for_scope(scope.scope_id).latest() is None
+
+    asyncio.run(scenario())
+
+
+def test_handoff_batch_rejects_existing_prompt_as_evidence(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(
+            BuiltinConfig(
+                database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'prompt-evidence.db'}"),
+                inference=InferenceConfig(generation_model="test"),
+            ),
+            handoff_pipeline=_EchoHandoffPipeline(),
+        ) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Prompt boundary", summary="Evidence isolation", idempotency_key="prompt-evidence")
+            )
+            source = await runtime.sources.for_scope(scope.scope_id).capture(
+                CaptureSource(source_id="valid", content="Valid evidence.", metadata={})
+            )
+            prompt = await runtime.records.for_scope(scope.scope_id).create_artifact(
+                "prompt",
+                ArtifactWrite(
+                    prompt_key="memory.extract",
+                    content={
+                        "schema_version": "powercontext.prompt.v1",
+                        "mode": "custom",
+                        "instructions": "Keep personal preferences.",
+                        "demonstrations": [],
+                    },
+                ),
+            )
+            citation = HandoffArtifactCitation(
+                artifact_ref=ArtifactRef(family="prompt", artifact_id=prompt.artifact_id, revision=prompt.revision)
+            )
+            handoffs = runtime.handoff.for_scope(scope.scope_id)
+            with pytest.raises(HandoffEvidenceUnavailableError) as error:
+                await handoffs.prepare(
+                    PrepareHandoff(
+                        objective="Do not use instructions as evidence.",
+                        evidence=(HandoffSourceCitation(source_ref=source.source_ref), citation),
+                    )
+                )
+            assert error.value.citation == citation
+            assert await handoffs.latest() is None
+
+    asyncio.run(scenario())
+
+
+def test_handoff_batch_error_identifies_source_with_unregistered_definition() -> None:
+    async def scenario() -> None:
+        async with SQLiteProfile.open(SQLiteConfig(), tables=BUILTIN_TABLES) as profile:
+            original = RelationalContexts(
+                database=profile.database,
+                source_registry=SourceDefinitionRegistry.from_adapters(SOURCE_ADAPTERS),
+            )
+            context = await original.get("project")
+            valid = await context.sources.add(await context.sources.resolve(CommitInput(revision="valid")))
+            unavailable = await context.sources.add(
+                await context.sources.resolve(NoteInput(note_id="unavailable", body="Historical note."))
+            )
+            citations = (
+                HandoffSourceCitation(source_ref=SourceRef(source_type="commit", source_id=valid.name)),
+                HandoffSourceCitation(source_ref=SourceRef(source_type="note", source_id=unavailable.name)),
+            )
+
+            # Reopen the same data without the historical Note adapter.
+            reopened = RelationalContexts(
+                database=profile.database,
+                source_registry=SourceDefinitionRegistry.from_adapters((CommitAdapter(),)),
+                handoff_pipeline=_EchoHandoffPipeline(),
+            )
+            handoffs = (await reopened.get("project")).artifacts.handoff
+            with pytest.raises(HandoffEvidenceUnavailableError) as error:
+                await handoffs.prepare(PrepareHandoff(objective="Report unavailable evidence.", evidence=citations))
+
+            assert error.value.citation == citations[1]
+            assert await handoffs.latest() is None
+
+    asyncio.run(scenario())
+
+
 def test_runtime_owns_handoff_trigger_activation_and_deduplication() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(
             BuiltinConfig(database=SQLiteConfig()),
             handoff_pipeline=_EchoHandoffPipeline(),
         ) as runtime:
-            source = await runtime.sources.for_scope("project").capture(
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Project", summary="Handoff activation", idempotency_key="project")
+            )
+            source = await runtime.sources.for_scope(scope.scope_id).capture(
                 CaptureSource(
                     source_id="turn-1",
                     content="The parser maps malformed input to a stable public error.",
                     metadata={},
                 )
             )
-            handoffs = runtime.handoff.for_scope("project")
+            handoffs = runtime.handoff.for_scope(scope.scope_id)
             generated = await handoffs.activate(
                 ActivateHandoff(
                     boundary_source=source.source_ref,
@@ -100,6 +226,65 @@ def test_runtime_owns_handoff_trigger_activation_and_deduplication() -> None:
     asyncio.run(scenario())
 
 
+def test_handoff_activation_rejects_a_lineage_only_boundary_source() -> None:
+    async def scenario() -> None:
+        pipeline = _EchoHandoffPipeline()
+        async with open_builtin_runtime(
+            BuiltinConfig(database=SQLiteConfig()),
+            handoff_pipeline=pipeline,
+        ) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Project", summary="Reserved boundary", idempotency_key="reserved-boundary")
+            )
+            created = await runtime.records.for_scope(scope.scope_id).create_artifact(
+                "memory",
+                ArtifactWrite(content={"entries": [{"kind": "fact", "text": "Direct input."}]}),
+            )
+
+            with pytest.raises(SourceNotEligibleError):
+                await runtime.handoff.for_scope(scope.scope_id).activate(
+                    ActivateHandoff(
+                        boundary_source=created.sources[0],
+                        objective="Do not regenerate from management provenance.",
+                    )
+                )
+
+    asyncio.run(scenario())
+
+
+def test_handoff_hint_omits_a_lineage_only_source_without_changing_continue_errors() -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Hint evidence", summary="Eligibility boundary", idempotency_key="hint-eligibility")
+            )
+            created = await runtime.records.for_scope(scope.scope_id).create_artifact(
+                "memory", ArtifactWrite(content={"entries": [{"kind": "fact", "text": "Direct input."}]})
+            )
+            prepared = PreparedHandoff(
+                scope_id=scope.scope_id,
+                base=None,
+                content=HandoffDraft(
+                    objective="Continue historical work.",
+                    state=(
+                        HandoffStatement(
+                            text="Recorded state.", citations=(HandoffSourceCitation(source_ref=created.sources[0]),)
+                        ),
+                    ),
+                    disposition="continuable",
+                ).as_content(),
+            )
+            handoffs = runtime.handoff.for_scope(scope.scope_id)
+            hint = await handoffs.hint(PrepareHandoffHint(selection="prepared", prepared=prepared))
+            assert hint.status == "empty" and hint.content is None and hint.content_bytes == 0
+            with pytest.raises(SourceNotEligibleError):
+                await handoffs.continue_from(prepared)
+
+    asyncio.run(scenario())
+
+
 def test_handoff_trigger_state_survives_runtime_restart(tmp_path: Path) -> None:
     async def scenario() -> None:
         config = BuiltinConfig(
@@ -108,14 +293,18 @@ def test_handoff_trigger_state_survives_runtime_restart(tmp_path: Path) -> None:
             )
         )
         async with open_builtin_runtime(config, handoff_pipeline=_EchoHandoffPipeline()) as runtime:
-            source = await runtime.sources.for_scope("project").capture(
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Project", summary="Restarted Handoff trigger", idempotency_key="project")
+            )
+            source = await runtime.sources.for_scope(scope.scope_id).capture(
                 CaptureSource(
                     source_id="boundary-1",
                     content="The provider observed one participant boundary.",
                     metadata={},
                 )
             )
-            first = await runtime.handoff.for_scope("project").activate(
+            first = await runtime.handoff.for_scope(scope.scope_id).activate(
                 ActivateHandoff(
                     boundary_source=source.source_ref,
                     objective="Transfer the current work.",
@@ -123,7 +312,7 @@ def test_handoff_trigger_state_survives_runtime_restart(tmp_path: Path) -> None:
             )
 
         async with open_builtin_runtime(config, handoff_pipeline=_EchoHandoffPipeline()) as runtime:
-            repeated = await runtime.handoff.for_scope("project").activate(
+            repeated = await runtime.handoff.for_scope(scope.scope_id).activate(
                 ActivateHandoff(
                     boundary_source=source.source_ref,
                     objective="Transfer the current work.",
@@ -140,14 +329,18 @@ def test_handoff_trigger_state_survives_runtime_restart(tmp_path: Path) -> None:
 def test_handoff_runtime_supports_temporary_transfer_and_durable_milestones() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            source = await runtime.sources.for_scope("project").capture(
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Project", summary="Handoff milestones", idempotency_key="project")
+            )
+            source = await runtime.sources.for_scope(scope.scope_id).capture(
                 CaptureSource(
                     source_id="turn-1",
                     content="The parser maps malformed input to a stable public error.",
                     metadata={"origin": "e2e"},
                 )
             )
-            memory = await runtime.memory.for_scope("project").remember(
+            memory = await runtime.memory.for_scope(scope.scope_id).remember(
                 RememberMemoryRequest(
                     entries=(
                         MemoryEntryInput(
@@ -160,7 +353,7 @@ def test_handoff_runtime_supports_temporary_transfer_and_durable_milestones() ->
             assert memory.entry is not None
             source_citation = HandoffSourceCitation(source_ref=source.source_ref)
             memory_citation = HandoffMemoryCitation(memory_citation=memory.entry.citation)
-            handoffs = runtime.handoff.for_scope("project")
+            handoffs = runtime.handoff.for_scope(scope.scope_id)
 
             empty = await handoffs.continue_latest()
             prepared = await handoffs.finalize(
@@ -243,10 +436,66 @@ def test_handoff_runtime_supports_temporary_transfer_and_durable_milestones() ->
     asyncio.run(scenario())
 
 
+def test_handoff_resolution_authorizes_each_evidence_target_before_reading_it() -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(
+                    title="Project",
+                    summary="Authorization of Handoff evidence targets.",
+                    idempotency_key="handoff-evidence-authorization",
+                )
+            )
+            source = await runtime.sources.for_scope(scope.scope_id).capture(
+                CaptureSource(source_id="visible", content="Visible evidence.", metadata={})
+            )
+            hidden = HandoffArtifactCitation(
+                artifact_ref=ArtifactRef(family="experience", artifact_id="not-readable", revision=1)
+            )
+            prepared = PreparedHandoff(
+                scope_id=scope.scope_id,
+                base=None,
+                content=HandoffDraft(
+                    objective="Continue with independently authorized evidence.",
+                    state=(
+                        HandoffStatement(
+                            text="One citation is visible and one is hidden.",
+                            citations=(HandoffSourceCitation(source_ref=source.source_ref), hidden),
+                        ),
+                    ),
+                    disposition="continuable",
+                ).as_content(),
+            )
+            inspected = []
+
+            async def authorize(citation) -> bool:
+                inspected.append(citation)
+                return citation != hidden
+
+            resolution = await runtime.handoff.for_scope(scope.scope_id).continue_from(
+                prepared,
+                evidence_authorizer=authorize,
+            )
+
+            assert inspected == list(prepared.content.state[0].citations)
+            assert resolution.evidence_checks[0].status == "unavailable"
+            assert resolution.evidence_checks[0].unavailable_evidence == (hidden,)
+
+    asyncio.run(scenario())
+
+
 def test_handoff_runtime_rejects_stale_and_cross_scope_use() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            source = await runtime.sources.for_scope("project").capture(
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Project", summary="Handoff concurrency", idempotency_key="project")
+            )
+            other = await runtime.scopes.create(
+                ScopeDraft(title="Other", summary="Cross-Scope Handoff", idempotency_key="other")
+            )
+            source = await runtime.sources.for_scope(scope.scope_id).capture(
                 CaptureSource(
                     source_id="turn-1",
                     content="A stable source for concurrent Handoffs.",
@@ -254,7 +503,7 @@ def test_handoff_runtime_rejects_stale_and_cross_scope_use() -> None:
                 )
             )
             citation = HandoffSourceCitation(source_ref=source.source_ref)
-            handoffs = runtime.handoff.for_scope("project")
+            handoffs = runtime.handoff.for_scope(scope.scope_id)
             initial = await handoffs.finalize(
                 HandoffDraft(
                     objective="Coordinate the next milestone.",
@@ -282,7 +531,7 @@ def test_handoff_runtime_rejects_stale_and_cross_scope_use() -> None:
             with pytest.raises(RevisionConflictError) as stale:
                 await handoffs.commit(session_b)
             with pytest.raises(HandoffScopeMismatchError):
-                await runtime.handoff.for_scope("other").continue_from(session_a)
+                await runtime.handoff.for_scope(other.scope_id).continue_from(session_a)
 
             assert stale.value.artifact == session_b.base
             assert stale.value.current == current
@@ -299,14 +548,18 @@ def test_handoff_runtime_recovers_only_explicitly_committed_milestones(tmp_path:
             )
         )
         async with open_builtin_runtime(config) as runtime:
-            source = await runtime.sources.for_scope("project").capture(
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Project", summary="Durable Handoff", idempotency_key="project")
+            )
+            source = await runtime.sources.for_scope(scope.scope_id).capture(
                 CaptureSource(
                     source_id="turn-1",
                     content="Persist only an explicitly selected milestone.",
                     metadata={},
                 )
             )
-            prepared = await runtime.handoff.for_scope("project").finalize(
+            prepared = await runtime.handoff.for_scope(scope.scope_id).finalize(
                 HandoffDraft(
                     objective="Recover the selected milestone.",
                     state=(
@@ -325,7 +578,7 @@ def test_handoff_runtime_recovers_only_explicitly_committed_milestones(tmp_path:
             transferred_value = prepared.model_dump_json(by_alias=True)
 
         async with open_builtin_runtime(config) as runtime:
-            handoffs = runtime.handoff.for_scope("project")
+            handoffs = runtime.handoff.for_scope(scope.scope_id)
             restored_temporary = PreparedHandoff.model_validate_json(transferred_value)
 
             assert (await handoffs.continue_latest()).status == "empty"
@@ -333,7 +586,7 @@ def test_handoff_runtime_recovers_only_explicitly_committed_milestones(tmp_path:
             committed = await handoffs.commit(restored_temporary)
 
         async with open_builtin_runtime(config) as runtime:
-            handoffs = runtime.handoff.for_scope("project")
+            handoffs = runtime.handoff.for_scope(scope.scope_id)
             recovered = await handoffs.continue_latest()
 
             assert recovered.status == "resolved"

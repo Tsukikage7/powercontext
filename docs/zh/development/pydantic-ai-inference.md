@@ -30,8 +30,13 @@ export POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL="provider:model-name"
 下面；例如，兼容的 OpenAI-style endpoint 可以这样关闭 Qwen thinking：
 
 ```bash
+export POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL="openai-chat:<served-model-name>"
 export POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL_SETTINGS='{"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}'
 ```
+
+Topic Memory 也支持 `openai-chat:<model>` 使用这一精确的 `extra_body` 结构。值必须是 JSON 布尔值
+`false`；任一层的额外字段、其他 provider 前缀以及 Embedding 的 `extra_body` 仍不支持。端点必须实现
+`chat_template_kwargs.enable_thinking`；关闭 thinking 不保证推理一定在超时前完成。
 
 generation-backed pipeline、可选的 LLM reranker 和 readiness probe 共用这些 settings。PowerContext 仍保留自身的
 请求边界：readiness 使用 `max_tokens=1`，rerank 使用 `temperature=0`。credential 与 static header 应放在
@@ -45,10 +50,52 @@ export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_PROFILE_ID="project-embedding-v1"
 export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION="1536"
 ```
 
-provider credential 仍使用所选 Pydantic AI provider 支持的环境变量，不属于 PowerContext model 字段。
+每类 workload 可以连接不同的模型服务。自定义 base URL 使用 model identifier 指定的 provider 接口：
+OpenAI-compatible Chat Completions 服务使用 `openai-chat:<model>`，OpenAI-compatible Responses 或 embedding
+服务使用 `openai:<model>`，Anthropic-compatible generation 服务使用 `anthropic:<model>`。内置 reranker 是 LLM
+listwise reranker，因此它的独立 endpoint 也是 Pydantic AI generation endpoint，而不是 cross-encoder `/rerank`
+API：
+
+```bash
+export POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL="openai-chat:generator"
+export POWERCONTEXT_SERVER_INFERENCE_GENERATION_BASE_URL="http://127.0.0.1:8080/v1"
+export POWERCONTEXT_SERVER_INFERENCE_GENERATION_HEADERS='{"Authorization":"Bearer generation-secret"}'
+export POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL_SETTINGS='{"max_tokens":4096}'
+
+export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL="openai:embedding"
+export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_BASE_URL="http://127.0.0.1:8081/v1"
+export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_HEADERS='{"Authorization":"Bearer embedding-secret"}'
+export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL_SETTINGS='{"dimensions":1536}'
+
+export POWERCONTEXT_SERVER_INFERENCE_RERANK_MODEL="openai-chat:reranker"
+export POWERCONTEXT_SERVER_INFERENCE_RERANK_BASE_URL="http://127.0.0.1:8082/v1"
+export POWERCONTEXT_SERVER_INFERENCE_RERANK_HEADERS='{"Authorization":"Bearer rerank-secret"}'
+export POWERCONTEXT_SERVER_INFERENCE_RERANK_MODEL_SETTINGS='{"max_tokens":256}'
+```
+
+header 和 model settings 都使用 JSON object。settings model 会将 header value 作为 secret 处理，并将它们作为
+workload provider client 的静态 header；这些值不会进入 Pydantic AI request settings。不要在 model settings 中配置
+`extra_headers`；使用独立的 headers 变量才能保留配置与日志脱敏语义。其余 model settings 由 Pydantic AI 传递给
+所选 provider。reranker 始终将 `temperature` 固定为零。自定义 embedding base URL 目前要求服务实现
+OpenAI-compatible embeddings 接口。
+
+base URL 可以包含 gateway path prefix，但具体 operation suffix 仍由所选 Pydantic AI provider 决定，例如
+`/chat/completions`、`/responses` 或 `/embeddings`；不支持任意改写 operation path。
+自定义 base URL 或静态 header 时必须使用显式的 OpenAI- 或 Anthropic-compatible model identifier，PowerContext
+才能创建对应的 provider client。
+
+未设置 `RERANK_MODEL` 时，LLM rerank 复用 generation model 和 base URL；仍可通过 reranker headers 和 model
+settings 扩展或覆盖 generation 配置。覆盖 header 时会为 rerank workload 创建独立 provider client，但保留
+generation model identifier 和 base URL。独立的 reranker base URL 必须同时配置显式 reranker model。reranker
+timeout 和 request limit 未显式设置时继承 generation 的对应配置。
+
+不需要自定义 base URL 或 header 时，provider credential 仍使用所选 Pydantic AI provider 支持的环境变量。
 
 Server 会拒绝不完整的 embedding profile。`embedding_model`、`embedding_profile_id` 和
 `embedding_dimension` 必须一起配置。SQLite vector search 使用这组配置，因为 index dimension 必须与持久化向量一致。
+`embedding_dimension` 默认也会作为请求参数 `dimensions` 发送，并覆盖 model settings 里的同名字段。固定输出维度、
+不接受该参数的模型把 `POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_SEND_DIMENSIONS` 设为 `false`；本地维度仍然必填，
+返回向量仍按它校验。
 
 ## 直接组合 generation
 

@@ -22,7 +22,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from powercontext.artifacts import ArtifactRef
 from powercontext.builtin.inference import TokenEstimatorProfile
+from powercontext.builtin.scope.models import ScopeSelection
 
 
 class StatisticsPeriod(StrEnum):
@@ -49,6 +51,9 @@ class ModelUsagePurpose(StrEnum):
     EXPERIENCE_GENERATION = "experience_generation"
     SKILL_GENERATION = "skill_generation"
     HANDOFF_GENERATION = "handoff_generation"
+    TOPIC_MEMORY_GENERATION = "topic_memory_generation"
+    TOPIC_MEMORY_RECALL = "topic_memory_recall"
+    TOPIC_MEMORY_INDEXING = "topic_memory_indexing"
 
 
 class FamilyCount(BaseModel):
@@ -228,17 +233,59 @@ class RecallTokenStatistics(BaseModel):
     daily: tuple[RecallTokenDay, ...]
 
 
-class Statistics(BaseModel):
-    """Current inventory and bounded model usage for one scope."""
+MAX_RECURRENCE_TOP_REVISIONS = 20
+
+
+class RecurrenceStreak(BaseModel):
+    """One Experience revision's terminal ``recurred`` streak since its last ``avoided``."""
+
+    artifact_ref: ArtifactRef
+    signature_key: str
+    terminal_recurred_streak: int = Field(ge=0)
+
+
+class RecurrenceStatistics(BaseModel):
+    """Derived recurrence readings for one Scope, read from an append-only ledger."""
+
+    selected: int = Field(ge=0)
+    recurred: int = Field(ge=0)
+    avoided: int = Field(ge=0)
+    unknown: int = Field(ge=0)
+    unlinked_handoff_citations: int = Field(ge=0)
+    needing_review: int = Field(ge=0)
+    top_revisions: tuple[RecurrenceStreak, ...] = Field(max_length=MAX_RECURRENCE_TOP_REVISIONS)
+
+
+class ScopeStatistics(BaseModel):
+    """Statistics retained for one Scope inside a resolved selection."""
 
     scope_id: str
+    inventory: InventoryStatistics
+    usage: UsageStatistics
+    recall: RecallTokenStatistics
+    recurrence: RecurrenceStatistics
+
+
+class Statistics(BaseModel):
+    """Current inventory and bounded model usage for one frozen Scope selection."""
+
+    selection: ScopeSelection
+    scope_ids: tuple[str, ...]
     as_of: datetime
     inventory: InventoryStatistics
     usage: UsageStatistics
     recall: RecallTokenStatistics
+    by_scope: tuple[ScopeStatistics, ...]
+
+    @model_validator(mode="after")
+    def validate_scope_details(self) -> Statistics:
+        if tuple(item.scope_id for item in self.by_scope) != self.scope_ids:
+            raise ValueError("by_scope must contain one ordered entry for every resolved Scope")  # noqa: TRY003
+        return self
 
 
 __all__ = [
+    "MAX_RECURRENCE_TOP_REVISIONS",
     "ArtifactInventoryStatistics",
     "CandidateFamilyCount",
     "CandidateInventoryStatistics",
@@ -257,7 +304,10 @@ __all__ = [
     "RecallTokenMeasurement",
     "RecallTokenStatistics",
     "RecallTokenValue",
+    "RecurrenceStatistics",
+    "RecurrenceStreak",
     "ResolvedUsagePeriod",
+    "ScopeStatistics",
     "SourceInventoryStatistics",
     "Statistics",
     "StatisticsPeriod",

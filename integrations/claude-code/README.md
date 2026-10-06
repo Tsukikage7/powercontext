@@ -1,5 +1,7 @@
 # Claude Code integration
 
+`community`
+
 `plugins/powercontext` contains the PowerContext plugin distributed through the
 Claude Code marketplace at the repository root.
 
@@ -12,9 +14,14 @@ The plugin is a client of a running PowerContext Server:
 - MCP exposes explicit Memory and Handoff operations;
 - Server and transport failures never block normal Claude Code work.
 
-The plugin uses the same Git-derived project scope as the Codex integration, so
-both agents can recall and maintain the same project context. It does not use a
-`Stop` hook and does not capture Claude's final response in v1.
+The plugin resolves the current Scope through the Server. An explicit Scope has
+priority, followed by durable session and workspace bindings, then the Server's
+default Scope. It does not use a `Stop` hook and does not capture Claude's final
+response in v1.
+
+`powercontext setup claude-code` also configures Claude Code's native status line
+to show the current scope's estimated token reduction for today and the last 30
+days. An existing non-PowerContext custom status line is preserved.
 
 Validate the marketplace and plugin from a repository checkout:
 
@@ -41,4 +48,4 @@ Windows paths in the distributed integration files.
 The default Server endpoint is `http://127.0.0.1:8000`. Set
 `POWERCONTEXT_CLAUDE_AUTHORIZATION` to a complete `Bearer <token>` value
 before starting Claude Code when the Server requires authentication. The MCP
-header helper emits no `Authorization` header when this value is absent.
+configuration expands this environment variable into its `Authorization` header.

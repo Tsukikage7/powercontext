@@ -17,12 +17,47 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pydantic import BaseModel
 
-from powercontext import ArtifactNotFoundError, SourceConflictError
+from powercontext import (
+    AdapterSourceDefinition,
+    ArtifactNotFoundError,
+    Source,
+    SourceConflictError,
+    SourceDefinitionRegistry,
+    SourceMaterialization,
+)
 from powercontext.builtin.artifacts.memory import MemoryCandidateRequest, MemoryEntryInput
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
+from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
-from powercontext.builtin.sources import ContentCapture, ContentSource, SourceCursor
+from powercontext.builtin.source_eligibility import SourceNotEligibleError
+from powercontext.builtin.sources import BUILTIN_SOURCE_REGISTRY, ContentCapture, ContentSource, SourceCursor
+
+
+class CustomCapture(BaseModel):
+    source_id: str
+    value: str
+
+
+class CustomSource(Source):
+    value: str
+
+
+class CustomSourceAdapter:
+    input_class = CustomCapture
+    name = "test-custom"
+    source_class = CustomSource
+
+    async def resolve(self, value: CustomCapture, /) -> CustomSource:
+        return CustomSource(
+            name=value.source_id,
+            materialization=SourceMaterialization.CAPTURED,
+            value=value.value,
+        )
+
+    async def read(self, source: CustomSource, /) -> str:
+        return source.value
 
 
 class EchoCandidatePipeline:
@@ -52,6 +87,84 @@ class BlockingCandidatePipeline(EchoCandidatePipeline):
 
 class StateSaveFailure(RuntimeError):
     pass
+
+
+@pytest.mark.parametrize("mode", ["extract", "auto"])
+def test_explicit_memory_extraction_rejects_lineage_only_before_pipeline(mode) -> None:
+    class EmptyPipeline:
+        called = False
+
+        async def extract(self, request):
+            self.called = True
+            return ()
+
+    async def scenario() -> None:
+        pipeline = EmptyPipeline()
+        async with open_builtin_contexts(
+            BuiltinConfig(database=SQLiteConfig()),
+            candidate_pipeline=pipeline,
+        ) as contexts:
+            context = await contexts.get("project")
+            created = await contexts.records.create_artifact(
+                "project",
+                "memory",
+                ArtifactWrite(content={"entries": [{"kind": "fact", "text": "Managed input."}]}),
+            )
+            async with contexts.database.transaction() as connection:
+                stored = await contexts.repositories.sources.get(connection, "project", created.sources[0])
+            assert await context.sources.get(stored.value) == stored.value
+            with pytest.raises(SourceNotEligibleError):
+                await context.artifacts.memory.remember(memory=None, sources=(stored.value,), mode=mode)
+            assert pipeline.called is False
+            head = await contexts.records.get_artifact("project", "memory", created.artifact_id)
+            assert head.revision == 1
+
+    asyncio.run(scenario())
+
+
+def test_provider_uses_one_injected_source_registry_for_routing_and_persistence() -> None:
+    async def scenario() -> None:
+        registry = SourceDefinitionRegistry((
+            *BUILTIN_SOURCE_REGISTRY.definitions,
+            AdapterSourceDefinition(CustomSourceAdapter()),
+        ))
+        async with open_builtin_contexts(
+            BuiltinConfig(database=SQLiteConfig()),
+            source_registry=registry,
+        ) as contexts:
+            context = await contexts.get("project")
+            source = await context.sources.resolve(CustomCapture(source_id="custom-1", value="typed value"))
+            stored = await context.sources.add(source)
+
+            assert isinstance(stored, CustomSource)
+            assert await context.sources.read(stored) == "typed value"
+            assert await context.sources.list() == (stored,)
+
+    asyncio.run(scenario())
+
+
+def test_lineage_only_source_remains_readable_but_is_skipped_by_memory_flush() -> None:
+    async def scenario() -> None:
+        async with open_builtin_contexts(
+            BuiltinConfig(database=SQLiteConfig()),
+            candidate_pipeline=EchoCandidatePipeline(),
+        ) as contexts:
+            context = await contexts.get("project")
+            created = await contexts.records.create_artifact(
+                "project",
+                "memory",
+                ArtifactWrite(content={"entries": [{"kind": "fact", "text": "Directly managed."}]}),
+            )
+            async with contexts.database.transaction() as connection:
+                stored = await contexts.repositories.sources.get(connection, "project", created.sources[0])
+
+            assert await context.sources.get(stored.value) == stored.value
+            flushed = await context.triggers.flush(limit=10)
+            assert flushed.source_count == 0
+            assert flushed.current_cursor == stored.journal_position
+            assert flushed.memory_ref is None
+
+    asyncio.run(scenario())
 
 
 def test_provider_translates_repository_source_identity_conflicts() -> None:

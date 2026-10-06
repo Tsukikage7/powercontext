@@ -18,6 +18,8 @@ import asyncio
 import json
 import logging
 import sqlite3
+from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -50,7 +52,17 @@ from powercontext.builtin.artifacts.memory import (
 from powercontext.builtin.inference.pydantic_ai import PydanticAIEmbeddingModel
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import BuiltinConfig, RememberMemoryRequest, open_builtin_runtime
+from powercontext.builtin.runtime.artifact_processing import (
+    ArtifactProcessingBinding,
+    SpawnArtifactProcessingWorkerLauncher,
+)
 from powercontext.builtin.runtime.config import InferenceConfig, RuntimeConfig
+from powercontext.builtin.runtime.family_processing import FamilyWorkerSpec, process_family_invocation
+from powercontext.builtin.runtime.processing_contracts import (
+    ArtifactProcessingWorkAssignment,
+    ArtifactProcessingWorkerCompletion,
+)
+from powercontext.builtin.scope import ScopeDraft
 from powercontext.errors import RevisionConflictError
 from powercontext.server.factory import create_server_app
 from powercontext.server.logging import OperationalContextFilter
@@ -68,6 +80,19 @@ _STAGE_ATTRIBUTE_KEYS = {
         "powercontext.operation.unit",
         "powercontext.operation.outcome",
         "powercontext.scope.lock.contended",
+    },
+    "memory.capture": {
+        "powercontext.operation.name",
+        "powercontext.operation.unit",
+        "powercontext.operation.outcome",
+        "powercontext.memory.capture.source_count",
+    },
+    "memory.commit": {
+        "powercontext.operation.name",
+        "powercontext.operation.unit",
+        "powercontext.operation.outcome",
+        "powercontext.memory.commit.memory_changed",
+        "powercontext.memory.commit.entry_version_count",
     },
     "memory.search": {
         "powercontext.operation.name",
@@ -97,13 +122,28 @@ _STAGE_ATTRIBUTE_KEYS = {
         "powercontext.experience.search.limit",
         "powercontext.experience.search.result_count",
     },
+    "topic_memory.search": {
+        "powercontext.operation.name",
+        "powercontext.operation.unit",
+        "powercontext.operation.outcome",
+        "powercontext.topic_memory.search.configured",
+        "powercontext.topic_memory.search.limit",
+        "powercontext.topic_memory.search.result_count",
+    },
     "context.build": {
         "powercontext.operation.name",
         "powercontext.operation.unit",
         "powercontext.operation.outcome",
+        "powercontext.context.build.scope_count",
         "powercontext.context.build.memory_candidate_count",
+        "powercontext.context.build.topic_memory_candidate_count",
         "powercontext.context.build.experience_candidate_count",
+        "powercontext.context.build.profile_candidate_count",
+        "powercontext.context.build.code_candidate_count",
         "powercontext.context.build.selected_count",
+        "powercontext.context.build.code_selected_count",
+        "powercontext.context.build.code_injected_count",
+        "powercontext.context.build.code_omitted_count",
         "powercontext.context.build.status",
         "powercontext.context.build.content_bytes",
     },
@@ -120,18 +160,23 @@ _STAGE_ATTRIBUTE_KEYS = {
         "powercontext.experience.incubation.source_count",
         "powercontext.experience.incubation.candidate_count",
     },
-    "scheduled.process_source_window": {
+    "artifact_processing.worker": {
         "powercontext.operation.name",
         "powercontext.operation.unit",
         "powercontext.operation.outcome",
-        "powercontext.background.source_count",
+        "powercontext.artifact_processing.family",
+        "powercontext.artifact_processing.failure",
+        "error.type",
     },
-    "scheduled.incubate_experience_candidates": {
-        "powercontext.operation.name",
-        "powercontext.operation.unit",
-        "powercontext.operation.outcome",
-        "powercontext.background.source_count",
-        "powercontext.background.candidate_count",
+    **{
+        f"artifact_processing.worker.{stage}": {
+            "powercontext.operation.name",
+            "powercontext.operation.unit",
+            "powercontext.operation.outcome",
+            "powercontext.artifact_processing.family",
+            "error.type",
+        }
+        for stage in ("start", "wait", "acknowledge")
     },
 }
 
@@ -200,6 +245,26 @@ class _VectorMemoryIndex:
     ) -> None:
         pass
 
+    async def delete(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _memory_ref: ArtifactRef,
+        _entry_ids: tuple[str, ...],
+        /,
+    ) -> None:
+        pass
+
+    async def upsert(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _memory_ref: ArtifactRef,
+        _projections: tuple[MemoryProjection, ...],
+        /,
+    ) -> None:
+        pass
+
     async def search(
         self,
         _connection: AsyncConnection,
@@ -242,7 +307,6 @@ def test_observability_signals_correlate_without_counting_the_mcp_bridge(caplog,
         ),
         tracing=tracing,
     )
-    scope_id = "project:sensitive-evaluation"
 
     def create_http_client(
         headers: dict[str, str] | None = None,
@@ -259,7 +323,7 @@ def test_observability_signals_correlate_without_counting_the_mcp_bridge(caplog,
             follow_redirects=True,
         )
 
-    async def scenario() -> str:
+    async def scenario() -> tuple[str, str]:
         transport = StreamableHttpTransport(
             "http://testserver/mcp/",
             httpx_client_factory=create_http_client,
@@ -271,14 +335,17 @@ def test_observability_signals_correlate_without_counting_the_mcp_bridge(caplog,
         ):
             direct = await http_client.get("/v1/capabilities")
             assert direct.status_code == 200
+            default_scope = await http_client.get("/v1/scopes/default")
+            assert default_scope.status_code == 200
+            scope_id = default_scope.json()["scope_id"]
             await mcp_client.call_tool("list_memory_entries", {"scope_id": scope_id})
-            return (await http_client.get("/metrics")).text
+            return scope_id, (await http_client.get("/metrics")).text
 
     correlation_filter = OperationalContextFilter()
     caplog.handler.addFilter(correlation_filter)
     try:
         with caplog.at_level(logging.INFO):
-            metrics = asyncio.run(scenario())
+            scope_id, metrics = asyncio.run(scenario())
     finally:
         caplog.handler.removeFilter(correlation_filter)
 
@@ -332,6 +399,7 @@ def test_database_failure_log_does_not_include_memory_content(caplog, tmp_path) 
     memory_content = "PROBE-SENSITIVE-MEMORY-1318"
 
     with TestClient(app, raise_server_exceptions=False) as client:
+        scope_id = _get_default_scope_id(client)
         with sqlite3.connect(database_path) as connection:
             connection.executescript("""
                 CREATE TRIGGER reject_memory_insert
@@ -344,7 +412,7 @@ def test_database_failure_log_does_not_include_memory_content(caplog, tmp_path) 
         with caplog.at_level(logging.ERROR, logger="powercontext.server.app"):
             response = client.post(
                 "/v1/memory/remember",
-                json={"scope_id": "project:failure-log", "kind": "fact", "text": memory_content},
+                json={"scope_id": scope_id, "kind": "fact", "text": memory_content},
             )
 
     records = [
@@ -368,7 +436,9 @@ def test_inference_spans_join_the_operation_trace_only_when_instrumented(monkeyp
     # Pydantic AI also resolves already-constructed models through `infer_model`, so pass those through.
     monkeypatch.setattr(
         "pydantic_ai.models.infer_model",
-        lambda model: model if isinstance(model, Model) else TestModel(custom_output_text='{"candidates":[]}'),
+        lambda model, **_kwargs: (
+            model if isinstance(model, Model) else TestModel(custom_output_text='{"candidates":[]}')
+        ),
     )
 
     instrumented = _flush_memory_spans(tmp_path / "instrumented.db", instrumented=True)
@@ -376,29 +446,284 @@ def test_inference_spans_join_the_operation_trace_only_when_instrumented(monkeyp
 
     transport = next(span for span in instrumented if span.name == "HTTP flush_memory")
     application = next(span for span in instrumented if span.name == "powercontext flush_memory")
-    flush_stage = next(span for span in instrumented if span.name == "memory.flush")
-    invoke_agent = next(span for span in instrumented if span.name == "invoke_agent memory_extraction")
-    chat = next(span for span in instrumented if span.name.startswith("chat "))
+    flush = _only_child(instrumented, application, "memory.flush")
+    invoke_agent = _only_child(instrumented, flush, "invoke_agent memory_extraction")
+    chat = _only_child_with_prefix(instrumented, invoke_agent, "chat ")
+    commit = _only_child(instrumented, flush, "memory.commit")
 
     assert application.parent is not None
     assert application.parent.span_id == transport.context.span_id
-    assert flush_stage.parent is not None
-    assert flush_stage.parent.span_id == application.context.span_id
-    assert invoke_agent.parent is not None
-    assert invoke_agent.parent.span_id == flush_stage.context.span_id
-    assert chat.parent is not None
-    assert chat.parent.span_id == invoke_agent.context.span_id
-    assert {span.context.trace_id for span in (transport, application, flush_stage, invoke_agent, chat)} == {
+    assert _pop_prompt_attributes(dict(flush.attributes or {}), _MEMORY_EXTRACT_PROMPT_PREFIX) == {
+        "powercontext.operation.name": "memory.flush",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.flush.source_count": 1,
+        "powercontext.operation.outcome": "success",
+    }
+    assert dict(commit.attributes or {}) == {
+        "powercontext.operation.name": "memory.commit",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.commit.memory_changed": False,
+        "powercontext.memory.commit.entry_version_count": 0,
+        "powercontext.operation.outcome": "success",
+    }
+    assert {span.context.trace_id for span in (transport, application, flush, invoke_agent, chat, commit)} == {
         transport.context.trace_id
     }
     assert not any(_is_inference_span(span) for span in uninstrumented)
+
+
+def test_memory_write_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -> None:
+    private_source_content = "Private captured source sentinel."
+    private_memory_content = "Keep write-path traces bounded."
+    model_output = json.dumps({
+        "candidates": [
+            {
+                "intent": "add",
+                "kind": "decision",
+                "text": private_memory_content,
+                "evidence_ids": ["source:0"],
+                "reason": "private extraction reason",
+            }
+        ]
+    })
+    monkeypatch.setattr(
+        "pydantic_ai.models.infer_model",
+        lambda model: model if isinstance(model, Model) else TestModel(custom_output_text=model_output),
+    )
+    monkeypatch.setattr(
+        "pydantic_ai.embeddings.infer_embedding_model",
+        lambda _model, **_kwargs: TestEmbeddingModel(dimensions=3),
+    )
+    monkeypatch.setattr(
+        "powercontext.builtin.runtime.composition.SQLiteMemoryVectorIndex",
+        lambda _profile: _VectorMemoryIndex(),
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    app = create_server_app(
+        settings=ServerSettings(
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'memory-write-tracing.db'}"),
+            inference=InferenceConfig(
+                generation_model="test",
+                embedding_model="test",
+                embedding_profile_id=_VECTOR_PROFILE.profile_id,
+                embedding_dimension=_VECTOR_PROFILE.dimension,
+            ),
+            mcp=McpConfig(enabled=False),
+        ),
+        tracing=ServerTracing(provider, instrumented=True),
+    )
+    source_id = "private-source-id"
+
+    with TestClient(app) as client:
+        scope_id = _create_scope(client, title="Memory write trace", idempotency_key="memory-write-trace")
+        captured = client.post(
+            "/v1/sources/content",
+            json={"scope_id": scope_id, "source_id": source_id, "content": private_source_content},
+        )
+        flushed = client.post("/v1/memory/flush", json={"scope_id": scope_id})
+        no_op = client.post("/v1/memory/flush", json={"scope_id": scope_id})
+
+    assert captured.status_code == 202
+    assert flushed.status_code == 200
+    assert flushed.json()["memory"] is not None
+    assert no_op.status_code == 200
+    assert no_op.json()["processed_source_count"] == 0
+
+    spans = list(exporter.get_finished_spans())
+    capture_application = next(
+        span
+        for span in spans
+        if span.name == "powercontext capture_content_source" and _children(spans, span, "memory.capture")
+    )
+    assert _only_child(spans, capture_application, "scope.lock")
+    capture = _only_child(spans, capture_application, "memory.capture")
+    assert dict(capture.attributes or {}) == {
+        "powercontext.operation.name": "memory.capture",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.capture.source_count": 1,
+        "powercontext.operation.outcome": "success",
+    }
+
+    flush_applications = [span for span in spans if span.name == "powercontext flush_memory"]
+    assert len(flush_applications) == 2
+    flushes = [_only_child(spans, application, "memory.flush") for application in flush_applications]
+    processed_flush = next(
+        span for span in flushes if (span.attributes or {})["powercontext.operation.outcome"] == "success"
+    )
+    no_op_flush = next(span for span in flushes if (span.attributes or {})["powercontext.operation.outcome"] == "noop")
+    processed_application = next(
+        application
+        for application in flush_applications
+        if processed_flush.parent is not None and processed_flush.parent.span_id == application.context.span_id
+    )
+    assert _only_child(spans, processed_application, "scope.context")
+    assert _only_child(spans, processed_application, "scope.lock")
+    assert _pop_prompt_attributes(dict(processed_flush.attributes or {}), _MEMORY_EXTRACT_PROMPT_PREFIX) == {
+        "powercontext.operation.name": "memory.flush",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.flush.source_count": 1,
+        "powercontext.operation.outcome": "success",
+    }
+    invoke_agent = _only_child(spans, processed_flush, "invoke_agent memory_extraction")
+    chat = _only_child_with_prefix(spans, invoke_agent, "chat ")
+    embedding = _only_child_with_prefix(spans, processed_flush, "embeddings ")
+    commit = _only_child(spans, processed_flush, "memory.commit")
+    assert embedding.name == "embeddings test"
+    assert dict(commit.attributes or {}) == {
+        "powercontext.operation.name": "memory.commit",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.commit.memory_changed": True,
+        "powercontext.memory.commit.entry_version_count": 1,
+        "powercontext.operation.outcome": "success",
+    }
+    assert {
+        span.context.trace_id
+        for span in (processed_application, processed_flush, invoke_agent, chat, embedding, commit)
+    } == {processed_application.context.trace_id}
+
+    assert _pop_prompt_attributes(dict(no_op_flush.attributes or {}), _MEMORY_EXTRACT_PROMPT_PREFIX) == {
+        "powercontext.operation.name": "memory.flush",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.flush.source_count": 0,
+        "powercontext.operation.outcome": "noop",
+    }
+    assert not _children(spans, no_op_flush, "invoke_agent memory_extraction")
+    assert not [
+        span
+        for span in spans
+        if span.name.startswith("embeddings ")
+        and span.parent is not None
+        and span.parent.span_id == no_op_flush.context.span_id
+    ]
+    assert not _children(spans, no_op_flush, "memory.commit")
+
+    for span in spans:
+        allowed_keys = _STAGE_ATTRIBUTE_KEYS.get(span.name)
+        if allowed_keys is None:
+            continue
+        if span.name == "memory.flush":
+            allowed_keys = allowed_keys | {_MEMORY_EXTRACT_PROMPT_PREFIX + key for key in _PROMPT_SELECTION_ATTRIBUTES}
+        attributes = dict(span.attributes or {})
+        assert attributes.keys() <= allowed_keys
+        assert all(isinstance(value, str | bool | int | float) for value in attributes.values())
+
+    exported = _exported_span_data(spans)
+    assert scope_id not in exported
+    assert source_id not in exported
+    assert private_source_content not in exported
+    assert private_memory_content not in exported
+    assert "private extraction reason" not in exported
+
+
+def test_memory_commit_failure_is_traced_and_rolls_back(tmp_path) -> None:
+    database_path = tmp_path / "memory-commit-failure.db"
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    source_content = "Private Source content for a failed commit."
+    memory_content = "Private Memory content for a failed commit."
+    app = create_server_app(
+        settings=ServerSettings(
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{database_path}"),
+            mcp=McpConfig(enabled=False),
+        ),
+        candidate_pipeline=_FixedCandidatePipeline(memory_content),
+        tracing=ServerTracing(provider),
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        scope_id = _create_scope(client, title="Commit failure trace", idempotency_key="commit-failure-trace")
+        captured = client.post(
+            "/v1/sources/content",
+            json={"scope_id": scope_id, "source_id": "failed-commit-source", "content": source_content},
+        )
+        assert captured.status_code == 202
+        with sqlite3.connect(database_path) as connection:
+            connection.executescript("""
+                CREATE TRIGGER reject_memory_insert
+                BEFORE INSERT ON pc_memory_entry_versions
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced Memory commit failure');
+                END;
+            """)
+        failed = client.post("/v1/memory/flush", json={"scope_id": scope_id})
+        failed_spans = list(exporter.get_finished_spans())
+
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("DROP TRIGGER reject_memory_insert")
+        retried = client.post("/v1/memory/flush", json={"scope_id": scope_id})
+
+    assert failed.status_code == 500
+    failed_application = next(
+        span
+        for span in failed_spans
+        if span.name == "powercontext flush_memory"
+        and (span.attributes or {}).get("powercontext.operation.outcome") == "failure"
+    )
+    failed_flush = _only_child(failed_spans, failed_application, "memory.flush")
+    failed_commit = _only_child(failed_spans, failed_flush, "memory.commit")
+    assert dict(failed_commit.attributes or {}) == {
+        "powercontext.operation.name": "memory.commit",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.commit.memory_changed": True,
+        "powercontext.memory.commit.entry_version_count": 1,
+        "powercontext.operation.outcome": "failure",
+        "error.type": "IntegrityError",
+    }
+    exported = _exported_span_data(failed_spans)
+    assert source_content not in exported
+    assert memory_content not in exported
+    assert "forced Memory commit failure" not in exported
+
+    assert retried.status_code == 200
+    assert retried.json()["processed_source_count"] == 1
+    assert retried.json()["memory"] is not None
+
+
+def test_process_memory_preserves_commit_tracing(tmp_path) -> None:
+    from powercontext.builtin.runtime.composition import open_builtin_contexts
+    from powercontext.builtin.sources import ContentCapture
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    scope_id = "project:process-memory-tracing"
+
+    async def scenario() -> None:
+        async with open_builtin_contexts(
+            BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'process-memory.db'}")),
+            candidate_pipeline=_EmptyCandidatePipeline(),
+            tracing=ServerTracing(provider),
+        ) as contexts:
+            context = await contexts.get(scope_id)
+            await context.sources.capture(ContentCapture(source_id="process-source", content="process evidence"))
+            result = await contexts.process_memory(scope_id, 10)
+            assert result.source_count == 1
+            assert result.memory_ref is None
+
+    asyncio.run(scenario())
+
+    commits = [span for span in exporter.get_finished_spans() if span.name == "memory.commit"]
+    assert len(commits) == 1
+    assert dict(commits[0].attributes or {}) == {
+        "powercontext.operation.name": "memory.commit",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.commit.memory_changed": False,
+        "powercontext.memory.commit.entry_version_count": 0,
+        "powercontext.operation.outcome": "success",
+    }
 
 
 def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -> None:
     # Resolve the configured test model without consulting the environment or a real provider.
     monkeypatch.setattr(
         "pydantic_ai.models.infer_model",
-        lambda model: model if isinstance(model, Model) else TestModel(custom_output_text='{"selected_ranks":[99,1]}'),
+        lambda model, **_kwargs: (
+            model if isinstance(model, Model) else TestModel(custom_output_text='{"selected_ranks":[99,1]}')
+        ),
     )
 
     exporter = InMemorySpanExporter()
@@ -413,12 +738,22 @@ def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -
         ),
         tracing=ServerTracing(provider, instrumented=True),
     )
-    scope_id = "project:private-trace-scope"
     memory_content = "Private trace sentinel evidence."
     query = "private trace sentinel"
     no_match_query = "unmatched giraffe phrase"
 
     with TestClient(app) as client:
+        scope_id = _create_scope(client, title="Memory trace", idempotency_key="memory-trace")
+        empty_search_scope_id = _create_scope(
+            client,
+            title="Empty memory search",
+            idempotency_key="empty-memory-search",
+        )
+        empty_context_scope_id = _create_scope(
+            client,
+            title="Empty context",
+            idempotency_key="empty-context",
+        )
         remembered = client.post(
             "/v1/memory/remember",
             json={"scope_id": scope_id, "kind": "fact", "text": memory_content},
@@ -434,7 +769,7 @@ def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -
         no_memory = client.post(
             "/v1/memory/search",
             json={
-                "scope_id": "project:private-empty-search-scope",
+                "scope_id": empty_search_scope_id,
                 "query": query,
                 "limit": 1,
                 "mode": "fts",
@@ -446,7 +781,7 @@ def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -
         )
         empty = client.post(
             "/v1/context/prepare",
-            json={"scope_id": "project:private-empty-scope", "query": query},
+            json={"scope_id": empty_context_scope_id, "query": query},
         )
 
     assert remembered.status_code == 200
@@ -490,6 +825,24 @@ def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -
     assert not _children(spans, search_application, "scope.lock")
     search = _only_child(spans, search_application, "memory.search")
     search_attributes = dict(search.attributes or {})
+    prompt_prefix = "powercontext.prompt.memory.rerank."
+    prompt_attributes = {
+        key.removeprefix(prompt_prefix): search_attributes.pop(key)
+        for key in tuple(search_attributes)
+        if key.startswith(prompt_prefix)
+    }
+    assert set(prompt_attributes) == {
+        "selection",
+        "version",
+        "definition_version",
+        "builtin_version",
+        "compiled_digest",
+        "demonstration_count",
+    }
+    assert prompt_attributes["selection"] == "built_in"
+    assert prompt_attributes["version"] == prompt_attributes["builtin_version"]
+    assert prompt_attributes["demonstration_count"] == 0
+    assert len(str(prompt_attributes["compiled_digest"])) == 64
     assert search_attributes == {
         "powercontext.operation.name": "memory.search",
         "powercontext.operation.unit": "stage",
@@ -557,9 +910,13 @@ def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -
     ready_experience = _only_child(spans, ready_application, "experience.search")
     assert (ready_experience.attributes or {})["powercontext.experience.search.configured"] is True
     assert (ready_experience.attributes or {})["powercontext.experience.search.result_count"] == 0
+    ready_topic = _only_child(spans, ready_application, "topic_memory.search")
+    assert (ready_topic.attributes or {})["powercontext.topic_memory.search.result_count"] == 0
     ready_context = _only_child(spans, ready_application, "context.build")
     assert (ready_context.attributes or {})["powercontext.context.build.memory_candidate_count"] == 1
+    assert (ready_context.attributes or {})["powercontext.context.build.topic_memory_candidate_count"] == 0
     assert (ready_context.attributes or {})["powercontext.context.build.experience_candidate_count"] == 0
+    assert (ready_context.attributes or {})["powercontext.context.build.profile_candidate_count"] == 0
     assert (ready_context.attributes or {})["powercontext.context.build.selected_count"] == 1
     assert (ready_context.attributes or {})["powercontext.context.build.status"] == "ready"
     ready_content_bytes = (ready_context.attributes or {})["powercontext.context.build.content_bytes"]
@@ -574,23 +931,34 @@ def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -
     assert not _children(spans, empty_memory, "memory.rerank")
     empty_experience = _only_child(spans, empty_application, "experience.search")
     assert (empty_experience.attributes or {})["powercontext.experience.search.result_count"] == 0
+    empty_topic = _only_child(spans, empty_application, "topic_memory.search")
+    assert (empty_topic.attributes or {})["powercontext.topic_memory.search.result_count"] == 0
     empty_context = _only_child(spans, empty_application, "context.build")
     assert (empty_context.attributes or {})["powercontext.context.build.selected_count"] == 0
     assert (empty_context.attributes or {})["powercontext.context.build.status"] == "empty"
     assert (empty_context.attributes or {})["powercontext.context.build.content_bytes"] == 0
 
+    for context in (ready_context, empty_context):
+        attributes = dict(context.attributes or {})
+        assert attributes["powercontext.context.build.code_candidate_count"] == 0
+        assert attributes["powercontext.context.build.code_selected_count"] == 0
+        assert attributes["powercontext.context.build.code_injected_count"] == 0
+        assert attributes["powercontext.context.build.code_omitted_count"] == 0
+
     for span in spans:
         allowed_keys = _STAGE_ATTRIBUTE_KEYS.get(span.name)
         if allowed_keys is None:
             continue
+        if span.name == "memory.search":
+            allowed_keys = allowed_keys | {prompt_prefix + key for key in prompt_attributes}
         attributes = dict(span.attributes or {})
         assert attributes.keys() <= allowed_keys
         assert all(isinstance(value, str | bool | int | float) for value in attributes.values())
 
     exported = _exported_span_data(spans)
     assert scope_id not in exported
-    assert "project:private-empty-scope" not in exported
-    assert "project:private-empty-search-scope" not in exported
+    assert empty_context_scope_id not in exported
+    assert empty_search_scope_id not in exported
     assert memory_content not in exported
     assert query not in exported
     assert no_match_query not in exported
@@ -600,14 +968,20 @@ def test_scope_lock_stage_span_reports_contention_and_closes_at_acquisition(tmp_
     exporter = InMemorySpanExporter()
     provider = TracerProvider(sampler=ALWAYS_ON, shutdown_on_exit=False)
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    scope_id = "project:private-lock-scope"
+    scope_id = ""
     memory_content = "Private lock sentinel evidence."
 
     async def scenario() -> None:
+        nonlocal scope_id
         async with open_builtin_runtime(
             BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'scope-lock.db'}")),
             tracing=ServerTracing(provider),
         ) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Private lock", summary="Lock observability", idempotency_key="private-lock")
+            )
+            scope_id = scope.scope_id
             memory = runtime.memory.for_scope(scope_id)
             first = await memory.remember(
                 RememberMemoryRequest(entries=(MemoryEntryInput(kind="fact", text=memory_content),))
@@ -655,22 +1029,23 @@ def test_scope_lock_stage_span_reports_contention_and_closes_at_acquisition(tmp_
 
 
 def test_scope_lock_is_released_when_stage_teardown_fails(tmp_path) -> None:
-    scope_id = "project:private-broken-tracing"
-
     async def scenario() -> bool:
-        async with (
-            open_builtin_runtime(
-                BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'broken-tracing.db'}")),
-                tracing=_ScopeLockTeardownFailingTracing(),
-            ) as runtime,
-            runtime._scope_operation(scope_id),
-        ):
-            lock = runtime._lock(scope_id)
-            with pytest.raises(_StageTeardownError):
-                await runtime.memory.for_scope(scope_id).remember(
-                    RememberMemoryRequest(entries=(MemoryEntryInput(kind="fact", text="Guarded fact."),))
-                )
-            return lock.locked()
+        async with open_builtin_runtime(
+            BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'broken-tracing.db'}")),
+            tracing=_ScopeLockTeardownFailingTracing(),
+        ) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Broken tracing", summary="Lock teardown", idempotency_key="broken-tracing")
+            )
+            scope_id = scope.scope_id
+            async with runtime._scope_operation(scope_id):
+                lock = runtime._lock(scope_id)
+                with pytest.raises(_StageTeardownError):
+                    await runtime.memory.for_scope(scope_id).remember(
+                        RememberMemoryRequest(entries=(MemoryEntryInput(kind="fact", text="Guarded fact."),))
+                    )
+                return lock.locked()
 
     assert asyncio.run(scenario()) is False
 
@@ -683,6 +1058,14 @@ class _EmptyCandidatePipeline:
         return ()
 
 
+class _FixedCandidatePipeline:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    async def extract(self, request: MemoryCandidateRequest, /) -> tuple[MemoryEntryInput, ...]:
+        return (MemoryEntryInput(kind="fact", text=self._text, sources=request.sources),)
+
+
 class _EmptyExperiencePipeline:
     """Produce no Experience candidates so a scheduled incubation advances the cursor without a model."""
 
@@ -691,68 +1074,185 @@ class _EmptyExperiencePipeline:
         return ()
 
 
-def test_scheduled_source_window_starts_an_independent_trace_root(tmp_path) -> None:
+def _traced_family_worker(
+    spec: FamilyWorkerSpec, assignment: ArtifactProcessingWorkAssignment, /
+) -> ArtifactProcessingWorkerCompletion:
+    """Rebuild deterministic processors inside a real spawn child."""
+    from powercontext.builtin.runtime.composition import open_builtin_contexts
+
+    async def run() -> ArtifactProcessingWorkerCompletion:
+        async with open_builtin_contexts(
+            spec.config,
+            candidate_pipeline=_EmptyCandidatePipeline(),
+            experience_pipeline=_EmptyExperiencePipeline(),
+            _topic_memory_worker=True,
+        ) as contexts:
+            return await process_family_invocation(contexts, assignment, config=spec.config)
+
+    return asyncio.run(run())
+
+
+def _unacknowledged_worker(
+    spec: FamilyWorkerSpec, assignment: ArtifactProcessingWorkAssignment, /
+) -> ArtifactProcessingWorkerCompletion:
+    del spec, assignment
+    return ArtifactProcessingWorkerCompletion()
+
+
+def _failed_worker(
+    spec: FamilyWorkerSpec, assignment: ArtifactProcessingWorkAssignment, /
+) -> ArtifactProcessingWorkerCompletion:
+    del spec, assignment
+    raise RuntimeError("private child failure evidence")  # noqa: TRY003
+
+
+def _protocol_acknowledging_worker(
+    config: BuiltinConfig, assignment: ArtifactProcessingWorkAssignment, /
+) -> ArtifactProcessingWorkerCompletion:
+    """Exercise the Family-neutral control protocol, without simulating domain work."""
+    from powercontext.builtin.runtime.composition import open_builtin_contexts
+    from powercontext.builtin.runtime.processing_execution import ScopeInvocation
+
+    async def run() -> ArtifactProcessingWorkerCompletion:
+        async with (
+            open_builtin_contexts(config, _topic_memory_worker=True) as contexts,
+            contexts.database.transaction() as connection,
+        ):
+            invocation = ScopeInvocation(assignment)
+            await invocation.start(connection)
+            await invocation.complete(connection, remaining_work=False)
+        return ArtifactProcessingWorkerCompletion()
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("family", ["topic-memory", "profile"])
+def test_scope_worker_lifecycle_trace_is_family_neutral_and_detaches_ambient_http(tmp_path, family) -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    config = BuiltinConfig(
+        database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'protocol-tracing.db'}"),
+        runtime=RuntimeConfig.model_validate({"artifact_processing_families": (family,)}),
+    )
+    binding = ArtifactProcessingBinding(
+        f"{family}-source-window",
+        family,
+        SpawnArtifactProcessingWorkerLauncher(partial(_protocol_acknowledging_worker, config)),
+        automatic_processing_interval=timedelta(seconds=0.02),
+    )
+    content = "private source excluded from protocol traces"
+
+    async def run() -> tuple[str, ReadableSpan]:
+        # Starting the controller under an ambient HTTP span catches accidental
+        # context inheritance by its async scheduling task and child stages.
+        with provider.get_tracer(__name__).start_as_current_span("HTTP capture"):
+            async with open_builtin_runtime(
+                config, artifact_processing_bindings=(binding,), tracing=ServerTracing(provider)
+            ) as runtime:
+                assert runtime.scopes is not None
+                scope = await runtime.scopes.create(
+                    ScopeDraft(title="Trace", summary="Protocol trace", idempotency_key="protocol-trace")
+                )
+                await runtime.records.for_scope(scope.scope_id).create_source("content", content)
+                root = await asyncio.to_thread(
+                    _wait_for_named_span, exporter, "artifact_processing.worker", outcome="success", timeout=30
+                )
+                return scope.scope_id, root
+
+    scope_id, root = asyncio.run(run())
+    spans = list(exporter.get_finished_spans())
+    assert (root.attributes or {})["powercontext.artifact_processing.family"] == family
+    for stage_name in ("start", "wait", "acknowledge"):
+        stage = _only_child(spans, root, f"artifact_processing.worker.{stage_name}")
+        _assert_scheduled_background_trace(root, stage, spans, scope_id=scope_id, content=content)
+
+
+@pytest.mark.parametrize("family", ["memory", "experience"])
+def test_scheduled_family_worker_starts_an_independent_trace_root(monkeypatch, tmp_path, family) -> None:
+    monkeypatch.setattr("powercontext.builtin.runtime.composition.run_family_worker", _traced_family_worker)
     exporter = InMemorySpanExporter()
     provider = TracerProvider(shutdown_on_exit=False)
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     app = create_server_app(
         settings=ServerSettings(
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'scheduled-tracing.db'}"),
-            runtime=RuntimeConfig(schedule_seconds=0.02),
+            runtime=RuntimeConfig.model_validate({
+                "artifact_processing_families": (family,),
+                f"{family}_schedule_seconds": 0.02,
+            }),
+            inference=InferenceConfig(generation_model="test"),
             mcp=McpConfig(enabled=False),
         ),
-        scheduler_path=tmp_path / "scheduler.db",
-        candidate_pipeline=_EmptyCandidatePipeline(),
         tracing=ServerTracing(provider),
     )
-    scope_id = "project:private-scheduled-trace"
     content = "private scheduled evidence"
 
     with TestClient(app) as client:
+        scope_id = _get_default_scope_id(client)
         captured = client.post(
             "/v1/sources/content",
             json={"scope_id": scope_id, "source_id": "task-1", "content": content},
         )
         assert captured.status_code == 202
-        root = _wait_for_named_span(exporter, "scheduled.process_source_window", outcome="success")
+        root = _wait_for_named_span(exporter, "artifact_processing.worker", outcome="success", timeout=30)
         spans = list(exporter.get_finished_spans())
-        flush = _only_child(spans, root, "memory.flush")
-        _assert_scheduled_background_trace(root, flush, spans, scope_id=scope_id, content=content)
-        assert (root.attributes or {})["powercontext.background.source_count"] == 1
-        assert (flush.attributes or {})["powercontext.memory.flush.source_count"] == 1
+        assert (root.attributes or {})["powercontext.artifact_processing.family"] == family
+        for stage_name in ("start", "wait", "acknowledge"):
+            stage = _only_child(spans, root, f"artifact_processing.worker.{stage_name}")
+            _assert_scheduled_background_trace(root, stage, spans, scope_id=scope_id, content=content)
+            assert (stage.attributes or {})["powercontext.artifact_processing.family"] == family
 
 
-def test_scheduled_experience_starts_an_independent_trace_root(tmp_path) -> None:
+@pytest.mark.parametrize("failure", ["missing_durable_acknowledgement", "worker_failed", "timeout"])
+def test_scheduled_worker_failure_trace_requires_acknowledgement_and_excludes_payloads(
+    monkeypatch, tmp_path, failure
+) -> None:
+    monkeypatch.setattr(
+        "powercontext.builtin.runtime.composition.run_family_worker",
+        _failed_worker if failure == "worker_failed" else _unacknowledged_worker,
+    )
     exporter = InMemorySpanExporter()
     provider = TracerProvider(shutdown_on_exit=False)
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     app = create_server_app(
         settings=ServerSettings(
-            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'scheduled-experience-tracing.db'}"),
-            runtime=RuntimeConfig(experience_schedule_seconds=0.02),
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'failed-worker-tracing.db'}"),
+            runtime=RuntimeConfig(
+                artifact_processing_families=("memory",),
+                memory_schedule_seconds=0.02,
+                memory_worker_timeout_seconds=0.01 if failure == "timeout" else 30,
+            ),
+            inference=InferenceConfig(generation_model="test"),
             mcp=McpConfig(enabled=False),
         ),
-        scheduler_path=tmp_path / "scheduler.db",
-        experience_pipeline=_EmptyExperiencePipeline(),
         tracing=ServerTracing(provider),
     )
-    scope_id = "project:private-scheduled-experience"
-    content = "private scheduled incubation evidence"
+    content = "private child failure evidence"
 
     with TestClient(app) as client:
+        scope_id = _get_default_scope_id(client)
         captured = client.post(
             "/v1/sources/content",
             json={"scope_id": scope_id, "source_id": "task-1", "content": content},
         )
         assert captured.status_code == 202
-        root = _wait_for_named_span(exporter, "scheduled.incubate_experience_candidates", outcome="success")
+        root = _wait_for_named_span(exporter, "artifact_processing.worker", outcome="failure", timeout=30)
         spans = list(exporter.get_finished_spans())
-        incubation = _only_child(spans, root, "experience.incubation")
-        _assert_scheduled_background_trace(root, incubation, spans, scope_id=scope_id, content=content)
-        assert (root.attributes or {})["powercontext.background.source_count"] == 1
-        assert (root.attributes or {})["powercontext.background.candidate_count"] == 0
-        assert (incubation.attributes or {})["powercontext.experience.incubation.source_count"] == 1
-        assert (incubation.attributes or {})["powercontext.experience.incubation.candidate_count"] == 0
+        assert root.parent is None
+        assert (root.attributes or {})["powercontext.artifact_processing.failure"] == failure
+        assert root.status.status_code.name == "ERROR"
+        assert not any(
+            span.name == "artifact_processing.worker"
+            and (span.attributes or {}).get("powercontext.operation.outcome") == "success"
+            for span in spans
+        )
+        for span in spans:
+            if span.name.startswith("artifact_processing.worker"):
+                _assert_stage_attribute_keys(span)
+        exported = _exported_span_data(spans)
+        assert scope_id not in exported
+        assert content not in exported
 
 
 def test_vector_search_exports_embedding_under_memory_search_without_recording_text(monkeypatch, tmp_path) -> None:
@@ -780,11 +1280,11 @@ def test_vector_search_exports_embedding_under_memory_search_without_recording_t
         ),
         tracing=ServerTracing(provider, instrumented=True),
     )
-    scope_id = "project:private-vector-scope"
     memory_content = "Private vector memory sentinel."
     private_text = "private embedding sentinel"
 
     with TestClient(app) as client:
+        scope_id = _get_default_scope_id(client)
         remembered = client.post(
             "/v1/memory/remember",
             json={"scope_id": scope_id, "kind": "fact", "text": memory_content},
@@ -850,14 +1350,13 @@ def test_injected_always_on_embedding_skips_readiness_but_traces_vector_search(m
         embedding_model=embedding_model,
         tracing=tracing,
     )
-    scope_id = "project:injected-always-on"
-
     with TestClient(app) as client:
         readiness = client.get("/health/ready")
         readiness_spans = list(exporter.get_finished_spans())
         assert not [span for span in readiness_spans if span.parent is None]
         assert not any(_is_inference_span(span) for span in readiness_spans)
 
+        scope_id = _get_default_scope_id(client)
         remembered = client.post(
             "/v1/memory/remember",
             json={"scope_id": scope_id, "kind": "fact", "text": "Private injected vector memory."},
@@ -893,9 +1392,8 @@ def _flush_memory_spans(database_path: Path, *, instrumented: bool) -> list[Read
         ),
         tracing=ServerTracing(provider, instrumented=instrumented),
     )
-    scope_id = "project:inference-tracing"
-
     with TestClient(app) as client:
+        scope_id = _get_default_scope_id(client)
         captured = client.post(
             "/v1/sources/content",
             json={"scope_id": scope_id, "source_id": "task-1", "content": "bounded evidence"},
@@ -905,6 +1403,50 @@ def _flush_memory_spans(database_path: Path, *, instrumented: bool) -> list[Read
         assert flushed.status_code == 200
 
     return list(exporter.get_finished_spans())
+
+
+def _get_default_scope_id(client: TestClient) -> str:
+    response = client.get("/v1/scopes/default")
+    assert response.status_code == 200
+    return response.json()["scope_id"]
+
+
+def _create_scope(client: TestClient, *, title: str, idempotency_key: str) -> str:
+    response = client.post(
+        "/v1/scopes",
+        json={
+            "title": title,
+            "summary": "Observability acceptance test scope",
+            "idempotency_key": idempotency_key,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()["scope_id"]
+
+
+_MEMORY_EXTRACT_PROMPT_PREFIX = "powercontext.prompt.memory.extract."
+_PROMPT_SELECTION_ATTRIBUTES = (
+    "selection",
+    "version",
+    "definition_version",
+    "builtin_version",
+    "compiled_digest",
+    "demonstration_count",
+)
+
+
+def _pop_prompt_attributes(attributes: dict[str, object], prefix: str, /) -> dict[str, object]:
+    """Remove one span's prompt-selection attributes so the remainder compares exactly.
+
+    The span carries either all six bounded prompt attributes or none; rejecting any other name keeps
+    prompt metadata from smuggling unbounded values onto the stage span.
+    """
+
+    prompt_names = {key.removeprefix(prefix) for key in attributes if key.startswith(prefix)}
+    assert prompt_names == set() or prompt_names == set(_PROMPT_SELECTION_ATTRIBUTES)
+    for key in [key for key in attributes if key.startswith(prefix)]:
+        del attributes[key]
+    return attributes
 
 
 def _is_inference_span(span: ReadableSpan) -> bool:

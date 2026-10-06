@@ -39,7 +39,7 @@ from typing import Any, Never
 
 import uvicorn
 from dotenv import load_dotenv
-from sqlalchemy import bindparam, text
+from sqlalchemy import bindparam, inspect, text
 
 from powercontext.builtin.artifacts.experience import ExperienceCandidateInput, ExperienceContent
 from powercontext.builtin.artifacts.skill import CodexSkillRoot
@@ -57,6 +57,7 @@ from powercontext.http import (
     CandidateFamily,
     CandidateStatus,
     CaptureContentSourceRequest,
+    CreateScopeRequest,
     ExperienceArtifact,
     ExperienceProposal,
     ExternalSkillImportMode,
@@ -100,19 +101,31 @@ _HARNESS_SCOPE_PREFIXES = (
     "configured-real-foreign:",
 )
 _SCOPE_TABLES = (
+    "pc_access_audit",
+    "pc_access_owners",
+    "pc_access_relationships",
     "pc_memory_vector_entries",
     "pc_memory_entry_heads",
     "pc_memory_entry_versions",
+    "pc_skill_publications",
     "pc_artifact_candidate_heads",
     "pc_artifact_candidate_versions",
     "pc_artifact_heads",
     "pc_artifact_lineage_artifacts",
     "pc_artifact_lineage_sources",
     "pc_artifacts",
+    "pc_skill_packages",
     "pc_source_cursors",
+    "pc_memory_source_windows",
     "pc_external_skill_registrations",
     "pc_sources",
     "pc_source_journal_heads",
+    "pc_scope_bindings",
+    "pc_scope_context_references",
+    "pc_scope_external_references",
+    "pc_scope_creation_requests",
+    "pc_scope_settings",
+    "pc_scopes",
 )
 PRODUCER_SCHEMA = {
     "type": "object",
@@ -283,12 +296,14 @@ class RunningServer:
 def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901 - one exception-safe harness lifecycle
     arguments = _arguments(argv)
     configured_settings: ServerSettings | None = None
+    configured_access_token: str | None = None
     configured_scopes: ConfiguredScopes | None = None
     external_skill: Path | None = None
     if arguments.configured:
         load_dotenv(arguments.env_file, override=False)
         configured_settings = ServerSettings()
         _validate_configured_settings(configured_settings)
+        configured_access_token = _configured_access_token(configured_settings)
         configured_scopes = _new_configured_scopes()
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     mode = "configured-experience-skill" if arguments.configured else "experience-skill"
@@ -308,6 +323,8 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901 - one exceptio
     shutil.copyfile(auth_file, isolated_auth)
     isolated_auth.chmod(0o600)
     codex_environment = {**os.environ, "CODEX_HOME": str(isolated_home), "NO_COLOR": "1"}
+    if configured_access_token is not None:
+        codex_environment["POWERCONTEXT_CLIENT_API_TOKEN"] = configured_access_token
     server: RunningServer | None = None
     configured_server_settings: ServerSettings | None = None
 
@@ -383,6 +400,13 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901 - one exceptio
         else:
             if configured_scopes is None or configured_server_settings is None or external_skill is None:
                 _fail("configured E2E state was not initialized")
+            configured_scopes = asyncio.run(
+                _create_configured_scopes(
+                    server_url=server.base_url,
+                    idempotency_keys=configured_scopes,
+                    api_token=configured_access_token,
+                )
+            )
             journey = asyncio.run(
                 _run_configured_journey(
                     recorder=recorder,
@@ -394,6 +418,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901 - one exceptio
                     server_url=server.base_url,
                     timeout=arguments.codex_timeout,
                     generation_timeout=configured_settings.inference.generation_timeout_seconds,
+                    api_token=configured_access_token,
                 )
             )
             server.stop()
@@ -409,6 +434,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901 - one exceptio
                     state=journey,
                     server_url=server.base_url,
                     generation_timeout=configured_settings.inference.generation_timeout_seconds,
+                    api_token=configured_access_token,
                 )
             )
     finally:
@@ -419,11 +445,12 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901 - one exceptio
             except Exception as error:
                 cleanup_errors.append(f"server: {error}")
         database_cleanup: dict[str, object] | None = None
-        if configured_settings is not None and configured_scopes is not None and arguments.cleanup:
+        if configured_settings is not None and arguments.cleanup:
             try:
-                database_cleanup = asyncio.run(
-                    _purge_database_scopes(configured_settings.database, configured_scopes.all)
-                )
+                discovered_scopes = asyncio.run(_discover_harness_scopes(configured_settings.database))
+                configured_scope_ids = () if configured_scopes is None else configured_scopes.all
+                cleanup_scopes = tuple(dict.fromkeys((*configured_scope_ids, *discovered_scopes)))
+                database_cleanup = asyncio.run(_purge_database_scopes(configured_settings.database, cleanup_scopes))
             except Exception as error:
                 cleanup_errors.append(f"database: {type(error).__name__}: {error}")
         codex_home_path = isolated_home
@@ -624,21 +651,18 @@ async def _run_journey(
         with recorder.scenario(
             "exact managed Skill projects into an isolated Codex repository",
             "projection/SKILL.md",
-            "projection/powercontext.json",
+            "projection/files.json",
         ):
             projection = repositories["consumer"] / ".agents" / "skills" / skill_v1.content.name
             _project_via_cli(
                 server_url=server_url,
+                api_token=None,
                 scope_id=scope_id,
                 skill=skill_v1,
                 destination=projection,
                 recorder=recorder,
             )
-            recorder.write_text("projection/SKILL.md", (projection / "SKILL.md").read_text(encoding="utf-8"))
-            recorder.write_text(
-                "projection/powercontext.json",
-                (projection / "powercontext.json").read_text(encoding="utf-8"),
-            )
+            _record_standard_projection(recorder, projection)
 
         with recorder.scenario(
             "next real Codex task explicitly uses the projected managed Skill",
@@ -755,6 +779,7 @@ async def _run_configured_journey(
     server_url: str,
     timeout: int,  # noqa: ASYNC109 - external Codex process budget, not an asyncio timeout scope
     generation_timeout: float,
+    api_token: str | None,
 ) -> ConfiguredJourneyState:
     memory_scope = scopes.memory
     artifact_scope = scopes.artifacts
@@ -767,7 +792,7 @@ async def _run_configured_journey(
         generation_timeout + CONFIGURED_EXPERIENCE_SCHEDULE_SECONDS + 30.0,
     )
 
-    async with PowerContextClient(server_url, timeout=max(30.0, generation_wait)) as client:
+    async with PowerContextClient(server_url, token=api_token, timeout=max(30.0, generation_wait)) as client:
         with recorder.scenario(
             "configured embedding model and database support vector and hybrid Memory retrieval",
             "api/capabilities.json",
@@ -1083,21 +1108,18 @@ async def _run_configured_journey(
         with recorder.scenario(
             "exact managed Skill projects into an isolated Codex repository",
             "projection/SKILL.md",
-            "projection/powercontext.json",
+            "projection/files.json",
         ):
             projection = repositories["consumer"] / ".agents" / "skills" / skill_v1.content.name
             _project_via_cli(
                 server_url=server_url,
+                api_token=api_token,
                 scope_id=artifact_scope,
                 skill=skill_v1,
                 destination=projection,
                 recorder=recorder,
             )
-            recorder.write_text("projection/SKILL.md", (projection / "SKILL.md").read_text(encoding="utf-8"))
-            recorder.write_text(
-                "projection/powercontext.json",
-                (projection / "powercontext.json").read_text(encoding="utf-8"),
-            )
+            _record_standard_projection(recorder, projection)
 
         with recorder.scenario(
             "a second real Codex task explicitly reuses the projected managed Skill",
@@ -1551,13 +1573,14 @@ async def _verify_configured_restart(
     state: ConfiguredJourneyState,
     server_url: str,
     generation_timeout: float,
+    api_token: str | None,
 ) -> None:
     with recorder.scenario(
         "configured state remains exact and searchable after a clean Server restart",
         "api/restart-persistence.json",
     ):
         timeout = max(30.0, generation_timeout + 30.0)
-        async with PowerContextClient(server_url, timeout=timeout) as client:
+        async with PowerContextClient(server_url, token=api_token, timeout=timeout) as client:
             persisted_experience_values: list[ExperienceArtifact] = []
             for expected in state.experience_revisions:
                 persisted_experience_values.append(
@@ -1783,12 +1806,16 @@ async def _replace_skill(client, scope_id, current, source):
 def _project_via_cli(
     *,
     server_url: str,
+    api_token: str | None,
     scope_id: str,
     skill: SkillArtifact,
     destination: Path,
     recorder: Recorder,
 ) -> None:
     uv = _required_executable("uv")
+    environment = dict(os.environ)
+    if api_token is not None:
+        environment["POWERCONTEXT_CLIENT_API_TOKEN"] = api_token
     completed = _run(
         [
             uv,
@@ -1809,8 +1836,17 @@ def _project_via_cli(
             skill.artifact.artifact_id,
         ],
         cwd=PROJECT_ROOT,
+        env=environment,
     )
     recorder.write_text("projection/cli.stdout", completed.stdout)
+
+
+def _record_standard_projection(recorder: Recorder, projection: Path) -> None:
+    files = sorted(path.relative_to(projection).as_posix() for path in projection.rglob("*") if path.is_file())
+    _require("SKILL.md" in files, "projected managed Skill omitted the standard entrypoint")
+    _require("powercontext.json" not in files, "projected standard Skill package contains a private ownership sidecar")
+    recorder.write_text("projection/SKILL.md", (projection / "SKILL.md").read_text(encoding="utf-8"))
+    recorder.write_json("projection/files.json", {"files": files})
 
 
 def _run_codex(
@@ -2016,12 +2052,55 @@ def _validate_configured_settings(settings: ServerSettings) -> None:
         _fail("configured E2E requires POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL")
 
 
+def _configured_access_token(settings: ServerSettings) -> str | None:
+    if settings.access.mode == "disabled":
+        return None
+    if settings.auth.token is None:
+        _fail("configured E2E supports enforced Access Control only with static-bearer authentication")
+    return settings.auth.token.get_secret_value()
+
+
 def _new_configured_scopes() -> ConfiguredScopes:
     suffix = f"{time.time_ns()}-{os.getpid()}"
     return ConfiguredScopes(
         memory=f"configured-real-memory:{suffix}",
         artifacts=f"configured-real-experience-skill:{suffix}",
         foreign=f"configured-real-foreign:{suffix}",
+    )
+
+
+async def _create_configured_scopes(
+    *,
+    server_url: str,
+    idempotency_keys: ConfiguredScopes,
+    api_token: str | None,
+) -> ConfiguredScopes:
+    async with PowerContextClient(server_url, token=api_token) as client:
+        memory = await client.create_scope(
+            CreateScopeRequest(
+                title="Configured real Memory",
+                summary="Isolated Memory retrieval boundary for the configured real-service E2E.",
+                idempotency_key=idempotency_keys.memory,
+            )
+        )
+        artifacts = await client.create_scope(
+            CreateScopeRequest(
+                title="Configured real Experience and Skill",
+                summary="Isolated governed Artifact boundary for the configured real-service E2E.",
+                idempotency_key=idempotency_keys.artifacts,
+            )
+        )
+        foreign = await client.create_scope(
+            CreateScopeRequest(
+                title="Configured real foreign evidence",
+                summary="Isolated negative-control boundary for cross-Scope evidence checks.",
+                idempotency_key=idempotency_keys.foreign,
+            )
+        )
+    return ConfiguredScopes(
+        memory=memory.scope_id,
+        artifacts=artifacts.scope_id,
+        foreign=foreign.scope_id,
     )
 
 
@@ -2064,7 +2143,19 @@ async def _discover_harness_scopes(database: DatabaseConfig) -> tuple[str, ...]:
     async def discover(profile: OceanBaseProfile | SeekDBProfile | SQLiteProfile) -> tuple[str, ...]:
         scopes: set[str] = set()
         async with profile.database.transaction() as connection:
-            for table_name in _SCOPE_TABLES:
+            table_names = set(
+                await connection.run_sync(lambda sync_connection: inspect(sync_connection).get_table_names())
+            )
+            if "pc_scope_creation_requests" in table_names:
+                statement = text(
+                    "SELECT DISTINCT scope_id FROM pc_scope_creation_requests WHERE idempotency_key LIKE :prefix"
+                )
+                for prefix in _HARNESS_SCOPE_PREFIXES:
+                    scopes.update(
+                        str(value)
+                        for value in (await connection.execute(statement, {"prefix": f"{prefix}%"})).scalars()
+                    )
+            for table_name in (name for name in _SCOPE_TABLES if name in table_names):
                 statement = text(
                     f"SELECT DISTINCT scope_id FROM {table_name} WHERE scope_id LIKE :prefix"  # noqa: S608
                 )
@@ -2109,9 +2200,10 @@ async def _purge_database_scopes(
 ) -> dict[str, object]:
     async def purge(profile: OceanBaseProfile | SeekDBProfile | SQLiteProfile) -> dict[str, object]:
         async with profile.database.transaction() as connection:
-            before = await _scope_counts(connection, scopes)
+            tables = await _existing_scope_tables(connection)
+            before = await _scope_counts(connection, scopes, tables=tables)
             if scopes:
-                for table_name in _SCOPE_TABLES:
+                for table_name in tables:
                     statement = text(
                         f"DELETE FROM {table_name} WHERE scope_id IN :scope_ids"  # noqa: S608
                     ).bindparams(bindparam("scope_ids", expanding=True))
@@ -2145,11 +2237,22 @@ async def _purge_database_scopes(
         return await purge(profile)
 
 
-async def _scope_counts(connection: Any, scopes: tuple[str, ...]) -> dict[str, dict[str, int]]:
+async def _existing_scope_tables(connection: Any) -> tuple[str, ...]:
+    table_names = set(await connection.run_sync(lambda sync_connection: inspect(sync_connection).get_table_names()))
+    return tuple(table_name for table_name in _SCOPE_TABLES if table_name in table_names)
+
+
+async def _scope_counts(
+    connection: Any,
+    scopes: tuple[str, ...],
+    *,
+    tables: tuple[str, ...] | None = None,
+) -> dict[str, dict[str, int]]:
     counts = {scope: dict.fromkeys(_SCOPE_TABLES, 0) for scope in scopes}
     if not scopes:
         return counts
-    for table_name in _SCOPE_TABLES:
+    existing_tables = await _existing_scope_tables(connection) if tables is None else tables
+    for table_name in existing_tables:
         statement = text(
             f"SELECT scope_id, COUNT(*) FROM {table_name} "  # noqa: S608
             "WHERE scope_id IN :scope_ids GROUP BY scope_id"
