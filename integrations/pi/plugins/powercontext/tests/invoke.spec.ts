@@ -34,7 +34,7 @@ describe('secret detection', () => {
 })
 
 describe('Pi native tool invocation', () => {
-  it('uses the derived scope and refuses secret-bearing writes', async () => {
+  it('uses the resolved scope and refuses secret-bearing writes', async () => {
     let body: string | undefined
     const client = new PowerContextClient({
       baseUrl: 'http://127.0.0.1:8000',
@@ -47,16 +47,55 @@ describe('Pi native tool invocation', () => {
 
     await expect(invokeOperation(client, 'search_memory', {
       query: 'prior decision',
-      scope_id: 'project:untrusted',
-    }, 'project:derived')).resolves.toMatchObject({ ok: true })
-    expect(JSON.parse(body ?? '{}')).toMatchObject({ scope_id: 'project:derived' })
+      scope_id: 'scope:untrusted',
+    }, 'scp_resolved')).resolves.toMatchObject({ ok: true })
+    expect(JSON.parse(body ?? '{}')).toMatchObject({ scope_id: 'scp_resolved' })
 
     await expect(invokeOperation(client, 'remember_memory', {
       kind: 'agent-note',
       text: 'api_key=secret',
-    }, 'project:derived')).resolves.toMatchObject({
-      ok: false,
-      code: 'secret_rejected',
+    }, 'scp_resolved')).resolves.toMatchObject({ ok: false, code: 'secret_rejected' })
+
+    const structuredWrites = [
+      ['create_work_contract', { contract: { objective: 'api_key=secret' } }],
+      ['handoff_current_work', { handoff: { objective: 'api_key=secret' } }],
+      ['acknowledge_handoff', { receiver: 'api_key=secret' }],
+      ['record_task_outcome', { outcome: { summary: 'api_key=secret' } }],
+      ['generate_experience', { reason: 'api_key=secret' }],
+      ['generate_skill', { reason: 'api_key=secret' }],
+      ['approve_artifact_candidate', { candidate_id: 'api_key=secret', expected_version: 1 }],
+      ['reject_artifact_candidate', { reason: 'api_key=secret', candidate_id: 'candidate-1', expected_version: 1 }],
+      ['revise_artifact_candidate', { proposal: { lesson: 'api_key=secret' } }],
+      ['import_external_skill', { external_skill_id: 'skill-1', fingerprint: 'api_key=secret', mode: 'import' }],
+    ] as const
+    for (const [operationId, payload] of structuredWrites) {
+      await expect(invokeOperation(client, operationId, payload, 'scp_resolved')).resolves.toMatchObject({
+        ok: false,
+        code: 'secret_rejected',
+      })
+    }
+  })
+
+  it('limits observation requests to the derived Scope', async () => {
+    const bodies: unknown[] = []
+    const client = new PowerContextClient({
+      baseUrl: 'http://127.0.0.1:8000',
+      requestTimeoutMs: 1000,
+      fetch: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)))
+        return new Response(JSON.stringify({}), { status: 200 })
+      },
     })
+
+    await invokeOperation(client, 'get_stats', { selection: { mode: 'all' } }, 'scp_resolved')
+    await invokeOperation(client, 'get_handoff_report', {
+      selection: { mode: 'subtree', root_scope_id: 'scope:other' },
+      format: 'json',
+    }, 'scp_resolved')
+
+    expect(bodies).toEqual([
+      { selection: { mode: 'exact', scope_ids: ['scp_resolved'] } },
+      { selection: { mode: 'exact', scope_ids: ['scp_resolved'] }, format: 'json' },
+    ])
   })
 })

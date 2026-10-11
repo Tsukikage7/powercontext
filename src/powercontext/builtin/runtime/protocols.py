@@ -21,9 +21,16 @@ from contextlib import AbstractContextManager
 from typing import Protocol, TypeVar
 
 from powercontext.builtin.artifacts.handoff import ActivateHandoff, HandoffActivation
-from powercontext.builtin.runtime.models import MemoryFlushResult
+from powercontext.builtin.runtime.models import (
+    CommitConnectorCheckpoint,
+    ConnectorCheckpointState,
+    MemoryFlushResult,
+    SourceReceipt,
+    SubmitSourceObservation,
+)
 from powercontext.builtin.sources import SourceCursor
 from powercontext.context import PowerContext
+from powercontext.sources import ConnectorBinding, SourceDefinitionManifest
 
 SourcesT = TypeVar("SourcesT", covariant=True)
 ArtifactsT = TypeVar("ArtifactsT", covariant=True)
@@ -64,10 +71,30 @@ class PowerContextProvider(Protocol[SourcesT, ArtifactsT, TriggersT]):
     async def get(self, scope_id: str, /) -> PowerContext[SourcesT, ArtifactsT, TriggersT]: ...
 
 
+class RemoteIngestion(Protocol):
+    """Server-side authority used by independent Connector workers."""
+
+    async def register_source_definition(
+        self,
+        manifest: SourceDefinitionManifest,
+        /,
+    ) -> SourceDefinitionManifest: ...
+
+    async def connector_checkpoint(self, binding: ConnectorBinding, /) -> ConnectorCheckpointState: ...
+
+    async def submit_source_observation(self, request: SubmitSourceObservation, /) -> SourceReceipt: ...
+
+    async def commit_connector_checkpoint(
+        self,
+        request: CommitConnectorCheckpoint,
+        /,
+    ) -> ConnectorCheckpointState: ...
+
+
 class BuiltinTriggers(Protocol):
     """Atomically execute the built-in Trigger policies for one scope."""
 
-    async def flush(self, *, limit: int) -> MemoryFlushResult: ...
+    async def flush(self, *, limit: int, atomic_context=None) -> MemoryFlushResult: ...
 
     async def cursor(self) -> SourceCursor: ...
 

@@ -35,6 +35,12 @@ POWERCONTEXT_TOOLS = (
     "powercontext_memory_store",
     "powercontext_memory_revise",
     "powercontext_memory_retire",
+    "powercontext_work_contract_create",
+    "powercontext_handoff_current_work",
+    "powercontext_handoff_commit",
+    "powercontext_handoff_continue",
+    "powercontext_handoff_acknowledge",
+    "powercontext_task_outcome",
 )
 MIN_OPENCLAW_VERSION = (2026, 8, 1, 2)
 OPENCLAW_VERSION_PATTERN = re.compile(r"(?:OpenClaw\s+)?(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?")
@@ -57,13 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="http://127.0.0.1:8000",
         help="PowerContext Server URL for enable",
     )
-    parser.add_argument(
-        "scope_mode",
-        nargs="?",
-        default="agent",
-        choices=("agent", "project"),
-        help="memory scope for enable",
-    )
     return parser
 
 
@@ -73,7 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         openclaw = find_openclaw()
         if args.action == "enable":
             require_supported_openclaw(openclaw)
-            enable(openclaw, args.endpoint, args.scope_mode)
+            enable(openclaw, args.endpoint)
         elif args.action == "disable":
             disable(openclaw)
         elif args.action == "off":
@@ -113,14 +112,13 @@ def require_supported_openclaw(executable: str) -> str:
     return version_text
 
 
-def enable(executable: str, endpoint: str, scope_mode: str) -> None:
+def enable(executable: str, endpoint: str) -> None:
     normalized_endpoint = normalize_endpoint(endpoint)
     settings = [
         {"path": "plugins.entries.memory-powercontext.enabled", "value": True},
         {"path": "plugins.entries.memory-powercontext.config.endpoint", "value": normalized_endpoint},
         {"path": "plugins.entries.memory-powercontext.config.autoRecall", "value": True},
         {"path": "plugins.entries.memory-powercontext.config.autoCapture", "value": True},
-        {"path": "plugins.entries.memory-powercontext.config.scopeMode", "value": scope_mode},
         {"path": "plugins.entries.memory-powercontext.hooks.allowConversationAccess", "value": True},
         {"path": "plugins.slots.memory", "value": "memory-powercontext"},
     ]

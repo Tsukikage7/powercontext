@@ -1,5 +1,7 @@
 # PowerContext for LangGraph
 
+`community`
+
 This package connects a [LangGraph](https://langchain-ai.github.io/langgraph/) graph to a running PowerContext
 Server through the public Python client. It integrates at the node and tool level, using LangGraph primitives that
 are stable public API, and provides three components:
@@ -26,7 +28,7 @@ agent = create_react_agent(
     context_schema=PowerContextScope,
     checkpointer=my_checkpointer,
 )
-await agent.ainvoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
+await agent.ainvoke(state, context=PowerContextScope())
 ```
 
 The recall hook and the Memory tools are async, so drive the graph with `ainvoke`/`astream`; a synchronous
@@ -58,7 +60,7 @@ builder.add_edge(START, "recall")
 builder.add_edge("recall", "model")
 
 graph = builder.compile(checkpointer=my_checkpointer)
-await graph.ainvoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
+await graph.ainvoke(state, context=PowerContextScope())
 ```
 
 ## Installation
@@ -81,8 +83,9 @@ Configuration is read through pydantic-settings with the prefix `POWERCONTEXT_LA
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `POWERCONTEXT_LANGGRAPH_BASE_URL` | `http://127.0.0.1:8000` | PowerContext Server URL |
+| `POWERCONTEXT_LANGGRAPH_ALLOW_INSECURE_HTTP` | `false` | Explicitly allow non-loopback HTTP; HTTPS certificate validation stays enabled |
 | `POWERCONTEXT_LANGGRAPH_TOKEN` | unset | Bearer token forwarded to `PowerContextClient` |
-| `POWERCONTEXT_LANGGRAPH_SCOPE_ID` | derived | Durable scope shared across runs |
+| `POWERCONTEXT_LANGGRAPH_SCOPE_ID` | unset | Existing Server Scope to use instead of the Server default |
 | `POWERCONTEXT_LANGGRAPH_TIMEOUT` | `10` | Client timeout in seconds |
 | `POWERCONTEXT_LANGGRAPH_MAX_BYTES` | `8000` | Prepared-context size limit |
 
@@ -90,18 +93,22 @@ Configuration is read through pydantic-settings with the prefix `POWERCONTEXT_LA
 `POWERCONTEXT_*_AUTHORIZATION` convention used by the Codex, Claude Code, and DeepSeek Harness plugins.
 `PowerContextClient` accepts the bare token and composes the header internally.
 
+`allow_insecure_http=True` on `PowerContextLangGraphSettings` or `PowerContextScope` also permits non-loopback HTTP.
+Transport settings resolve from explicit values, host environment, common
+`POWERCONTEXT_CLIENT_SERVER_URL` / `POWERCONTEXT_CLIENT_ALLOW_INSECURE_HTTP`, then the `langgraph` entry in
+`~/.config/powercontext/clients.json` (overridden by `POWERCONTEXT_CLIENT_CONFIG_FILE`). A host value of `false`
+overrides common `true`. Saved consent applies only to its saved Server URL; changing a run's URL does not reuse it.
+
 ## Scope resolution
 
-The scope for a run is resolved in this order:
+The adapter asks the Server to resolve the Scope for every operation:
 
-1. an explicit `scope_id` on `PowerContextScope`, or `POWERCONTEXT_LANGGRAPH_SCOPE_ID`;
-2. a scope derived from the current Git remote;
-3. otherwise the adapter raises.
+1. an explicit, existing `scope_id` on `PowerContextScope`, or `POWERCONTEXT_LANGGRAPH_SCOPE_ID`;
+2. otherwise the Server default Scope.
 
-This priority is inverted relative to the Codex plugin. A LangGraph deployment is typically a long-running service in
-which the working directory has no relationship to the project, so explicit configuration is the primary path and Git
-derivation is the fallback. When neither is available the adapter raises rather than defaulting to a shared local
-scope, which would place unrelated tenants together.
+Scope IDs are Server-owned opaque identifiers. The adapter never derives one from the process working directory, a
+Git remote, or a filesystem path. An explicit ID is validated by the Server before the operation continues; obtain it
+from the Scope API rather than inventing it locally.
 
 ## Why this package does not implement `BaseStore`
 

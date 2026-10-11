@@ -21,12 +21,19 @@ from typing import Annotated, ClassVar, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, InstanceOf, field_validator, model_validator
 
 from powercontext.artifacts import Artifact, ArtifactDraft, ArtifactRef
-from powercontext.builtin.artifacts.memory import MemoryCitation, MemoryEntryVersion
+from powercontext.builtin.artifacts.handoff.generation_metadata import (
+    HandoffGenerationEnvelope,
+    HandoffGenerationMetadata,
+)
 from powercontext.sources import Source, SourceRef
 
 DEFAULT_HANDOFF_MAX_BYTES = 8000
 MAX_HANDOFF_BYTES = 32_768
 MIN_HANDOFF_MAX_BYTES = 512
+# Startup orientation has a smaller budget than a complete Handoff.
+DEFAULT_HINT_MAX_BYTES = 2000
+MAX_HINT_BYTES = 4000
+MIN_HINT_MAX_BYTES = 1
 MAX_HANDOFF_CITATIONS = 32
 MAX_HANDOFF_OMISSIONS = 64
 MAX_HANDOFF_STATE_STATEMENTS = 64
@@ -59,15 +66,8 @@ class HandoffArtifactCitation(_HandoffValue):
     artifact_ref: ArtifactRef
 
 
-class HandoffMemoryCitation(_HandoffValue):
-    """Cite one exact Memory entry version."""
-
-    kind: Literal["memory"] = "memory"
-    memory_citation: MemoryCitation
-
-
 HandoffCitation: TypeAlias = Annotated[
-    HandoffSourceCitation | HandoffArtifactCitation | HandoffMemoryCitation,
+    HandoffSourceCitation | HandoffArtifactCitation,
     Field(discriminator="kind"),
 ]
 
@@ -148,25 +148,7 @@ class HandoffArtifactEvidence(_HandoffValue):
         return self
 
 
-class HandoffMemoryEvidence(_HandoffValue):
-    """One exact Memory entry version resolved for Handoff generation."""
-
-    citation: HandoffMemoryCitation
-    entry: MemoryEntryVersion
-
-    @model_validator(mode="after")
-    def require_exact_entry_version(self) -> HandoffMemoryEvidence:
-        reference = self.citation.memory_citation
-        if (
-            reference.memory_ref.artifact_id != self.entry.memory_artifact_id
-            or reference.entry_id != self.entry.entry_id
-            or reference.entry_version_id != self.entry.entry_version_id
-        ):
-            raise ValueError("resolved Memory entry does not match its Handoff citation")  # noqa: TRY003
-        return self
-
-
-HandoffGenerationEvidence: TypeAlias = HandoffSourceEvidence | HandoffArtifactEvidence | HandoffMemoryEvidence
+HandoffGenerationEvidence: TypeAlias = HandoffSourceEvidence | HandoffArtifactEvidence
 
 
 class HandoffGenerationRequest(_HandoffValue):
@@ -215,6 +197,8 @@ class HandoffOmission(_HandoffValue):
 class HandoffContent(_HandoffValue):
     """The complete content shared by temporary and committed Handoffs."""
 
+    generation: HandoffGenerationMetadata | None = Field(default=None, exclude_if=lambda value: value is None)
+
     schema_version: Literal["powercontext.handoff.v1"] = Field(
         default="powercontext.handoff.v1",
         alias="schema",
@@ -239,6 +223,8 @@ class HandoffContent(_HandoffValue):
 
 class HandoffDraft(_HandoffValue):
     """Inspectable and correctable content before Handoff finalization."""
+
+    generation: HandoffGenerationEnvelope | None = Field(default=None, exclude_if=lambda value: value is None)
 
     objective: Annotated[str, Field(max_length=MAX_HANDOFF_TEXT_LENGTH)]
     state: Annotated[
@@ -308,6 +294,8 @@ class HandoffArtifactDraft(ArtifactDraft[HandoffContent]):
 class PreparedHandoff(_HandoffValue):
     """Finalized temporary Handoff associated with one scope and observed head."""
 
+    generation: HandoffGenerationEnvelope | None = Field(default=None, exclude_if=lambda value: value is None)
+
     schema_version: Literal["powercontext.prepared-handoff.v1"] = Field(
         default="powercontext.prepared-handoff.v1",
         alias="schema",
@@ -320,6 +308,23 @@ class PreparedHandoff(_HandoffValue):
     @classmethod
     def require_scope_id(cls, value: str) -> str:
         return _require_text("scope_id", value)
+
+
+class PrepareHandoffHint(_HandoffValue):
+    """Explicitly select one Handoff for optional, bounded historical orientation."""
+
+    selection: HandoffResolutionSelection
+    prepared: PreparedHandoff | None = None
+    revision: ArtifactRef | None = None
+    max_bytes: Annotated[int, Field(ge=MIN_HINT_MAX_BYTES, le=MAX_HINT_BYTES)] = DEFAULT_HINT_MAX_BYTES
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> PrepareHandoffHint:
+        if (self.prepared is not None) != (self.selection == "prepared") or (self.revision is not None) != (
+            self.selection == "exact"
+        ):
+            raise ValueError("hint selection requires exactly its selected Handoff value")  # noqa: TRY003
+        return self
 
 
 class HandoffEvidenceCheck(_HandoffValue):

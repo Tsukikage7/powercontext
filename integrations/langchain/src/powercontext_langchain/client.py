@@ -25,9 +25,10 @@ import httpx
 from pydantic import SecretStr
 
 from powercontext.client import PowerContextClient
+from powercontext.http import ResolveScopeBindingRequest
 
-from .scope import PowerContextScope, resolve_scope_id
-from .settings import PowerContextLangChainSettings
+from .scope import PowerContextScope
+from .settings import ContextAssembly, PowerContextLangChainSettings
 
 _SHARED_HTTP_CLIENT: ContextVar[tuple[httpx.AsyncClient, bool] | None] = ContextVar(
     "powercontext_langchain_http_client", default=None
@@ -39,10 +40,12 @@ class ResolvedConfig:
     """Effective connection configuration for one middleware operation."""
 
     base_url: str
-    scope_id: str
+    scope_id: str | None
     token: str | None = field(repr=False)
     timeout: float
     max_bytes: int
+    context_assembly: ContextAssembly | None = None
+    allow_insecure_http: bool = False
 
 
 def resolve_config(
@@ -55,17 +58,38 @@ def resolve_config(
     resolved_settings = settings or PowerContextLangChainSettings()
     resolved_scope = scope or PowerContextScope()
     token = resolved_scope.token if resolved_scope.token is not None else _secret_value(resolved_settings.token)
+    base_url, allow_insecure_http = resolved_settings.resolve_transport(
+        server_url=resolved_scope.base_url, allow_insecure_http=resolved_scope.allow_insecure_http
+    )
     return ResolvedConfig(
-        base_url=(resolved_scope.base_url or resolved_settings.base_url).strip(),
-        scope_id=resolve_scope_id(resolved_scope.scope_id or resolved_settings.scope_id),
+        base_url=base_url,
+        scope_id=_explicit_scope_id(resolved_scope.scope_id or resolved_settings.scope_id),
         token=token,
         timeout=resolved_scope.timeout if resolved_scope.timeout is not None else resolved_settings.timeout,
         max_bytes=resolved_settings.max_bytes,
+        context_assembly=resolved_settings.context_assembly,
+        allow_insecure_http=allow_insecure_http,
     )
 
 
 def _secret_value(secret: SecretStr | None) -> str | None:
     return secret.get_secret_value() if secret is not None else None
+
+
+def _explicit_scope_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+async def resolve_server_scope(client: PowerContextClient, config: ResolvedConfig) -> str:
+    """Resolve an explicit or default Server-owned Scope for one operation."""
+
+    scope = await client.resolve_scope_binding(
+        ResolveScopeBindingRequest(explicit_scope_id=config.scope_id, binding_keys=[]),
+    )
+    return scope.scope_id
 
 
 def open_client(config: ResolvedConfig) -> PowerContextClient:
@@ -83,8 +107,11 @@ def open_client(config: ResolvedConfig) -> PowerContextClient:
             token=config.token,
             http_client=client,
             trust_transport_security=trust_transport_security,
+            allow_insecure_http=config.allow_insecure_http,
         )
-    return PowerContextClient(config.base_url, token=config.token, timeout=config.timeout)
+    return PowerContextClient(
+        config.base_url, token=config.token, timeout=config.timeout, allow_insecure_http=config.allow_insecure_http
+    )
 
 
 @contextmanager
@@ -104,4 +131,4 @@ def shared_http_client(client: httpx.AsyncClient, *, trust_transport_security: b
         _SHARED_HTTP_CLIENT.reset(token)
 
 
-__all__ = ["ResolvedConfig", "open_client", "resolve_config", "shared_http_client"]
+__all__ = ["ResolvedConfig", "open_client", "resolve_config", "resolve_server_scope", "shared_http_client"]

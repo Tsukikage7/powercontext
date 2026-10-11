@@ -46,6 +46,7 @@ describe('agent tool surface', () => {
       'pc_remember',
       'pc_memory_list',
       'pc_memory_get',
+      'pc_memory_state',
       'pc_memory_revise',
       'pc_memory_retire',
       'pc_prepare_context',
@@ -111,7 +112,7 @@ describe('agent tool surface', () => {
       {
         client: {} as never,
         config: { maxBytes: 8000 },
-        resolveScope: async (cwd?: string) => cwd ? 'local:from-cwd' : undefined,
+        resolveScope: async (cwd?: string) => cwd ? 'scp_from_server' : undefined,
         log: vi.fn(),
       } as unknown as PluginRuntime,
       (definition) => definition,

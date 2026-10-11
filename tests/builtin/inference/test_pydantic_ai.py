@@ -35,7 +35,7 @@ from pydantic_ai.embeddings import (
 )
 from pydantic_ai.embeddings.result import EmbedInputType
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
+from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.instrumented import InstrumentationSettings, InstrumentedModel
 from pydantic_ai.models.test import TestModel
@@ -132,6 +132,7 @@ class RecordingEmbeddingModel(PydanticAIEmbeddingModelBase):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[tuple[str, ...]] = []
+        self.input_types: list[EmbedInputType] = []
 
     @property
     def model_name(self) -> str:
@@ -150,6 +151,7 @@ class RecordingEmbeddingModel(PydanticAIEmbeddingModelBase):
     ) -> PydanticAIEmbeddingResult:
         prepared, _ = self.prepare_embed(inputs, settings)
         self.calls.append(tuple(prepared))
+        self.input_types.append(input_type)
         return PydanticAIEmbeddingResult(
             embeddings=((1.0, 2.0, 3.0),) * len(prepared),
             inputs=prepared,
@@ -200,6 +202,83 @@ def test_structured_generator_passes_explicit_model_settings() -> None:
 
         assert result.output == Answer("stable")
         assert observed_temperatures == [0.0]
+
+    asyncio.run(scenario())
+
+
+def test_structured_generator_enforces_wire_and_cumulative_output_limits() -> None:
+    observed_max_tokens: list[int | None] = []
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        observed_max_tokens.append(None if info.model_settings is None else info.model_settings.get("max_tokens"))
+        return ModelResponse(
+            parts=[TextPart('{"value":"stable"}')],
+            usage=RequestUsage(output_tokens=11),
+        )
+
+    async def scenario() -> None:
+        generator = PydanticAIStructuredGenerator(
+            model=FunctionModel(respond),
+            instructions="Return a value.",
+            input_type=Question,
+            output_type=Answer,
+            limits=InferenceLimits(
+                max_requests=1,
+                max_output_tokens_per_request=7,
+                output_tokens_limit=10,
+            ),
+            model_settings={"max_tokens": 100},
+        )
+
+        with pytest.raises(InvalidInferenceOutputError):
+            await generator.generate(Question("bounded evidence"))
+        assert observed_max_tokens == [7]
+
+    asyncio.run(scenario())
+
+
+def test_structured_generator_bounds_each_retry_and_cumulative_output() -> None:
+    observed_max_tokens: list[int | None] = []
+    retry_feedback: list[str] = []
+    calls = 0
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        observed_max_tokens.append(None if info.model_settings is None else info.model_settings.get("max_tokens"))
+        retry_feedback.extend(
+            part.model_response() for message in messages for part in message.parts if isinstance(part, RetryPromptPart)
+        )
+        text = (
+            '{"candidates":[{"text":"candidate"}]}'
+            if calls == 1
+            else '{"candidates":[{"text":"candidate","intent":"durable"}]}'
+        )
+        return ModelResponse(parts=[TextPart(text)], usage=RequestUsage(output_tokens=3))
+
+    async def scenario() -> None:
+        generator = PydanticAIStructuredGenerator(
+            model=FunctionModel(respond),
+            instructions="Return proposals.",
+            input_type=Question,
+            output_type=Proposal,
+            limits=InferenceLimits(
+                max_requests=2,
+                max_output_tokens_per_request=5,
+                output_tokens_limit=6,
+            ),
+            model_settings={"max_tokens": 100},
+        )
+
+        result = await generator.generate(Question("bounded evidence"))
+
+        assert result.output == Proposal(candidates=(Candidate(text="candidate", intent="durable"),))
+        assert result.usage.requests == 2
+        assert result.usage.output_tokens == 6
+        assert observed_max_tokens == [5, 5]
+        assert len(retry_feedback) == 1
+        assert len(retry_feedback[0]) < 512
 
     asyncio.run(scenario())
 
@@ -277,7 +356,7 @@ def test_generation_readiness_probe_uses_one_bounded_text_request() -> None:
 
     assert observed_settings == [
         {
-            "max_tokens": 1,
+            "max_tokens": 16,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
         }
     ]
@@ -388,6 +467,23 @@ def test_embedding_adapter_preserves_order_across_bounded_provider_batches() -> 
     asyncio.run(scenario())
 
 
+def test_embedding_adapter_forwards_query_input_type() -> None:
+    async def scenario() -> None:
+        provider = RecordingEmbeddingModel()
+        model = PydanticAIEmbeddingModel(
+            embedder=Embedder(provider),
+            profile=TEST_PROFILE,
+        )
+
+        result = await model.embed_query(("find this",))
+
+        assert provider.calls == [("find this",)]
+        assert provider.input_types == ["query"]
+        assert result.vectors == ((1.0, 2.0, 3.0),)
+
+    asyncio.run(scenario())
+
+
 def test_embedding_adapter_enforces_unit_normalization_profile() -> None:
     async def scenario() -> None:
         model = PydanticAIEmbeddingModel(
@@ -403,6 +499,28 @@ def test_embedding_adapter_enforces_unit_normalization_profile() -> None:
         result = await model.embed(("alpha",))
 
         assert result.vectors[0] == pytest.approx((0.6, 0.8))
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "embeddings",
+    [
+        ((1.0, 2.0),),
+        ((1.0, 2.0, float("inf")),),
+    ],
+)
+def test_embedding_adapter_preserves_invalid_output_classification(
+    embeddings: tuple[tuple[float, ...], ...],
+) -> None:
+    async def scenario() -> None:
+        adapter = PydanticAIEmbeddingModel(
+            embedder=Embedder(ResultEmbeddingModel(embeddings)),
+            profile=TEST_PROFILE,
+        )
+
+        with pytest.raises(InvalidInferenceOutputError):
+            await adapter.embed(("bounded text",))
 
     asyncio.run(scenario())
 

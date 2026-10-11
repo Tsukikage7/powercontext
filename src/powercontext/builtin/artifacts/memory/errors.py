@@ -21,6 +21,14 @@ class MemoryLayerError(PowerContextError):
     """Base exception for Memory domain and repository failures."""
 
 
+class MemoryCapacityExceededError(MemoryLayerError, RuntimeError):
+    def __init__(self, dimension: str, limit: int, observed: int) -> None:
+        self.dimension = dimension
+        self.limit = limit
+        self.observed = observed
+        super().__init__(f"memory capacity budget is exceeded: {dimension} {observed} > {limit}")
+
+
 class CapabilityNotSupportedError(MemoryLayerError, RuntimeError):
     def __init__(self, capability: str, detail: str | None = None) -> None:
         self.capability = capability
@@ -48,9 +56,16 @@ class MemoryEntryInactiveError(MemoryEntryError, RuntimeError):
 
 
 class InvalidMemoryCandidateError(MemoryLayerError, ValueError):
-    def __init__(self, code: str, detail: object | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        detail: object | None = None,
+        *,
+        canonical_code: str | None = None,
+    ) -> None:
         self.code = code
         self.detail = detail
+        self.canonical_code = canonical_code
         messages = {
             "remember-mode": f"unsupported memory remember mode: {detail}",
             "identity-kind": f"unsupported memory identity kind: {detail}",
@@ -80,19 +95,18 @@ class InvalidEmbeddingError(MemoryLayerError, ValueError):
         super().__init__(messages.get(code, f"invalid embedding: {code}"))
 
 
-class InvalidMemoryCitationError(MemoryLayerError, ValueError):
-    def __init__(self, code: str) -> None:
+class MemoryWriteRejectedError(MemoryLayerError, RuntimeError):
+    """A structured, caller-visible refusal to apply one Memory write.
+
+    ``code`` and ``reason`` carry the gate's decision to the host, so a refused write is
+    observable rather than silently dropped.
+    """
+
+    def __init__(self, code: str, reason: str | None = None) -> None:
         self.code = code
-        messages = {
-            "base-mismatch": "memory value does not match its exact stored Revision",
-            "duplicate-versions": "backend returned duplicate entry version identities",
-            "missing-version": "manifest entry version is missing",
-            "cross-identity": "entry version crosses Memory or logical entry identity",
-            "hash-mismatch": "manifest content hash does not match canonical entry bytes",
-            "expand-count": "invalid memory citation expansion count",
-            "expand-anchor": "invalid memory citation anchor",
-        }
-        super().__init__(messages.get(code, f"invalid memory citation: {code}"))
+        self.reason = reason
+        detail = "" if reason is None else f": {reason}"
+        super().__init__(f"memory write was rejected ({code}){detail}")
 
 
 class MemoryBackendConfigurationError(MemoryLayerError, RuntimeError):

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
 
+from powercontext.cli.dsh_runtime import DshProfile, DshTarget, dsh_home
 from powercontext.cli.git_source import (
     InvalidGitHubSourceError,
     clone_github_source,
@@ -48,12 +49,23 @@ class DshSetupResult:
     plugin: str
     plugin_path: str
     data_dir: str
+    authorization_state: str = "not_attempted"
+    profile: str = "web"
+    profile_dir: str = ""
 
 
-def install_dsh_plugin(*, source: str, ref: str) -> DshSetupResult:
+def install_dsh_plugin(
+    *,
+    source: str,
+    ref: str,
+    server_url: str = "http://127.0.0.1:8000",
+    allow_insecure_http: bool = False,
+    target: DshTarget | None = None,
+) -> DshSetupResult:
     """Install the plugin from a PowerContext checkout or Git source."""
 
-    dsh_executable()
+    profile = target.profile if target else DshProfile.WEB
+    executable = target.command if target and target.command else dsh_executable()
     data_dir = powercontext_data_dir()
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -61,11 +73,38 @@ def install_dsh_plugin(*, source: str, ref: str) -> DshSetupResult:
         raise SetupError.data_directory(data_dir, error) from error
     plugin_dir = resolve_dsh_plugin_dir(source=source, ref=ref)
     require_built_plugin(plugin_dir)
-    _run_dsh("plugin", "--profile", DSH_PROFILE, "add", str(plugin_dir))
+    from powercontext.cli.dsh_transport import read_dsh_settings, validate_dsh_setup_transport
+
+    try:
+        settings = read_dsh_settings(profile=profile, candidate=plugin_dir, prospective=True, executable=executable)
+        validate_dsh_setup_transport(settings, server_url, allow_insecure_http)
+    except ValueError as error:
+        raise SetupError(str(error)) from error
+    _run_dsh("plugin", "--profile", profile, "add", str(plugin_dir), **({"executable": executable} if target else {}))
+    try:
+        settings = read_dsh_settings(profile=profile, executable=executable, require_installed=True)
+        validate_dsh_setup_transport(settings, server_url, allow_insecure_http)
+    except ValueError as error:
+        raise SetupError(  # noqa: TRY003 - actionable host-specific readback failure.
+            f"DSH installation completed but its resulting configuration could not be validated: {error}. "
+            "Connection settings and credentials were not saved. Check the profile before restarting DSH."
+        ) from error
+    from powercontext.cli.authorization import (
+        configure_stored_authorization,
+        setup_authorization_value,
+    )
+
     return DshSetupResult(
         plugin=DSH_PLUGIN_NAME,
         plugin_path=str(plugin_dir),
         data_dir=str(data_dir),
+        profile=profile,
+        profile_dir=str(dsh_home() / "profiles" / profile),
+        authorization_state=configure_stored_authorization(
+            "dsh",
+            server_url=server_url,
+            value=setup_authorization_value("dsh"),
+        ),
     )
 
 
@@ -95,11 +134,11 @@ def require_built_plugin(path: Path) -> None:
         raise SetupError.unbuilt_dsh_plugin(path)
 
 
-def run_dsh_diagnostics() -> dict[str, Diagnostic]:
+def run_dsh_diagnostics(*, target: DshTarget | None = None) -> dict[str, Diagnostic]:
     """Collect diagnostics for the optional DeepSeek Harness integration."""
 
     try:
-        executable = dsh_executable()
+        executable = target.command if target and target.command else dsh_executable()
     except SetupError:
         return {
             "dsh": Diagnostic(
@@ -111,11 +150,32 @@ def run_dsh_diagnostics() -> dict[str, Diagnostic]:
                 detail="not checked because DeepSeek Harness CLI is unavailable",
             ),
         }
+    if target and target.profile == DshProfile.DESKTOP:
+        return _desktop_diagnostics(target)
     try:
-        output = _run_dsh("--profile", DSH_PROFILE, "--dump-config")
+        output = _run_dsh("--profile", DSH_PROFILE, "--dump-config", **({"executable": executable} if target else {}))
     except SetupError as error:
+        cause = error.__cause__
+        checks = {"dump_config": "failed"}
+        detail = "dsh --profile web --dump-config failed"
+        if isinstance(cause, subprocess.TimeoutExpired):
+            checks["dump_config"] = "timeout"
+            detail = "dsh --profile web --dump-config exceeded the 120-second deadline"
+        elif isinstance(cause, subprocess.CalledProcessError):
+            checks["exit_code"] = str(cause.returncode)
+            detail = f"dsh --profile web --dump-config exited with code {cause.returncode}"
+        elif isinstance(cause, OSError):
+            checks["dump_config"] = "launch_failed"
+            detail = "could not launch dsh --profile web --dump-config; verify the executable and its permissions"
         return {
-            "dsh": Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error)),
+            "dsh": Diagnostic(
+                status=DiagnosticStatus.FAILED,
+                detail=(
+                    f"{detail}; inspect the Web profile locally for configuration "
+                    "or plugin-load errors. Raw host output is withheld because it can contain credentials."
+                ),
+                checks=checks,
+            ),
             "plugin": Diagnostic(status=DiagnosticStatus.SKIPPED, detail="plugin list is unavailable"),
         }
     installed = plugin_id_installed(output)
@@ -123,8 +183,49 @@ def run_dsh_diagnostics() -> dict[str, Diagnostic]:
         "dsh": Diagnostic(status=DiagnosticStatus.OK, detail=executable),
         "plugin": Diagnostic(
             status=DiagnosticStatus.OK if installed else DiagnosticStatus.FAILED,
-            detail=(f"{DSH_PLUGIN_NAME} is installed" if installed else "PowerContext DSH plugin is not installed"),
+            detail=(
+                f"{DSH_PLUGIN_NAME} is registered in the Web profile. This standalone check cannot observe "
+                "the running DSH process environment or overrides; run /pc doctor inside that session."
+                if installed
+                else "PowerContext DSH plugin is not registered in the Web profile; run powercontext setup dsh."
+            ),
+            checks={
+                "registration": "present" if installed else "missing",
+                "running_host_configuration": "not_observed",
+                "server_liveness": "not_checked",
+                "server_readiness": "not_checked",
+                "route_compatibility": "not_checked",
+                "session_scope": "not_checked",
+            },
         ),
+    }
+
+
+def _desktop_diagnostics(target: DshTarget) -> dict[str, Diagnostic]:
+    """Compose registration with Desktop's parser without booting its reserved profile."""
+    from powercontext.cli.dsh_transport import read_dsh_settings
+
+    try:
+        read_dsh_settings(profile=target.profile, executable=target.command, require_installed=True)
+    except ValueError as error:
+        plugin = Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error))
+    else:
+        plugin = Diagnostic(
+            status=DiagnosticStatus.OK,
+            detail="powercontext-dsh is registered in the Desktop profile. Reopen Desktop and run /pc doctor "
+            "inside that session to check the running host and Server.",
+            checks={
+                "registration": "present",
+                "running_host_configuration": "not_observed",
+                "server_liveness": "not_checked",
+                "server_readiness": "not_checked",
+                "route_compatibility": "not_checked",
+                "session_scope": "not_checked",
+            },
+        )
+    return {
+        "dsh": Diagnostic(status=DiagnosticStatus.OK, detail=target.command or "Desktop-installed dsh"),
+        "plugin": plugin,
     }
 
 
@@ -210,8 +311,8 @@ def _clone_github_source(source: str, ref: str, target: Path) -> None:
         raise SetupError.invalid_dsh_source() from None
 
 
-def _run_dsh(*arguments: str) -> str:
-    command = [dsh_executable(), *arguments]
+def _run_dsh(*arguments: str, executable: str | None = None) -> str:
+    command = [executable or dsh_executable(), *arguments]
     try:
         completed = subprocess.run(  # noqa: S603 - arguments are passed directly to the fixed dsh executable.
             command,
@@ -228,7 +329,9 @@ def _run_dsh(*arguments: str) -> str:
         detail = (
             (completed.stderr or "").strip() or (completed.stdout or "").strip() or f"exit code {completed.returncode}"
         )
-        raise SetupError.command_failed(command, detail)
+        raise SetupError.command_failed(command, detail) from subprocess.CalledProcessError(
+            completed.returncode, command
+        )
     return completed.stdout or ""
 
 

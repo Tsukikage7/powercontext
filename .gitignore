@@ -27,10 +27,16 @@ build/
 develop-eggs/
 dist/
 node_modules/
-evaluation/web/node_modules/
-evaluation/web/playwright-report/
-evaluation/web/test-results/
-evaluation/web/*.tsbuildinfo
+evaluation/coding/swebench_pro/web/node_modules/
+evaluation/coding/swebench_pro/web/playwright-report/
+evaluation/coding/swebench_pro/web/test-results/
+evaluation/coding/swebench_pro/web/*.tsbuildinfo
+# Local results retained at the pre-migration evaluation path.
+/benchmark/
+# Local native-code experiment and validation reports.
+/docs/*/rfcs/0000-native-git-code-understanding-validation.md
+/docs/*/rfcs/0000-native-git-code-understanding-experiment.md
+/docs/*/rfcs/0000-native-git-code-understanding-same-harness.md
 downloads/
 eggs/
 .eggs/
@@ -97,6 +103,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+examples/jupyter/VALIDATION.*
 
 # IPython
 profile_default/
@@ -156,7 +163,14 @@ celerybeat.pid
 
 # Environments
 .env
+.env_jev
+.env_laya
+.env.systemone
 .env.bak-*
+*.env.client.env
+*.env.client.env.bak-*
+*.env.next-steps.md
+*.env.next-steps.md.bak-*
 .envrc
 .powercontext/
 .powercontext-e2e/
@@ -174,10 +188,10 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
-# mkdocs/zensical documentation
-/site
-/docs/api/openapi.yaml
+# Generated outputs
+site/
 e2e/bub/results/
+e2e/bub/memorycode-tasks/
 
 # mypy
 .mypy_cache/
@@ -198,7 +212,10 @@ cython_debug/
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+.idea/
+
+# macOS
+.DS_Store
 
 # Abstra
 # Abstra is an AI-powered process automation framework.
@@ -238,6 +255,10 @@ integrations/dsh/*.tgz
 !integrations/dsh/plugins/powercontext/lib/
 !integrations/dsh/plugins/powercontext/lib/**
 
+# PowerContext OpenCode plugin (Node)
+!integrations/opencode/plugins/powercontext/lib/
+!integrations/opencode/plugins/powercontext/lib/**
+
 # PowerContext OpenClaw plugin (Node)
 integrations/openclaw/plugins/memory-powercontext/artifacts/
 integrations/openclaw/plugins/memory-powercontext/*.tgz
@@ -249,3 +270,6 @@ integrations/pi/*.tgz
 integrations/pi/plugins/powercontext/node_modules/
 integrations/pi/plugins/powercontext/coverage/
 integrations/pi/plugins/powercontext/*.tgz
+
+# Local acceptance databases and redacted run artifacts
+.artifacts/

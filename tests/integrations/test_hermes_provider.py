@@ -19,6 +19,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import re
 import sys
 import threading
 import types
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jsonschema import ValidationError, validate
 
 HERMES_ROOT = Path(__file__).parents[2] / "integrations" / "hermes"
 _HERMES_MODULE_NAMES = (
@@ -33,7 +35,6 @@ _HERMES_MODULE_NAMES = (
     "plugins.powercontext.provider",
     "plugins.powercontext.commands",
     "plugins.powercontext.trace",
-    "plugins.powercontext.workstream",
     "plugins.powercontext.operations",
     "plugins.powercontext.helpers",
     "plugins.powercontext.client",
@@ -62,9 +63,34 @@ class FakeClient:
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.base_url = "http://powercontext.test:8000"
         self._remember_count = 0
-        self._revision = 0
         self._memory_entries: dict[str, dict[str, Any]] = {}
+        self._memory_history: dict[tuple[str, int], dict[str, Any]] = {}
         self.memory_extraction = True
+        self.default_scope_id = "scp_00000000000000000000000000"
+        self.scope_bindings: dict[tuple[str, str, str], str] = {}
+        self.resolved_binding_keys: list[dict[str, str]] = []
+
+    def resolve_scope_binding(self, *, explicit_scope_id, binding_keys):
+        self.resolved_binding_keys = binding_keys
+        if explicit_scope_id:
+            return {"scope_id": explicit_scope_id}
+        for key in binding_keys:
+            identity = (key["integration"], key["kind"], key["external_id"])
+            if identity in self.scope_bindings:
+                return {"scope_id": self.scope_bindings[identity]}
+        return {"scope_id": self.default_scope_id}
+
+    def set_scope_binding(self, key, scope_id):
+        identity = (key["integration"], key["kind"], key["external_id"])
+        self.scope_bindings[identity] = scope_id
+        self.calls.append(("set_scope_binding", (key, scope_id), {}))
+        return {"key": key, "scope_id": scope_id}
+
+    def clear_scope_binding(self, key):
+        identity = (key["integration"], key["kind"], key["external_id"])
+        cleared = self.scope_bindings.pop(identity, None) is not None
+        self.calls.append(("clear_scope_binding", (key,), {}))
+        return {"cleared": cleared}
 
     def prepare_context(self, scope_id, query, *, max_bytes):
         self.calls.append(("prepare_context", (scope_id, query), {"max_bytes": max_bytes}))
@@ -80,48 +106,73 @@ class FakeClient:
 
     def search_memory(self, scope_id, query, *, limit, mode):
         self.calls.append(("search_memory", (scope_id, query), {"limit": limit, "mode": mode}))
-        hits = [
-            {"text": text, "citation": citation}
-            for text, citation in self._memory_entries.items()
-            if query.lower() in text.lower()
-        ]
-        return {"hits": hits or [{"text": "a memory"}]}
+        return {
+            "mode": "fts",
+            "hits": [
+                {"memory": json.loads(json.dumps(record)), "score": 1 / 61, "matched_by": ["text"]}
+                for text, record in self._memory_entries.items()
+                if query.lower() in text.lower() and record["state"] == "active"
+            ][:limit],
+        }
 
     def get_memory_entry(self, scope_id, citation):
         self.calls.append(("get_memory_entry", (scope_id, citation), {}))
-        return {"text": "a memory"}
+        ref = citation.get("artifact", citation)
+        return json.loads(json.dumps(self._memory_history[(ref["artifact_id"], ref["revision"])]))
 
     def remember_memory(self, scope_id, *, kind, text, reason=None):
         self._remember_count += 1
-        self._revision += 1
-        for citation in self._memory_entries.values():
-            citation["memory_ref"]["revision"] = self._revision
-        citation = {
-            "memory_ref": {
-                "family": "memory",
-                "artifact_id": f"memory-{self._remember_count}",
-                "revision": self._revision,
-            },
-            "entry_id": f"entry-{self._remember_count}",
-            "entry_version_id": f"entry-version-{self._remember_count}",
+        record = {
+            "artifact": {"family": "atomic-memory", "artifact_id": f"am-{self._remember_count}", "revision": 1},
+            "kind": kind,
+            "text": text,
+            "state": "active",
+            "state_version": 0,
+            "merged_into_id": None,
         }
-        self._memory_entries[text] = citation
+        self._memory_entries[text] = record
+        self._memory_history[(record["artifact"]["artifact_id"], 1)] = {
+            **record["artifact"],
+            "scope_id": scope_id,
+            "content": {"kind": kind, "text": text},
+        }
         self.calls.append(("remember_memory", (scope_id, kind, text), {"reason": reason}))
-        return {
-            "status": "remembered",
-            "entry": {"citation": citation},
+        return {"changed": True, "records": [json.loads(json.dumps(record))]}
+
+    def revise_memory_entry(self, scope_id, citation, *, kind, text):
+        ref = citation.get("artifact", citation)
+        old_text, record = next(
+            (key, value)
+            for key, value in self._memory_entries.items()
+            if value["artifact"]["artifact_id"] == ref["artifact_id"]
+        )
+        assert record["artifact"] == ref
+        assert record["state"] in {"active", "forgotten"}
+        updated = {**record, "artifact": {**ref, "revision": ref["revision"] + 1}, "kind": kind, "text": text}
+        self._memory_entries.pop(old_text)
+        self._memory_entries[text] = updated
+        revision: dict[str, Any] = {
+            **updated["artifact"],
+            "scope_id": scope_id,
+            "content": {"kind": kind, "text": text},
         }
+        self._memory_history[(ref["artifact_id"], revision["revision"])] = revision
+        self.calls.append(("revise_memory_entry", (scope_id, citation), {"kind": kind, "text": text}))
+        return revision
+
+    def get_memory_state(self, scope_id, citation):
+        ref = citation.get("artifact", citation)
+        record = next(value for value in self._memory_entries.values() if value["artifact"] == ref)
+        self.calls.append(("get_memory_state", (scope_id, citation), {}))
+        return {"artifact": dict(record["artifact"]), "state_version": record["state_version"]}
 
     def retire_memory_entry(self, scope_id, citation, *, reason=None):
-        assert citation["memory_ref"]["revision"] == self._revision
-        self._revision += 1
-        identity = (citation["entry_id"], citation["entry_version_id"])
-        for text, stored in list(self._memory_entries.items()):
-            if (stored["entry_id"], stored["entry_version_id"]) == identity:
-                del self._memory_entries[text]
-                break
+        record = next(value for value in self._memory_entries.values() if value["artifact"] == citation["artifact"])
+        assert record["state_version"] == citation["state_version"]
+        record["state"] = "forgotten"
+        record["state_version"] += 1
         self.calls.append(("retire_memory_entry", (scope_id, citation), {"reason": reason}))
-        return {"status": "retired"}
+        return {"changed": True, "records": [json.loads(json.dumps(record))]}
 
     def get_liveness(self):
         self.calls.append(("get_liveness", (), {}))
@@ -145,12 +196,17 @@ def provider_and_client(tmp_path, hermes_modules):
     provider_module, _cli_module = hermes_modules
     client = FakeClient()
     provider = provider_module.PowerContextMemoryProvider(
-        {"scope_id": "hermes:{profile}:{user_id}"},
+        {},
         client_factory=lambda _config: client,
     )
     provider.initialize("session-1", hermes_home=str(tmp_path), agent_identity="coder", user_id="user-7")
     yield provider, client
     provider.shutdown()
+
+
+def hermes_provider_module(provider):
+    """The loaded plugin module, so tests can reach its public error types."""
+    return sys.modules[type(provider).__module__]
 
 
 def test_prefetch_uses_profile_and_user_scoped_context(provider_and_client):
@@ -161,7 +217,7 @@ def test_prefetch_uses_profile_and_user_scoped_context(provider_and_client):
     assert "remembered project context" in recalled
     assert client.calls[0] == (
         "prepare_context",
-        ("hermes:coder:user-7", "What did we decide about the deployment?"),
+        ("scp_00000000000000000000000000", "What did we decide about the deployment?"),
         {"max_bytes": 8000},
     )
 
@@ -235,7 +291,6 @@ def test_register_does_not_install_session_bound_slash_handlers(hermes_modules):
         def __init__(self):
             self.provider = None
             self.commands = {}
-            self.skills = {}
 
         def register_memory_provider(self, provider):
             self.provider = provider
@@ -243,15 +298,11 @@ def test_register_does_not_install_session_bound_slash_handlers(hermes_modules):
         def register_command(self, name, handler, **kwargs):
             self.commands[name] = (handler, kwargs)
 
-        def register_skill(self, name, path, description=None):
-            self.skills[name] = (path, description)
-
     context = Context()
     provider_module.register(context)
 
     assert context.provider is not None
     assert context.commands == {}
-    assert "powercontext" in context.skills
 
 
 def test_powercontext_subcommands_are_available_to_hermes_completer(hermes_modules, monkeypatch):
@@ -392,7 +443,7 @@ def test_queue_prefetch_honors_max_bytes_environment_override(provider_and_clien
 
     assert client.calls[0] == (
         "prepare_context",
-        ("hermes:coder:user-7", "What did we decide about the deployment?"),
+        ("scp_00000000000000000000000000", "What did we decide about the deployment?"),
         {"max_bytes": 16000},
     )
 
@@ -431,7 +482,6 @@ def test_json_config_is_loaded_from_hermes_home(tmp_path, hermes_modules):
     config_path.write_text(
         json.dumps({
             "base_url": "http://powercontext.test:9000",
-            "scope_id": "hermes:{profile}:{user_id}",
             "max_bytes": 1200,
             "capture_turns": False,
         }),
@@ -444,7 +494,7 @@ def test_json_config_is_loaded_from_hermes_home(tmp_path, hermes_modules):
     assert provider._config["base_url"] == "http://powercontext.test:9000"
     assert provider._config["max_bytes"] == 1200
     assert provider._config["capture_turns"] is False
-    assert provider._scope_id == "hermes:coder:user-7"
+    assert provider._scope_id == "scp_00000000000000000000000000"
     provider.shutdown()
 
 
@@ -461,7 +511,8 @@ def test_memory_setup_schema_exposes_powercontext_configuration(hermes_modules):
     assert fields["capture_pre_compress"]["choices"] == ["true", "false"]
     assert "capture_turns" in fields
     assert "flush_on_session_end" in fields
-    assert fields["workstream_persistence"]["default"] == "true"
+    assert fields["scope_id"]["default"] == ""
+    assert "scope_binding" not in fields
 
 
 def test_memory_setup_saves_powercontext_json_and_preserves_existing_values(tmp_path, hermes_modules):
@@ -495,7 +546,7 @@ def test_sync_turn_is_flushed_before_session_end(provider_and_client):
 
     names = [call[0] for call in client.calls]
     assert names == ["capture_content", "get_capabilities", "flush_memory"]
-    assert client.calls[0][1][0] == "hermes:coder:user-7"
+    assert client.calls[0][1][0] == "scp_00000000000000000000000000"
     assert client.calls[0][2]["metadata"]["kind"] == "hermes-turn"
 
 
@@ -581,6 +632,63 @@ def test_pre_compress_filters_roles_and_redacts_secrets(provider_and_client):
     assert "deployment" in content
 
 
+@pytest.fixture
+def make_provider(tmp_path, hermes_modules):
+    """Build an initialized provider for a specific agent context; shut it down after the test."""
+    provider_module, _cli_module = hermes_modules
+    initialized = []
+
+    def _make(config=None, **kwargs):
+        client = FakeClient()
+        provider = provider_module.PowerContextMemoryProvider(config or {}, client_factory=lambda _config: client)
+        provider.initialize(
+            kwargs.pop("session_id", "session-1"),
+            hermes_home=str(tmp_path),
+            agent_identity="coder",
+            **kwargs,
+        )
+        initialized.append(provider)
+        return provider, client
+
+    yield _make
+    for provider in initialized:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("agent_context", "platform"),
+    [("cron", "cli"), ("flush", "cli"), ("subagent", "cli"), ("", "cron"), ("", "subagent")],
+)
+def test_non_primary_agent_context_skips_automatic_writes(make_provider, agent_context, platform):
+    provider, client = make_provider(agent_context=agent_context, platform=platform)
+
+    provider.sync_turn("Scheduled check.", "Everything is green.", session_id="session-1")
+    provider.on_memory_write("add", "user", "The scheduled run prefers uv.")
+    provider._wait_for_background()
+
+    assert [call[0] for call in client.calls] == []
+
+
+@pytest.mark.parametrize(("agent_context", "platform"), [("", ""), ("primary", "cli"), ("primary", "telegram")])
+def test_primary_agent_context_still_writes_turns_and_memories(make_provider, agent_context, platform):
+    provider, client = make_provider(agent_context=agent_context, platform=platform)
+
+    provider.sync_turn("Use uv for the integration.", "I will add a uv check.", session_id="session-1")
+    provider.on_memory_write("add", "user", "The user prefers uv.")
+    provider._wait_for_background()
+
+    assert [call[0] for call in client.calls] == ["capture_content", "remember_memory"]
+
+
+def test_non_primary_agent_context_keeps_recall_available(make_provider):
+    provider, client = make_provider(agent_context="cron", platform="cron")
+
+    recalled = provider.prefetch("What did we decide about the deployment?")
+
+    assert "remembered project context" in recalled
+    assert client.calls[0][0] == "prepare_context"
+
+
 def test_pre_compress_captures_only_new_overlapping_windows(provider_and_client):
     provider, client = provider_and_client
     provider._config["capture_pre_compress"] = True
@@ -616,7 +724,155 @@ def test_pre_compress_captures_only_new_overlapping_windows(provider_and_client)
     assert len({call[1][1] for call in capture_calls}) == 3
 
 
-def test_memory_write_retires_mapped_entries_for_replace_and_remove(provider_and_client):
+def test_provider_advertises_the_fail_closed_checkpoint_contract(provider_and_client):
+    provider, _client = provider_and_client
+
+    assert provider.pre_compress_checkpoint_api_version == 2
+
+
+def test_pre_compress_prefers_host_normalized_evidence(provider_and_client):
+    provider, client = provider_and_client
+    provider._config["capture_pre_compress"] = True
+
+    provider.on_pre_compress(
+        [{"role": "user", "content": "raw transcript turn"}],
+        evidence_messages=[{"role": "user", "content": "normalized evidence turn"}],
+    )
+
+    content = client.calls[0][1][2]
+    assert "normalized evidence turn" in content
+    assert "raw transcript turn" not in content
+
+
+def test_required_checkpoint_raises_when_capture_is_disabled(provider_and_client):
+    provider, client = provider_and_client
+
+    with pytest.raises(hermes_provider_module(provider).PreCompressCheckpointError):
+        provider.on_pre_compress(
+            [{"role": "user", "content": "Not captured by default."}],
+            require_checkpoint=True,
+        )
+
+    assert client.calls == []
+
+
+def test_required_checkpoint_raises_when_the_transcript_cannot_be_stored(provider_and_client, monkeypatch):
+    provider, client = provider_and_client
+    provider._config["capture_pre_compress"] = True
+    provider_module = hermes_provider_module(provider)
+    failure = provider_module.PowerContextTransportError("server unreachable")
+
+    def capture_fails(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(client, "capture_content", capture_fails)
+
+    with pytest.raises(provider_module.PreCompressCheckpointError):
+        provider.on_pre_compress(
+            [{"role": "user", "content": "Capture me before compression."}],
+            require_checkpoint=True,
+        )
+
+
+def test_optional_checkpoint_still_fails_open_when_the_transcript_cannot_be_stored(provider_and_client, monkeypatch):
+    provider, client = provider_and_client
+    provider._config["capture_pre_compress"] = True
+
+    failure = hermes_provider_module(provider).PowerContextTransportError("server unreachable")
+
+    def capture_fails(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(client, "capture_content", capture_fails)
+
+    assert provider.on_pre_compress([{"role": "user", "content": "Capture me."}]) == ""
+
+
+def test_required_checkpoint_succeeds_when_the_transcript_is_stored(provider_and_client):
+    provider, client = provider_and_client
+    provider._config["capture_pre_compress"] = True
+
+    provider.on_pre_compress(
+        [{"role": "user", "content": "The service must stay backward compatible."}],
+        require_checkpoint=True,
+    )
+
+    assert [call[0] for call in client.calls] == ["capture_content", "get_capabilities", "flush_memory"]
+
+
+def test_required_checkpoint_raises_when_the_transcript_would_be_truncated(provider_and_client):
+    provider, client = provider_and_client
+    provider._config["capture_pre_compress"] = True
+    provider_module = hermes_provider_module(provider)
+
+    with pytest.raises(provider_module.PreCompressCheckpointError):
+        provider.on_pre_compress(
+            [{"role": "user", "content": "x" * 30_001}],
+            require_checkpoint=True,
+        )
+
+    assert client.calls == []
+    assert provider._precompress_snapshot == []
+
+
+def test_required_checkpoint_accepts_a_window_that_is_already_captured(provider_and_client):
+    provider, client = provider_and_client
+    provider._config["capture_pre_compress"] = True
+    window = [
+        {"role": "user", "content": "Only user turn."},
+        {"role": "assistant", "content": "Only assistant turn."},
+    ]
+
+    provider.on_pre_compress(window, require_checkpoint=True)
+    provider.on_pre_compress(window, require_checkpoint=True)
+
+    capture_calls = [call for call in client.calls if call[0] == "capture_content"]
+    assert len(capture_calls) == 1
+
+
+def test_required_checkpoint_raises_when_scope_changes_during_capture(provider_and_client, monkeypatch):
+    provider, client = provider_and_client
+    provider._config["capture_pre_compress"] = True
+    provider_module = hermes_provider_module(provider)
+    capture_content = client.capture_content
+
+    def capture_switches_scope(*args, **kwargs):
+        capture_content(*args, **kwargs)
+        provider._switch_scope("scp_other_scope")
+
+    monkeypatch.setattr(client, "capture_content", capture_switches_scope)
+
+    with pytest.raises(provider_module.PreCompressCheckpointError):
+        provider.on_pre_compress(
+            [{"role": "user", "content": "Capture before the scope switch."}],
+            require_checkpoint=True,
+        )
+
+    assert [call[0] for call in client.calls] == ["capture_content"]
+    assert provider._precompress_snapshot == []
+
+
+def test_committed_checkpoint_survives_a_memory_extraction_failure(provider_and_client, monkeypatch):
+    provider, client = provider_and_client
+    provider._config["capture_pre_compress"] = True
+
+    failure = hermes_provider_module(provider).PowerContextTransportError("flush unavailable")
+
+    def flush_fails(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(client, "flush_memory", flush_fails)
+
+    # The transcript is already stored, so the required checkpoint is still satisfied.
+    provider.on_pre_compress(
+        [{"role": "user", "content": "Capture me before compression."}],
+        require_checkpoint=True,
+    )
+
+    assert [call[0] for call in client.calls] == ["capture_content", "get_capabilities"]
+
+
+def test_memory_write_revises_and_forgets_mapped_artifacts(provider_and_client):
     provider, client = provider_and_client
 
     provider.on_memory_write("add", "user", "The user prefers uv.")
@@ -638,14 +894,17 @@ def test_memory_write_retires_mapped_entries_for_replace_and_remove(provider_and
 
     assert [call[0] for call in client.calls] == [
         "remember_memory",
-        "search_memory",
-        "retire_memory_entry",
-        "remember_memory",
-        "search_memory",
+        "get_memory_entry",
+        "revise_memory_entry",
+        "get_memory_state",
+        "get_memory_entry",
         "retire_memory_entry",
     ]
-    assert client.calls[2][1][1]["entry_id"] == "entry-1"
-    assert client.calls[5][1][1]["entry_id"] == "entry-2"
+    assert client.calls[2][1][1]["artifact"] == {"family": "atomic-memory", "artifact_id": "am-1", "revision": 1}
+    assert client.calls[5][1][1] == {
+        "artifact": {"family": "atomic-memory", "artifact_id": "am-1", "revision": 2},
+        "state_version": 0,
+    }
 
 
 def test_memory_write_matches_partial_old_text_for_replace_and_remove(provider_and_client):
@@ -668,9 +927,10 @@ def test_memory_write_matches_partial_old_text_for_replace_and_remove(provider_a
     )
     provider._wait_for_background()
 
-    retire_calls = [call for call in client.calls if call[0] == "retire_memory_entry"]
-    assert [call[1][1]["entry_id"] for call in retire_calls] == ["entry-1", "entry-2"]
-    assert [call[1][1]["memory_ref"]["revision"] for call in retire_calls] == [1, 3]
+    changes = [call for call in client.calls if call[0] in {"revise_memory_entry", "retire_memory_entry"}]
+    assert [call[1][1]["artifact"]["artifact_id"] for call in changes] == ["am-1", "am-1"]
+    assert [call[1][1]["artifact"]["revision"] for call in changes] == [1, 2]
+    assert [call[1][1]["state_version"] for call in changes] == [0, 0]
 
 
 def test_memory_write_does_not_retire_unmapped_same_text(provider_and_client):
@@ -691,7 +951,7 @@ def test_memory_write_does_not_retire_unmapped_same_text(provider_and_client):
     assert text in client._memory_entries
 
 
-def test_memory_map_refreshes_revision_after_multiple_writes(provider_and_client):
+def test_memory_map_preserves_per_identity_revisions_after_multiple_writes(provider_and_client):
     provider, client = provider_and_client
 
     provider.on_memory_write("add", "user", "The user prefers uv.")
@@ -714,8 +974,10 @@ def test_memory_map_refreshes_revision_after_multiple_writes(provider_and_client
     )
     provider._wait_for_background()
 
-    retire_calls = [call for call in client.calls if call[0] == "retire_memory_entry"]
-    assert [call[1][1]["memory_ref"]["revision"] for call in retire_calls] == [2, 4]
+    changes = [call for call in client.calls if call[0] in {"revise_memory_entry", "retire_memory_entry"}]
+    assert [call[1][1]["artifact"]["revision"] for call in changes] == [1, 2]
+    assert all(call[1][1]["artifact"]["artifact_id"] == "am-1" for call in changes)
+    assert client._memory_entries["The project uses Python."]["artifact"]["revision"] == 1
 
 
 def test_memory_write_skips_replace_and_remove_without_old_text(provider_and_client):
@@ -730,14 +992,6 @@ def test_memory_write_skips_replace_and_remove_without_old_text(provider_and_cli
 
 def test_memory_tools_map_to_powercontext_operations(provider_and_client):
     provider, client = provider_and_client
-    citation_args = {
-        "family": "memory",
-        "artifact_id": "memory-1",
-        "revision": 1,
-        "entry_id": "entry-1",
-        "entry_version_id": "entry-version-1",
-    }
-
     search = json.loads(provider.handle_tool_call("powercontext_search_memory", {"query": "deployment"}))
     saved = json.loads(
         provider.handle_tool_call(
@@ -745,13 +999,15 @@ def test_memory_tools_map_to_powercontext_operations(provider_and_client):
             {"kind": "decision", "text": "Use the Hermes standard Provider interface."},
         )
     )
+    snapshot = {key: saved["records"][0][key] for key in ("artifact", "state_version")}
+    citation_args = {"reference": snapshot}
     read = json.loads(provider.handle_tool_call("powercontext_get_memory", citation_args))
     retired = json.loads(provider.handle_tool_call("powercontext_retire_memory", citation_args))
 
-    assert search["hits"]
-    assert saved["status"] == "remembered"
-    assert read["text"] == "a memory"
-    assert retired["status"] == "retired"
+    assert search["hits"] == []
+    assert saved["changed"] is True
+    assert read["content"]["text"] == "Use the Hermes standard Provider interface."
+    assert retired["records"][0]["state"] == "forgotten"
     assert [call[0] for call in client.calls] == [
         "search_memory",
         "remember_memory",
@@ -776,13 +1032,13 @@ def test_extended_tools_are_registered_and_scope_bound(provider_and_client):
     assert result["operation"] == "list_memory_entries"
     assert result["payload"] == {
         "include_inactive": True,
-        "scope_id": "hermes:coder:user-7",
+        "scope_id": "scp_00000000000000000000000000",
     }
     assert client.calls[-1] == (
         "request_operation",
         (
             "list_memory_entries",
-            {"include_inactive": True, "scope_id": "hermes:coder:user-7"},
+            {"include_inactive": True, "scope_id": "scp_00000000000000000000000000"},
         ),
         {},
     )
@@ -800,11 +1056,11 @@ def test_extended_slash_commands_dispatch_json_operations(provider_and_client):
     help_text = provider.handle_slash_command("help")
 
     assert result["operation"] == "prepare_handoff"
-    assert result["payload"]["scope_id"] == "hermes:coder:user-7"
+    assert result["payload"]["scope_id"] == "scp_00000000000000000000000000"
     assert result["payload"]["objective"] == "finish integration"
     assert stats["operation"] == "get_stats"
-    assert stats["payload"] == {"period": "7d", "scope_id": "hermes:coder:user-7"}
-    assert "/pc workstream" in help_text
+    assert stats["payload"] == {"period": "7d", "scope_id": "scp_00000000000000000000000000"}
+    assert "/pc scope" in help_text
     assert [call[0] for call in client.calls] == ["request_operation", "request_operation"]
 
 
@@ -815,30 +1071,31 @@ def test_slash_commands_parse_unwrapped_citation_json_from_readme(provider_and_c
         kind="preference",
         text="The user prefers uv.",
         reason="seed test citation",
-    )["entry"]["citation"]
+    )["records"][0]
+    citation = {key: citation[key] for key in ("artifact", "state_version")}
     citation_json = json.dumps(citation)
     client.calls.clear()
 
     fetched = json.loads(provider.handle_slash_command(f"get {citation_json}"))
     revised = json.loads(
         provider.handle_slash_command(
-            f'revise {citation_json} preference "The user prefers rye." "toolchain update"',
+            f'revise {citation_json} preference "The user prefers rye."',
         )
     )
-    retired = json.loads(provider.handle_slash_command(f'retire {citation_json} "no longer current"'))
+    retired = json.loads(provider.handle_slash_command(f"retire {citation_json}"))
 
-    assert fetched["text"] == "a memory"
+    assert fetched["content"]["text"] == "The user prefers uv."
     assert revised == {
         "operation": "revise_memory_entry",
         "payload": {
             "citation": citation,
             "kind": "preference",
             "text": "The user prefers rye.",
-            "reason": "toolchain update",
+            "reason": None,
             "scope_id": provider._scope_id,
         },
     }
-    assert retired["status"] == "retired"
+    assert retired["records"][0]["state"] == "forgotten"
     assert [call[0] for call in client.calls] == [
         "get_memory_entry",
         "request_operation",
@@ -846,23 +1103,12 @@ def test_slash_commands_parse_unwrapped_citation_json_from_readme(provider_and_c
     ]
 
 
-def test_workstream_binding_is_shared_with_hermes_scope(tmp_path, hermes_modules, monkeypatch):
+def test_scope_resolution_uses_session_workspace_and_server_default(tmp_path, hermes_modules):
     provider_module, _cli_module = hermes_modules
-    git_directory = tmp_path / ".git"
-    state_path = git_directory / "powercontext" / "codex-workspace.json"
-    state_path.parent.mkdir(parents=True)
-    state_path.write_text(
-        json.dumps({
-            "schema": "powercontext.codex-workspace.v1",
-            "scope_id": "git:example/project",
-        }),
-        encoding="utf-8",
-    )
-    workstream_module = importlib.import_module("plugins.powercontext.workstream")
-    monkeypatch.setattr(workstream_module, "git_value", lambda _cwd, *_args: str(git_directory))
+    client = FakeClient()
     provider = provider_module.PowerContextMemoryProvider(
-        {"scope_id": "hermes:{profile}:{user_id}"},
-        client_factory=lambda _config: FakeClient(),
+        {},
+        client_factory=lambda _config: client,
     )
     provider.initialize(
         "session-1",
@@ -872,21 +1118,33 @@ def test_workstream_binding_is_shared_with_hermes_scope(tmp_path, hermes_modules
         user_id="user-7",
     )
 
-    status = json.loads(provider.handle_slash_command("workstream status"))
-    assert status["bound_scope_id"] == "git:example/project"
+    status = json.loads(provider.handle_slash_command("scope status"))
+    assert status["active_scope_id"] == client.default_scope_id
+    assert [key["kind"] for key in client.resolved_binding_keys] == ["session", "workspace"]
+    assert all(key["integration"] == "hermes" for key in client.resolved_binding_keys)
     provider.shutdown()
 
 
-def test_workstream_clear_restores_default_scope(tmp_path, hermes_modules, monkeypatch):
+def test_explicit_scope_precedes_server_bindings(tmp_path, hermes_modules):
     provider_module, _cli_module = hermes_modules
-    git_directory = tmp_path / ".git"
-    git_directory.mkdir()
-    workstream_module = importlib.import_module("plugins.powercontext.workstream")
-    monkeypatch.setattr(workstream_module, "git_value", lambda _cwd, *_args: str(git_directory))
+    client = FakeClient()
+    provider = provider_module.PowerContextMemoryProvider(
+        {"scope_id": "scp_explicit"},
+        client_factory=lambda _config: client,
+    )
+
+    provider.initialize("session-1", hermes_home=str(tmp_path), cwd=str(tmp_path))
+
+    assert provider._scope_id == "scp_explicit"
+    provider.shutdown()
+
+
+def test_scope_binding_clear_restores_default_scope(tmp_path, hermes_modules):
+    provider_module, _cli_module = hermes_modules
 
     client = FakeClient()
     provider = provider_module.PowerContextMemoryProvider(
-        {"scope_id": "hermes:{profile}:{user_id}"},
+        {},
         client_factory=lambda _config: client,
     )
     provider.initialize(
@@ -899,13 +1157,13 @@ def test_workstream_clear_restores_default_scope(tmp_path, hermes_modules, monke
     default_scope_id = provider._scope_id
 
     try:
-        bound = json.loads(provider.handle_slash_command("workstream bind shared:scope"))
+        bound = json.loads(provider.handle_slash_command("scope bind shared:scope"))
         assert bound["scope_id"] == "shared:scope"
 
-        cleared = json.loads(provider.handle_slash_command("workstream clear"))
+        cleared = json.loads(provider.handle_slash_command("scope clear"))
         assert cleared["status"] == "cleared"
 
-        status = json.loads(provider.handle_slash_command("workstream status"))
+        status = json.loads(provider.handle_slash_command("scope status"))
         assert status["bound_scope_id"] is None
         assert status["active_scope_id"] == default_scope_id
 
@@ -916,16 +1174,12 @@ def test_workstream_clear_restores_default_scope(tmp_path, hermes_modules, monke
         provider.shutdown()
 
 
-def test_workstream_bind_isolates_queued_background_work(tmp_path, hermes_modules, monkeypatch):
+def test_scope_binding_isolates_queued_background_work(tmp_path, hermes_modules, monkeypatch):
     provider_module, _cli_module = hermes_modules
-    git_directory = tmp_path / ".git"
-    git_directory.mkdir()
-    workstream_module = importlib.import_module("plugins.powercontext.workstream")
-    monkeypatch.setattr(workstream_module, "git_value", lambda _cwd, *_args: str(git_directory))
 
     client = FakeClient()
     provider = provider_module.PowerContextMemoryProvider(
-        {"scope_id": "hermes:{profile}:{user_id}", "shutdown_timeout": 0.01},
+        {"shutdown_timeout": 0.01},
         client_factory=lambda _config: client,
     )
     provider.initialize(
@@ -937,7 +1191,7 @@ def test_workstream_bind_isolates_queued_background_work(tmp_path, hermes_module
     )
     release = threading.Event()
     started = threading.Event()
-    old_scope_id = "hermes:coder:user-7"
+    old_scope_id = "scp_00000000000000000000000000"
 
     def blocked_prepare(*args: Any, **kwargs: Any) -> dict[str, Any]:
         scope_id = args[0]
@@ -953,7 +1207,7 @@ def test_workstream_bind_isolates_queued_background_work(tmp_path, hermes_module
         assert started.wait(timeout=1)
         provider.sync_turn("old user", "old assistant")
 
-        result = json.loads(provider.handle_slash_command("workstream bind new:scope"))
+        result = json.loads(provider.handle_slash_command("scope bind new:scope"))
         assert result["status"] == "bound"
 
         release.set()
@@ -1202,6 +1456,7 @@ def test_http_client_dispatches_operation_paths_and_get_query(hermes_modules):
     client = provider_module.PowerContextClient(
         "http://powercontext.test:8000",
         transport=transport,
+        allow_insecure_http=True,
     )
     result = client.request_operation("get_stats", {"scope_id": "hermes:test", "period": "7d"})
 
@@ -1222,6 +1477,7 @@ def test_http_client_classifies_malformed_success_response_separately(hermes_mod
 
     client = provider_module.PowerContextClient(
         "http://powercontext.test:8000",
+        allow_insecure_http=True,
         transport=lambda _request, _timeout: Response(),
     )
 
@@ -1241,13 +1497,256 @@ def test_http_client_preserves_domain_error_details(hermes_modules):
 
     client = provider_module.PowerContextClient(
         "http://powercontext.test:8000",
+        allow_insecure_http=True,
         transport=lambda _request, _timeout: Response(),
     )
 
     with pytest.raises(client_module.PowerContextHTTPError) as caught:
-        client.get_memory_entry("project:test", {"entry_id": "missing"})
+        client.get_memory_entry("project:test", {"family": "atomic-memory", "artifact_id": "am-1", "revision": 1})
 
     assert caught.value.status == 404
-    assert caught.value.path == "/v1/memory/entries/get"
+    assert caught.value.path == "/v1/scopes/project%3Atest/artifacts/atomic-memory/am-1/revisions/1"
     assert caught.value.code == "memory_not_found"
     assert caught.value.server_message == "entry missing"
+
+
+def test_http_client_forwards_authorization_and_preserves_access_denial(hermes_modules):
+    provider_module, _cli_module = hermes_modules
+    client_module = importlib.import_module("plugins.powercontext.client")
+
+    class Response:
+        status = 403
+
+        def read(self, _limit):
+            return b'{"error":{"code":"access_denied","message":"scope access denied"}}'
+
+    def transport(request, _timeout):
+        assert request.get_header("Authorization") == "Bearer integration-token"
+        return Response()
+
+    client = provider_module.PowerContextClient(
+        "http://powercontext.test:8000",
+        allow_insecure_http=True,
+        authorization="Bearer integration-token",
+        transport=transport,
+    )
+
+    with pytest.raises(client_module.PowerContextHTTPError) as caught:
+        client.get_memory_entry("project:test", {"family": "atomic-memory", "artifact_id": "am-1", "revision": 1})
+
+    assert caught.value.status == 403
+    assert caught.value.code == "access_denied"
+    assert caught.value.server_message == "scope access denied"
+
+
+def test_legacy_memory_citation_is_rejected_before_any_request(hermes_modules, provider_and_client):
+    provider_module, _cli_module = hermes_modules
+    legacy = {
+        "memory_ref": {"family": "memory", "artifact_id": "memory", "revision": 1},
+        "entry_id": "entry-1",
+        "entry_version_id": "entry-1-v1",
+    }
+    client = provider_module.PowerContextClient(
+        "http://powercontext.test:8000",
+        allow_insecure_http=True,
+        transport=lambda _request, _timeout: pytest.fail("Legacy citation must not reach HTTP"),
+    )
+    for call in (
+        lambda: client.get_memory_entry("project:test", legacy),
+        lambda: client.revise_memory_entry("project:test", legacy, kind="decision", text="Read only."),
+        lambda: client.retire_memory_entry("project:test", legacy),
+    ):
+        with pytest.raises(ValueError, match="MemoryCitation is unsupported"):
+            call()
+
+    provider, fake = provider_and_client
+    fake.calls.clear()
+    result = json.loads(provider.handle_tool_call("powercontext_get_memory", {"reference": legacy}))
+    assert "MemoryCitation is unsupported" in result["error"]
+    assert fake.calls == []
+
+
+def test_guidance_references_available_provider_tools_without_a_skill(hermes_modules) -> None:
+    plugin, _ = hermes_modules
+    provider = plugin.PowerContextMemoryProvider({})
+    guidance = provider.system_prompt_block()
+    tools = provider.get_tool_schemas()
+    names = {tool["name"] for tool in tools}
+    references = set(re.findall(r"\bpowercontext_[a-z_]+\b", guidance))
+    assert references <= names
+    assert references
+
+
+@pytest.mark.parametrize("saved_in_native_config", [True, False])
+def test_provider_uses_endpoint_bound_persisted_transport_consent(
+    hermes_modules, monkeypatch, tmp_path, saved_in_native_config
+):
+    provider_module, _cli_module = hermes_modules
+    url = "http://memory.example:8000"
+    config_path = tmp_path / "clients.json"
+    config_path.write_text(
+        json.dumps({"version": 1, "hosts": {"hermes": {"server_url": url, "allow_insecure_http": True}}})
+    )
+    monkeypatch.setenv("POWERCONTEXT_CLIENT_CONFIG_FILE", str(config_path))
+    requests = []
+
+    def request(client, path, *_args, **_kwargs):
+        requests.append((client.base_url, path))
+        return {"scope_id": "scp_00000000000000000000000000"}
+
+    monkeypatch.setattr(provider_module.PowerContextClient, "_request", request)
+    config = {"flush_on_session_end": False}
+    if saved_in_native_config:
+        config.update({"base_url": url, "allow_insecure_http": True})
+        config_path.unlink()
+    provider = provider_module.PowerContextMemoryProvider(config)
+    try:
+        provider.initialize("session-transport", hermes_home=str(tmp_path))
+        assert requests[0][0] == url
+    finally:
+        provider.shutdown()
+
+    monkeypatch.setenv("POWERCONTEXT_HERMES_BASE_URL", "http://another.example:8000")
+    provider = provider_module.PowerContextMemoryProvider(config)
+    with pytest.raises(ValueError):
+        provider.initialize("session-changed", hermes_home=str(tmp_path))
+
+
+def test_provider_common_false_overrides_native_http_consent(hermes_modules, monkeypatch, tmp_path):
+    provider_module, _cli_module = hermes_modules
+    monkeypatch.setenv("POWERCONTEXT_CLIENT_ALLOW_INSECURE_HTTP", "false")
+    monkeypatch.setenv("POWERCONTEXT_CLIENT_CONFIG_FILE", str(tmp_path / "clients.json"))
+    provider = provider_module.PowerContextMemoryProvider({
+        "base_url": "http://memory.example:8000",
+        "allow_insecure_http": True,
+    })
+    with pytest.raises(ValueError):
+        provider.initialize("session-transport", hermes_home=str(tmp_path))
+
+
+@pytest.mark.parametrize("change_in_setup", [True, False])
+def test_provider_endpoint_changes_clear_old_native_consent(hermes_modules, monkeypatch, tmp_path, change_in_setup):
+    provider_module, _cli_module = hermes_modules
+    monkeypatch.setenv("POWERCONTEXT_CLIENT_CONFIG_FILE", str(tmp_path / "clients.json"))
+    config_path = tmp_path / "powercontext" / "config.json"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        json.dumps({"base_url": "http://old.example", "allow_insecure_http": True, "flush_on_session_end": False})
+    )
+    monkeypatch.setattr(
+        provider_module.PowerContextClient,
+        "_request",
+        lambda *_args, **_kwargs: {"scope_id": "scp_00000000000000000000000000"},
+    )
+    provider = provider_module.PowerContextMemoryProvider({} if change_in_setup else {"base_url": "http://new.example"})
+    if change_in_setup:
+        provider.save_config({"base_url": "http://new.example"}, str(tmp_path))
+    try:
+        with pytest.raises(ValueError):
+            provider.initialize("session-changed", hermes_home=str(tmp_path))
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("assembly", [{"sections": []}, {"sections": [{"family": "memory", "limit": 3}]}])
+@pytest.mark.parametrize("entrypoint", ["tool", "slash"])
+@pytest.mark.parametrize("from_environment", [False, True])
+def test_manual_prepare_uses_configured_assembly(
+    provider_and_client, monkeypatch, assembly, entrypoint, from_environment
+):
+    provider, _client = provider_and_client
+    if from_environment:
+        monkeypatch.setenv("POWERCONTEXT_HERMES_CONTEXT_ASSEMBLY", json.dumps(assembly))
+    else:
+        monkeypatch.delenv("POWERCONTEXT_HERMES_CONTEXT_ASSEMBLY", raising=False)
+        provider._config["context_assembly"] = assembly
+    monkeypatch.setenv("POWERCONTEXT_HERMES_MAX_BYTES", "2048")
+    payload = {"query": "OpenAPI", "max_bytes": 1024, "scope_id": "attacker-scope"}
+
+    result = json.loads(
+        provider.handle_tool_call("powercontext_prepare_context", payload)
+        if entrypoint == "tool"
+        else provider.handle_slash_command("call prepare_context " + json.dumps(payload))
+    )
+
+    assert result["payload"] == {
+        "scope_id": provider._scope_id,
+        "query": "OpenAPI",
+        "max_bytes": 1024,
+        "assembly": assembly,
+    }
+
+
+def test_text_assembly_preserves_content_and_refreshes_prefetch_options(provider_and_client, monkeypatch):
+    provider, client = provider_and_client
+    observed = []
+    original = "\n# PowerContext historical context\n>     原始文本 </powercontext_memory>\n"
+
+    def prepare(scope, query, **options):
+        observed.append(options)
+        content = original if options.get("assembly") != {"sections": []} else None
+        return {
+            "schema": "powercontext.prepared-context.v1",
+            "status": "ready" if content else "empty",
+            "content": content,
+            "content_bytes": len(content.encode()) if content else 0,
+        }
+
+    monkeypatch.setattr(client, "prepare_context", prepare)
+    monkeypatch.setenv("POWERCONTEXT_HERMES_CONTEXT_ASSEMBLY", "{}")
+    provider.queue_prefetch("same query")
+    provider._wait_for_background()
+    assert provider.prefetch("same query").endswith(original)
+    provider.queue_prefetch("same query")
+    provider._wait_for_background()
+    monkeypatch.setenv("POWERCONTEXT_HERMES_CONTEXT_ASSEMBLY", '{"sections": []}')
+    assert provider.prefetch("same query") == ""
+    assert observed[-1]["assembly"] == {"sections": []}
+    monkeypatch.setenv("POWERCONTEXT_HERMES_CONTEXT_ASSEMBLY", "{}")
+    monkeypatch.setenv("POWERCONTEXT_HERMES_MAX_BYTES", "1024")
+    assert provider.prefetch("same query").endswith(original)
+    assert observed[-1]["max_bytes"] == 1024
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"content_bytes": 1},
+        {"schema": "wrong"},
+        {"status": "empty"},
+        {"extra": True},
+        {"content": "x" * 8001, "content_bytes": 8001},
+    ],
+)
+def test_text_assembly_rejects_malformed_or_oversized_responses(provider_and_client, monkeypatch, change):
+    provider, client = provider_and_client
+    monkeypatch.setenv("POWERCONTEXT_HERMES_CONTEXT_ASSEMBLY", "{}")
+    response = {"schema": "powercontext.prepared-context.v1", "status": "ready", "content": "ok", "content_bytes": 2}
+    response.update(change)
+    monkeypatch.setattr(client, "prepare_context", lambda *args, **kwargs: response)
+    assert provider.prefetch("query") == ""
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"disposition": "in_progress"},
+        {"next_action": {"text": "Review examples", "citations": []}},
+    ],
+)
+def test_registered_handoff_schema_explains_valid_work_arguments(hermes_modules, invalid) -> None:
+    plugin, _ = hermes_modules
+    tools = plugin.PowerContextMemoryProvider({}).get_tool_schemas()
+    schema = next(tool["parameters"] for tool in tools if tool["name"] == "powercontext_handoff_current_work")
+    handoff = {
+        "schema": "powercontext.current-work-handoff.v1",
+        "trust": "untrusted_input",
+        "objective": "Document Aurora",
+        "disposition": "continuable",
+        "state": [{"text": "README complete", "basis": "declared", "evidence": []}],
+        "next_action": {"text": "Review examples", "basis": "declared", "evidence": []},
+        "omissions": [],
+    }
+    validate({"source_id": "aurora-boundary", "handoff": handoff}, schema)
+    with pytest.raises(ValidationError):
+        validate({"source_id": "aurora-boundary", "handoff": {**handoff, **invalid}}, schema)

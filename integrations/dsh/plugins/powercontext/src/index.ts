@@ -15,7 +15,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { combineSignals, PowerContextClient } from './client.ts'
+import { PowerContextClient } from './client.ts'
 import { registerCommands } from './commands.ts'
 import { resolveConfig, type PluginConfig } from './config.ts'
 import { createDiagnosticEmitter } from './diagnostics.ts'
@@ -23,9 +23,10 @@ import { PLUGIN_NAME } from './errors.ts'
 import type { PluginRuntime } from './invoke.ts'
 import { loadPeer } from './peers.ts'
 import { runRecallPreStep, type PromptMessage } from './recall.ts'
-import { deriveScopeId } from './scope.ts'
+import { resolveScopeId } from './scope.ts'
 import { registerGuidance, registerSkill } from './skill.ts'
 import { registerTools } from './tools.ts'
+import { RuntimeStatus } from './status.ts'
 
 export const name = PLUGIN_NAME
 
@@ -40,7 +41,9 @@ export const Config = {
     validate(value: unknown) {
       try {
         const input = value && typeof value === 'object' ? value as PluginConfig : {}
-        return { value: resolveConfig(input) }
+        resolveConfig(input)
+        // Keep original inputs so runtime resolution can identify defaults and overrides.
+        return { value: input }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return { issues: [{ message }] }
@@ -51,7 +54,10 @@ export const Config = {
 
 type CreateUserMessage = (input: {
   content: Array<{ type: 'text'; text: string }>
-  source: { kind: 'plugin'; plugin: string }
+  source: {
+    kind: 'plugin'; plugin: string; form: 'snapshot'
+    sections: Array<{ name: string; text: string }>
+  }
 }) => unknown
 
 type DefineTool = (definition: Record<string, unknown>) => unknown
@@ -60,19 +66,21 @@ function createRuntime(ctx: Context, config: PluginConfig): PluginRuntime {
   const resolved = resolveConfig(config)
   const client = new PowerContextClient({
     baseUrl: resolved.baseUrl,
+    allowInsecureHttp: resolved.allowInsecureHttp,
     authorization: resolved.authorization,
     requestTimeoutMs: resolved.requestTimeoutMs,
   })
   const emitDiagnostic = createDiagnosticEmitter((line) => ctx.logger.warn(line))
   return {
+    status: new RuntimeStatus(),
     client,
     config: resolved,
-    resolveScope: (cwd) => deriveScopeId(cwd, { configuredScopeId: resolved.scopeId }),
+    resolveScope: (cwd, signal) => resolveScopeId(client, cwd, resolved.scopeId, signal),
     log: (event) => {
       const line = JSON.stringify({ component: 'powercontext.dsh', ...event })
       const quiet = event.outcome === 'ready' || event.outcome === 'ok' || event.outcome === 'empty'
-      if (quiet) ctx.logger.debug?.(line)
-      else emitDiagnostic({ component: 'powercontext.dsh', ...event })
+      if (quiet) return ctx.logger.debug?.(line)
+      return emitDiagnostic({ component: 'powercontext.dsh', ...event })
     },
   }
 }
@@ -84,23 +92,25 @@ function registerRecall(ctx: Context, runtime: PluginRuntime, createUserMessage:
     turn: number
     signal: AbortSignal
   }, next: () => Promise<{ kind: string; messages?: unknown[] }>) => {
-    const deadline = AbortSignal.timeout(runtime.config.timeoutMs)
-    const signal = combineSignals([payload.signal, deadline])
     return runRecallPreStep({
       messages: payload.messages,
       next,
       cwd: payload.agent.session.header.cwd,
       sessionId: payload.agent.session.header.id,
       turnId: String(payload.turn),
-      signal,
+      signal: payload.signal,
       client: runtime.client,
       config: runtime.config,
       resolveScope: runtime.resolveScope,
       wrapContent: (text) => createUserMessage({
         content: [{ type: 'text', text }],
-        source: { kind: 'plugin', plugin: PLUGIN_NAME },
+        source: {
+          kind: 'plugin', plugin: PLUGIN_NAME, form: 'snapshot',
+          sections: [{ name: 'PowerContext', text }],
+        },
       }),
       log: runtime.log,
+      status: runtime.status,
     })
   }) as never)
 }

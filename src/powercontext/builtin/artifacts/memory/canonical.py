@@ -26,8 +26,6 @@ from typing import Literal, cast
 import rfc8785
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
-from powercontext.builtin.artifacts.memory.models import MemoryContent
-
 _ENTRY_HASH_DOMAIN = b"powercontext:entry-content:v1\0"
 _EMBEDDING_HASH_DOMAIN = b"powercontext:embedding-content:v1\0"
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -35,6 +33,7 @@ _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 
 class _CanonicalValueError(ValueError):
     def __init__(self, code: str, detail: object | None = None) -> None:
+        self.code = code
         messages = {
             "text-too-long": "memory entry text must not exceed 8192 UTF-8 bytes",
             "reason-too-long": "memory change reason must not exceed 512 Unicode code points",
@@ -54,12 +53,21 @@ class _CanonicalValueError(ValueError):
 
 class _CanonicalTypeError(TypeError):
     def __init__(self, code: str, detail: object | None = None) -> None:
+        self.code = code
         messages = {
             "string": f"{detail} must be a string",
             "json-key": "canonical JSON object keys must be strings",
             "json-value": f"value of type {detail} is not JSON-compatible",
         }
         super().__init__(messages[code])
+
+
+def canonical_error_code(error: Exception) -> str | None:
+    """Return the stable code for an error raised by canonical validation."""
+
+    if isinstance(error, (_CanonicalValueError, _CanonicalTypeError)):
+        return error.code
+    return None
 
 
 def canonical_json(value: object) -> bytes:
@@ -75,6 +83,18 @@ def normalize_text(value: str) -> str:
     if len(normalized.encode("utf-8")) > 8192:
         raise _CanonicalValueError("text-too-long")
     return normalized
+
+
+def normalize_query(value: str) -> str:
+    """Normalize one transient retrieval query.
+
+    A query is never persisted, so the durable entry body's UTF-8 byte bound does not
+    apply to it. Callers that expose a query length limit enforce it on their own terms:
+    the HTTP contract states its bound in characters, and applying the storage-layer byte
+    bound here would reject queries the contract accepts.
+    """
+
+    return _normalize_non_empty_string(value, "memory search query")
 
 
 def normalize_kind(value: str) -> str:
@@ -160,45 +180,6 @@ def entry_content_hash(
         artifact_refs=artifact_refs,
     )
     return sha256(_ENTRY_HASH_DOMAIN + content).hexdigest()
-
-
-def memory_content_bytes(content: MemoryContent) -> bytes:
-    """Return canonical bytes for a complete Memory Artifact Revision."""
-
-    manifest_entries = tuple(
-        {
-            "entry_id": validate_identifier(entry.entry_id),
-            "entry_version_id": validate_identifier(entry.entry_version_id),
-            "entry_content_hash": validate_content_hash(entry.entry_content_hash),
-            "state": entry.state,
-        }
-        for entry in content.manifest.entries
-    )
-    changes = tuple(
-        {
-            "op": change.op,
-            "entry_id": validate_identifier(change.entry_id),
-            "from_entry_version_id": (
-                None if change.from_entry_version_id is None else validate_identifier(change.from_entry_version_id)
-            ),
-            "to_entry_version_id": (
-                None if change.to_entry_version_id is None else validate_identifier(change.to_entry_version_id)
-            ),
-            "reason": normalize_reason(change.reason),
-        }
-        for change in content.changes
-    )
-    return canonical_json({
-        "schema": content.schema_version,
-        "manifest": {"format": content.manifest.format, "entries": manifest_entries},
-        "changes": changes,
-    })
-
-
-def memory_content_hash(content: MemoryContent) -> str:
-    """Hash the complete canonical Memory Artifact content."""
-
-    return sha256(memory_content_bytes(content)).hexdigest()
 
 
 def embedding_content_hash(

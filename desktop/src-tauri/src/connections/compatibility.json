@@ -1,0 +1,21 @@
+[
+  {
+    "id": "sqlite-atomic-f702c041-v1",
+    "serverCommit": "f702c0418d69e3072e1ec2fa657e0df81e8e51b4",
+    "contractSha256": "5d8bbad951234b05e3174f1b9113e0ffe066ac968abbe53ac2456b2375e406d3",
+    "artifactSha256": "4fe64b868a2e214316a088574d8d4023d9b9679ec42029e2d13502121e6aade9",
+    "operations": [
+      "get_liveness",
+      "get_readiness",
+      "get_access_principal",
+      "get_capabilities",
+      "list_scopes",
+      "get_scope",
+      "get_default_scope",
+      "remember_memory",
+      "search_memory",
+      "get_artifact_revision"
+    ],
+    "evidence": "desktop/VALIDATION.md#atomic-memory-protocol-qualification"
+  }
+]

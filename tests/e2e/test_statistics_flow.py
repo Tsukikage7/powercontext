@@ -23,7 +23,6 @@ from uuid import uuid4
 import httpx
 import pytest
 from pydantic import SecretStr
-from pydantic_ai.models.test import TestModel
 from pytest import MonkeyPatch
 
 from powercontext.builtin.inference import character_token_estimator
@@ -45,7 +44,8 @@ from powercontext.http import (
     StatsPeriod,
 )
 from powercontext.server.factory import create_server_app
-from powercontext.server.settings import BearerAuthConfig, McpConfig, ServerSettings
+from powercontext.server.settings import AccessControlConfig, BearerAuthConfig, McpConfig, ServerSettings
+from tests.e2e.atomic_memory_models import independent_atomic_memory_model
 
 _AUTH_TOKEN = "statistics-e2e-token"  # noqa: S105 - non-secret test credential.
 _OCEANBASE_URL = os.environ.get("POWERCONTEXT_TEST_OCEANBASE_URL")
@@ -70,7 +70,8 @@ def _settings(database_kind: str, database: Path) -> ServerSettings:
         persistence = SQLiteConfig(url=f"sqlite+aiosqlite:///{database}")
     return ServerSettings(
         database=persistence,
-        auth=BearerAuthConfig(enabled=True, token=SecretStr(_AUTH_TOKEN)),
+        auth=BearerAuthConfig(token=SecretStr(_AUTH_TOKEN)),
+        access=AccessControlConfig(mode="enforced"),
         inference=InferenceConfig(generation_model="test"),
         mcp=McpConfig(enabled=False),
     )
@@ -98,6 +99,13 @@ def _client(app) -> tuple[httpx.AsyncClient, PowerContextClient]:
     )
 
 
+def _stats_request(scope_id: str, period: StatsPeriod) -> GetStatsRequest:
+    return GetStatsRequest.model_validate({
+        "selection": {"mode": "exact", "scope_ids": [scope_id]},
+        "period": period,
+    })
+
+
 @pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
 def test_statistics_survive_the_authenticated_http_business_flow_and_restart(
     database_kind: str,
@@ -107,27 +115,24 @@ def test_statistics_survive_the_authenticated_http_business_flow_and_restart(
     database = tmp_path / "statistics-flow.db"
     settings = _settings(database_kind, database)
     scope_id = f"statistics-e2e-{uuid4()}"
-    model_output = json.dumps({
-        "candidates": [
-            {
-                "intent": "add",
-                "kind": "decision",
-                "text": _MEMORY_TEXT,
-                "evidence_ids": ["source:0"],
-                "reason": "Captured by the statistics end-to-end flow.",
-            }
-        ]
-    })
     monkeypatch.setattr(
         "pydantic_ai.models.infer_model",
-        lambda _: TestModel(custom_output_text=model_output),
+        lambda _, **_kwargs: independent_atomic_memory_model(_MEMORY_TEXT),
     )
     first_app = create_server_app(settings=settings)
 
     async def scenario() -> None:
+        nonlocal scope_id
         async with first_app.router.lifespan_context(first_app):
             transport, client = _client(first_app)
             async with transport:
+                created_scope = await transport.post(
+                    "/v1/scopes",
+                    json={"title": "Statistics", "summary": "Statistics flow", "idempotency_key": scope_id},
+                    headers={"Authorization": f"Bearer {_AUTH_TOKEN}"},
+                )
+                assert created_scope.status_code == 201
+                scope_id = created_scope.json()["scope_id"]
                 source = await client.capture_content_source(
                     CaptureContentSourceRequest(
                         scope_id=scope_id,
@@ -137,12 +142,29 @@ def test_statistics_survive_the_authenticated_http_business_flow_and_restart(
                     )
                 )
                 flush = await client.flush_memory(FlushMemoryRequest(scope_id=scope_id))
-                await client.remember_memory(
+                remembered = await client.remember_memory(
                     RememberMemoryRequest(
                         scope_id=scope_id,
                         kind="project_note",
                         text="Keep Memory kinds open for product-specific entries.",
                     )
+                )
+
+                manual_ref = remembered.records[0].artifact
+                manual_artifact = await client.get_artifact_revision(
+                    scope_id, manual_ref.family, manual_ref.artifact_id, manual_ref.revision
+                )
+                assert len(manual_artifact.sources) == 1
+                manual_source = await client.get_source(
+                    scope_id, manual_artifact.sources[0].source_type, manual_artifact.sources[0].source_id
+                )
+                assert manual_source.content == {
+                    "schema": "powercontext.atomic-memory.v1",
+                    "kind": "project_note",
+                    "text": "Keep Memory kinds open for product-specific entries.",
+                }
+                manual_source_text = json.dumps(
+                    manual_source.content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 )
 
                 approved_candidate = await client.propose_experience(
@@ -195,28 +217,32 @@ def test_statistics_survive_the_authenticated_http_business_flow_and_restart(
                 prepared = await client.prepare_context(
                     PrepareContextRequest(scope_id=scope_id, query="statistics contract")
                 )
-                non_comparable = await client.prepare_context(
+                manual_prepared = await client.prepare_context(
                     PrepareContextRequest(scope_id=scope_id, query="Memory kinds open")
                 )
                 empty = await client.prepare_context(
                     PrepareContextRequest(scope_id=scope_id, query="unrelated-zebra-phrase")
                 )
-                first = await client.get_stats(GetStatsRequest(scope_id=scope_id, period=StatsPeriod.TODAY))
+                first = await client.get_stats(_stats_request(scope_id, StatsPeriod.TODAY))
 
-                unauthorized = await transport.get("/v1/stats", params={"scope_id": scope_id})
-                raw = await transport.get(
+                unauthorized = await transport.post(
                     "/v1/stats",
-                    params={"scope_id": scope_id, "period": "today"},
+                    json={"selection": {"mode": "exact", "scope_ids": [scope_id]}},
+                )
+                raw = await transport.post(
+                    "/v1/stats",
+                    json={"selection": {"mode": "exact", "scope_ids": [scope_id]}, "period": "today"},
                     headers={"Authorization": f"Bearer {_AUTH_TOKEN}"},
                 )
 
-        assert flush.memory is not None
+        assert flush.memory is None
+        assert flush.processed_source_count == 1
         assert prepared.status == "ready"
         assert prepared.content is not None
         assert '"kind":"experience"' in prepared.content
-        assert '"entry_id":"' in prepared.content
+        assert '"family":"atomic-memory"' in prepared.content
         assert _MEMORY_TEXT in prepared.content
-        assert non_comparable.status == "ready"
+        assert manual_prepared.status == "ready"
         assert empty.status == "empty"
         assert unauthorized.status_code == 401
         assert raw.status_code == 200
@@ -227,17 +253,18 @@ def test_statistics_survive_the_authenticated_http_business_flow_and_restart(
         first_body = first.model_dump(mode="json", by_alias=True)
         assert raw_body.pop("as_of") >= first_body.pop("as_of")
         assert raw_body == first_body
-        _assert_first_snapshot(first, prepared.content)
+        assert manual_prepared.content is not None
+        _assert_first_snapshot(first, prepared.content, manual_prepared.content, manual_source_text)
 
         second_app = create_server_app(settings=settings)
         async with second_app.router.lifespan_context(second_app):
             transport, client = _client(second_app)
             async with transport:
-                restored = await client.get_stats(GetStatsRequest(scope_id=scope_id, period=StatsPeriod.FIELD_7D))
+                restored = await client.get_stats(_stats_request(scope_id, StatsPeriod.FIELD_7D))
                 prepared_again = await client.prepare_context(
                     PrepareContextRequest(scope_id=scope_id, query="statistics contract")
                 )
-                updated = await client.get_stats(GetStatsRequest(scope_id=scope_id, period=StatsPeriod.FIELD_7D))
+                updated = await client.get_stats(_stats_request(scope_id, StatsPeriod.FIELD_7D))
 
         assert restored.inventory == first.inventory
         assert restored.usage.totals == first.usage.totals
@@ -249,23 +276,38 @@ def test_statistics_survive_the_authenticated_http_business_flow_and_restart(
         assert prepared_again.content == prepared.content
         assert updated.recall.totals.preparations == 4
         assert updated.recall.totals.ready_preparations == 3
-        assert updated.recall.totals.comparable_preparations == 2
-        assert updated.recall.totals.baseline_tokens == first.recall.totals.baseline_tokens * 2
-        assert updated.recall.totals.recalled_tokens == first.recall.totals.recalled_tokens * 2
-        assert updated.recall.totals.token_reduction == first.recall.totals.token_reduction * 2
+        assert updated.recall.totals.comparable_preparations == 3
+        estimator = character_token_estimator()
+        assert updated.recall.totals.baseline_tokens == (
+            first.recall.totals.baseline_tokens + estimator.estimate(_SOURCE_CONTENT)
+        )
+        assert updated.recall.totals.recalled_tokens == (
+            first.recall.totals.recalled_tokens + estimator.estimate(prepared.content)
+        )
+        assert updated.recall.totals.token_reduction == (
+            first.recall.totals.token_reduction
+            + estimator.estimate(_SOURCE_CONTENT)
+            - estimator.estimate(prepared.content)
+        )
 
     asyncio.run(scenario())
 
 
-def _assert_first_snapshot(statistics: ScopedStats, prepared_content: str) -> None:
+def _assert_first_snapshot(
+    statistics: ScopedStats, prepared_content: str, manual_content: str, manual_source_text: str
+) -> None:
+    # Captured source 1 was processed. Direct Remember adds a lineage-only
+    # system Source at journal position 2; captured source 3 is also beyond
+    # the Memory cursor. Inventory counts that journal coverage, including
+    # the system Source, while recall compares its exact direct-write lineage.
     assert statistics.inventory.sources.model_dump() == {
-        "total": 2,
+        "total": 3,
         "memory_processed": 1,
-        "memory_pending": 1,
+        "memory_pending": 2,
     }
     assert [(item.family, item.total) for item in statistics.inventory.artifacts.by_family] == [
+        ("atomic-memory", 2),
         ("experience", 1),
-        ("memory", 1),
     ]
     assert statistics.inventory.candidates.model_dump(exclude={"by_family"}) == {
         "total": 3,
@@ -278,7 +320,7 @@ def _assert_first_snapshot(statistics: ScopedStats, prepared_content: str) -> No
         ("project_note", 1, 1),
     ]
 
-    assert statistics.usage.totals.generation.requests == 1
+    assert statistics.usage.totals.generation.requests == 2
     assert statistics.usage.totals.generation.input_tokens is not None
     assert statistics.usage.totals.generation.output_tokens is not None
     assert statistics.usage.totals.embedding.requests == 0
@@ -292,8 +334,10 @@ def _assert_first_snapshot(statistics: ScopedStats, prepared_content: str) -> No
     assert recall.estimator.model_dump() == estimator.profile.model_dump()
     assert recall.totals.preparations == 3
     assert recall.totals.ready_preparations == 2
-    assert recall.totals.comparable_preparations == 1
-    assert recall.totals.baseline_tokens == estimator.estimate(_SOURCE_CONTENT)
-    assert recall.totals.recalled_tokens == estimator.estimate(prepared_content)
+    assert recall.totals.comparable_preparations == 2
+    assert recall.totals.baseline_tokens == (
+        estimator.estimate(_SOURCE_CONTENT) + estimator.estimate(manual_source_text)
+    )
+    assert recall.totals.recalled_tokens == (estimator.estimate(prepared_content) + estimator.estimate(manual_content))
     assert recall.totals.token_reduction == recall.totals.baseline_tokens - recall.totals.recalled_tokens
     assert recall.totals.token_reduction > 0
