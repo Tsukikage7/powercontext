@@ -1,0 +1,28 @@
+{
+  "title": "Connect Agents",
+  "pages": [
+    "index",
+    "---Plugins, MCP & Skills---",
+    "agent-plugin",
+    "---Agent hosts---",
+    "codex",
+    "claude-code",
+    "dsh",
+    "kimi-code",
+    "hermes",
+    "openclaw",
+    "opencode",
+    "pi",
+    "workbuddy",
+    "zcode",
+    "---Workflow platforms---",
+    "dify",
+    "---Python Agent frameworks---",
+    "pydantic-ai",
+    "langchain",
+    "langgraph",
+    "---Evaluation and capabilities---",
+    "evaluation",
+    "capabilities"
+  ]
+}

@@ -1,7 +1,8 @@
 # 使用 Builtin Memory layer
 
-Builtin Memory family 将可复用 entry 保存为不可变 Artifact revision。`builtin` extra 包含完整 runtime 和两种受支持的
-database integration。远程应用应采用[远程访问文档](remote-access-implementation.md)说明的 Server API。
+Builtin Memory 把每条可长期保留的事实、偏好或决策保存为一个独立的 `atomic-memory` Artifact。每条记忆都有自己的
+identity、revision、状态、tag 和访问关系。`builtin` extra 包含完整 runtime 和两种受支持的 database integration。
+远程应用应采用[远程访问文档](remote-access-implementation.md)说明的 Server API。
 
 ## 选择 database
 
@@ -15,13 +16,9 @@ SQLite 是默认选择。`open_builtin_runtime()` 持有所选 database profile�
 `BuiltinRuntime` interface：
 
 ```python
-from powercontext.builtin.artifacts.memory import MemoryEntryInput
+from powercontext.builtin.artifacts.atomic_memory import AtomicMemoryContent
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
-from powercontext.builtin.runtime import (
-    BuiltinConfig,
-    RememberMemoryRequest,
-    open_builtin_runtime,
-)
+from powercontext.builtin.runtime import BuiltinConfig, open_builtin_runtime
 
 
 async def save_note() -> None:
@@ -29,64 +26,62 @@ async def save_note() -> None:
         database=SQLiteConfig(url="sqlite+aiosqlite:///powercontext.db")
     )
     async with open_builtin_runtime(config) as runtime:
-        result = await runtime.memory.for_scope("project-alpha").remember(
-            RememberMemoryRequest(
-                entries=(
-                    MemoryEntryInput(
-                        kind="decision",
-                        text="Use one composition root for the process.",
-                    ),
-                )
-            )
+        assert runtime.atomic_memory is not None
+        result = await runtime.atomic_memory.for_scope("project-alpha").create(
+            (AtomicMemoryContent(kind="decision", text="Use one composition root for the process."),)
         )
-        assert result.memory_ref.revision == 1
+        assert result.primary.ref.revision == 1
 ```
 
-scope ID 在数据库中选择相互隔离的 Source journal、Memory lifecycle 和 Trigger cursor。
+scope ID 在数据库中选择相互隔离的 Source journal、记忆集合和 Trigger cursor。
 
-## 写入和演进 entry
+## 写入、提取和变更记忆
 
-`ScopedMemoryApplication.remember()` 接受显式的 `MemoryEntryInput`。基于 Source 的 extraction 使用另一条路径：
-先 capture Source，再通过已经配置 candidate pipeline 的 Runtime flush 待处理 Source window。
+`ScopedAtomicMemoryApplication.create()` 以全有或全无的方式批量写入显式记忆，每个输入对应返回一条记录。基于 Source
+的提取走另一条路径：先 capture Source，再调用 `flush()`，由已配置的提取 pipeline 处理待处理的 Source window。
+`cursor()` 返回已处理到的 Source 位置。
 
-result 包含新的不可变 Memory reference 和发生变化的 entry。后续 mutation 直接使用它的 citation：
+每条记忆独立变更。`forget()` 让一条记忆失效，`merge()` 用一条新记忆替换多条旧记忆。`forget()` 要求传入预期的内容
+revision 和状态版本，`merge()` 要求传入调用方读到的精确记录，调用方持有的数据过期时操作会失败，不会覆盖并发修改。
+`restore()` 使用 `preview_restoration()` 返回的 token 执行恢复：
 
 ```python
-from powercontext.builtin.runtime import ReviseMemoryEntryRequest
-
-memory = runtime.memory.for_scope("project-alpha")
-entries = await memory.list()
-current = entries.entries[0]
-revised = await memory.revise(
-    ReviseMemoryEntryRequest(
-        citation=current.citation,
-        kind=current.entry.kind,
-        text="Use PowerContext as the only composition root.",
-        reason="Clarify ownership.",
-    )
+memory = runtime.atomic_memory.for_scope("project-alpha")
+current = (await memory.list()).items[0]
+await memory.forget(
+    current.ref.artifact_id,
+    expected_revision=current.ref.revision,
+    expected_state_version=current.state.state_version,
 )
 ```
 
-`retire()` 将 entry 标记为 inactive，但不删除不可变 content。`changes()` 返回紧凑的 revision change。
-expected revision 和 citation 保留 optimistic concurrency，调用方无需重新构造 reference。
+`list()` 按状态分页列出记忆，`get()` 读取一条记忆，也可以指定精确 revision。
 
-## 检索、展开与引用
+## 检索
 
-SQLite 和 OceanBase 都会初始化全文索引，因此不配置 embedding model 也可以检索：
+SQLite 和 OceanBase 都会初始化全文索引，因此不配置 embedding model 也能检索：
 
 ```python
-from powercontext.builtin.runtime import SearchMemoryRequest
-
-result = await runtime.memory.for_scope("project-alpha").search(
-    SearchMemoryRequest(query="composition root", mode="fts")
-)
+result = await runtime.atomic_memory.for_scope("project-alpha").search("composition root", mode="text")
 ```
 
-每个 hit 都包含参与排序的精确 Memory revision、entry identity 和 entry version。Runtime 的 list 和 exact-read
-operation 返回相同的 citation 字段。
+每个 hit 都标明参与排序的精确记忆 revision。`mode="auto"` 会选择当前可用的最强模式，并可在 query embedding
+暂时不可用时回退到文本检索。显式请求 `vector` 或 `hybrid` 时，如果 profile 没有提供相应能力，操作会失败。
 
-`mode="auto"` 会选择当前可用的最强模式，并可在 query embedding 暂时不可用时回退到 FTS。显式请求 `vector`
-或 `hybrid` 时，如果 profile 没有提供相应能力，操作会失败。
+## 旧 Memory HTTP 操作
+
+Server 保留五个旧入口，每个都转换为 Atomic Memory 操作：
+
+| 操作 | 行为 |
+| --- | --- |
+| `POST /v1/memory/remember` | 创建一条记忆；带 `expected_revision` 的请求会被拒绝。 |
+| `POST /v1/memory/search` | 检索有效记忆；`fts` 映射为文本检索。 |
+| `POST /v1/memory/entries/list` | 列出记忆；`include_inactive` 会加入已遗忘、已合并和已退役的记忆。 |
+| `POST /v1/memory/entries/get` | 按旧 `target` 的集合 ID 和 entry ID 读取迁移后的记忆。 |
+| `POST /v1/memory/flush` | 处理下一个 Source window。 |
+
+集合 revision、citation、capacity、changes、revise、retire、entry tag 以及 `memory` 访问目标在 Atomic Memory 中
+没有对应语义，会在执行任何操作前返回 `422 legacy_memory_operation_unsupported`。
 
 ## 启用 SQLite 向量检索
 
@@ -104,12 +99,9 @@ async with open_builtin_runtime(
     ...
 ```
 
-SQLite profile 会组合 FTS5 和 sqlite-vec strategy，并通过 Memory capabilities 报告 `fts`、`vector` 和 `hybrid`。持久化
-projection 与 query vector 必须使用同一个 `EmbeddingProfile`，包括 model name、dimension、distance 和
-normalization。更换 profile 后，应先重建 projection，再恢复 vector search。
-
-调用 `MemoryService.rebuild_projections()` 可以从权威 Memory revision 重建派生检索数据。revision 和 entry 表
-始终是事实来源。
+SQLite profile 会组合 FTS5 和 sqlite-vec strategy，并报告 `text`、`vector` 和 `hybrid` 检索模式。持久化 projection
+与 query vector 必须使用同一个 `EmbeddingProfile`，包括 model name、dimension、distance 和 normalization。
+更换 profile 后，应先重建派生检索索引，再恢复 vector search。Artifact revision 和状态始终是事实来源。
 
 ## 使用 OceanBase 持久化
 
@@ -131,7 +123,7 @@ async with open_builtin_runtime(
     BuiltinConfig(database=config),
     embedding_model=embedding_model,
 ) as runtime:
-    memory = runtime.memory.for_scope("project-alpha")
+    memory = runtime.atomic_memory.for_scope("project-alpha")
 ```
 
 OceanBase profile 与 SQLite 使用相同的 index 组合方式。全文 strategy 始终可用；提供 embedding model 后，会增加
@@ -144,7 +136,7 @@ OceanBase profile 与 SQLite 使用相同的 index 组合方式。全文 strateg
 
 - 所选 profile 能够成功打开并完成初始化；
 - 每个 tenant 或 project 映射到预期的 scope ID；
-- 定时 extraction 已经配置 candidate pipeline；
+- 定时 extraction 已经配置提取 pipeline；
 - SQLite vector search 配置了匹配的 embedding model；
 - OceanBase vector search 配置了匹配的 embedding model；
 - capability response 与实际初始化的 index 一致；

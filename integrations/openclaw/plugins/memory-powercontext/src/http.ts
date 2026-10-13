@@ -16,6 +16,7 @@
 
 
 import type { PowerContextConfig } from "./config.js";
+import { normalizeServerUrl } from "./transport.js";
 
 export class PowerContextRequestError extends Error {
   readonly status?: number;
@@ -35,15 +36,17 @@ export type PowerContextClient = ReturnType<typeof createPowerContextClient>;
 
 export function createPowerContextClient(getConfig: () => PowerContextConfig) {
   async function request<T>(
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "PUT",
     path: string,
     body?: Record<string, unknown>,
     signal?: AbortSignal,
-  ): Promise<T> {
+    extraHeaders?: Record<string, string>,
+  ): Promise<{ data: T; etag: string | null }> {
     const config = getConfig();
     if (!config.endpoint) {
       throw new PowerContextRequestError(path, "PowerContext endpoint is not configured");
     }
+    const endpoint = normalizeServerUrl(config.endpoint, config.allowInsecureHttp);
     const controller = new AbortController();
     const abort = () => controller.abort();
     signal?.addEventListener("abort", abort, { once: true });
@@ -57,14 +60,15 @@ export function createPowerContextClient(getConfig: () => PowerContextConfig) {
     }, config.timeoutMs);
     try {
       const token = process.env[config.tokenEnv];
-      const headers: Record<string, string> = { "content-type": "application/json" };
+      const headers: Record<string, string> = { "content-type": "application/json", ...extraHeaders };
       if (token) {
         headers.authorization = `Bearer ${token}`;
       }
       let response: Response;
       try {
-        response = await fetch(`${config.endpoint}${path}`, {
+        response = await fetch(`${endpoint}${path}`, {
           method,
+          redirect: "manual",
           headers,
           ...(body ? { body: JSON.stringify(body) } : {}),
           signal: controller.signal,
@@ -104,7 +108,7 @@ export function createPowerContextClient(getConfig: () => PowerContextConfig) {
             : undefined;
         throw new PowerContextRequestError(path, detail, response.status, code);
       }
-      return payload as T;
+      return { data: payload as T, etag: response.headers.get("etag") };
     } catch (error) {
       if (error instanceof PowerContextRequestError) {
         throw error;
@@ -117,11 +121,17 @@ export function createPowerContextClient(getConfig: () => PowerContextConfig) {
   }
 
   return {
-    get<T>(path: string, signal?: AbortSignal) {
+    getResponse<T>(path: string, signal?: AbortSignal) {
       return request<T>("GET", path, undefined, signal);
     },
+    put<T>(path: string, body: Record<string, unknown>, ifMatch: string, signal?: AbortSignal) {
+      return request<T>("PUT", path, body, signal, { "If-Match": ifMatch }).then((result) => result.data);
+    },
+    get<T>(path: string, signal?: AbortSignal) {
+      return request<T>("GET", path, undefined, signal).then((result) => result.data);
+    },
     post<T>(path: string, body: Record<string, unknown>, signal?: AbortSignal) {
-      return request<T>("POST", path, body, signal);
+      return request<T>("POST", path, body, signal).then((result) => result.data);
     },
   };
 }

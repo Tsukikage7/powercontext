@@ -18,65 +18,59 @@ from typing import Any, ClassVar
 
 from powercontext.http import (
     ArtifactReference,
+    AtomicMemoryRecord,
+    AtomicMemorySearchHit,
+    AtomicMemorySearchMode,
+    AtomicMemoryState,
     CaptureContentSourceResponse,
     CaptureStatus,
     FlushMemoryResponse,
     FlushStatus,
-    MemoryCitation,
-    MemoryEntry,
-    MemoryEntryState,
-    MemoryMatchedBy,
     MemoryMutationResponse,
-    MemoryUsedSearchMode,
     PreparedContext,
-    SearchMemoryHit,
+    ScopeDescriptor,
     SearchMemoryResponse,
     SourceReference,
 )
 
 
 def artifact(revision: int = 7) -> ArtifactReference:
-    return ArtifactReference(family="memory", artifact_id="project-memory", revision=revision)
+    return ArtifactReference(family="atomic-memory", artifact_id="project-memory", revision=revision)
 
 
 def search_response() -> SearchMemoryResponse:
-    memory = artifact()
     return SearchMemoryResponse(
-        memory=memory,
-        mode=MemoryUsedSearchMode.FTS,
+        mode=AtomicMemorySearchMode.TEXT,
         hits=[
-            SearchMemoryHit(
-                citation=MemoryCitation(
-                    memory_ref=memory,
-                    entry_id="entry-1",
-                    entry_version_id="entry-version-1",
+            AtomicMemorySearchHit.model_validate({
+                "memory": AtomicMemoryRecord(
+                    artifact=artifact(),
+                    kind="fact",
+                    text="Keep the public response intact.",
+                    state=AtomicMemoryState.ACTIVE,
+                    state_version=0,
+                    merged_into_id=None,
                 ),
-                text="Keep the public response intact.",
-                score=0.875,
-                matched_by=[MemoryMatchedBy.FTS],
-            )
+                "score": 0.875,
+                "matched_by": ["text"],
+            })
         ],
     )
 
 
 def remember_response() -> MemoryMutationResponse:
-    memory = artifact(revision=8)
-    citation = MemoryCitation(
-        memory_ref=memory,
-        entry_id="entry-2",
-        entry_version_id="entry-version-2",
-    )
     return MemoryMutationResponse(
-        memory=memory,
-        entry=MemoryEntry(
-            citation=citation,
-            version=1,
-            kind="decision",
-            text="Use the public client.",
-            state=MemoryEntryState.ACTIVE,
-            source_refs=[],
-            artifact_refs=[],
-        ),
+        changed=True,
+        records=[
+            AtomicMemoryRecord(
+                artifact=ArtifactReference(family="atomic-memory", artifact_id="remembered-memory", revision=1),
+                kind="decision",
+                text="Use the public client.",
+                state=AtomicMemoryState.ACTIVE,
+                state_version=0,
+                merged_into_id=None,
+            )
+        ],
     )
 
 
@@ -87,6 +81,17 @@ def prepared_response(content: str | None = "Prepared memory evidence.") -> Prep
         "content": content,
         "content_bytes": len((content or "").encode()),
     })
+
+
+def scope_descriptor(scope_id: str) -> ScopeDescriptor:
+    return ScopeDescriptor(
+        scope_id=scope_id,
+        title="Test Scope",
+        summary="Scope returned by the recording client.",
+        context_references=[],
+        external_references=[],
+        version=1,
+    )
 
 
 class RecordingClient:
@@ -100,6 +105,7 @@ class RecordingClient:
     flush_error: ClassVar[Exception | None] = None
     capture_position_offset: ClassVar[int] = 0
     flush_cursors: ClassVar[tuple[int, ...] | None] = None
+    default_scope_id: ClassVar[str] = "server:default"
 
     def __init__(
         self,
@@ -107,11 +113,14 @@ class RecordingClient:
         *,
         token: str | None = None,
         timeout: float = 10,
+        allow_insecure_http: bool = False,
     ) -> None:
         self.base_url = base_url
         self.token = token
         self.timeout = timeout
+        self.allow_insecure_http = allow_insecure_http
         self.closed = False
+        self.resolve_scope_requests: list[Any] = []
         self.search_requests: list[Any] = []
         self.remember_requests: list[Any] = []
         self.prepare_requests: list[Any] = []
@@ -130,6 +139,7 @@ class RecordingClient:
         cls.flush_error = None
         cls.capture_position_offset = 0
         cls.flush_cursors = None
+        cls.default_scope_id = "server:default"
 
     async def __aenter__(self) -> RecordingClient:
         return self
@@ -137,6 +147,10 @@ class RecordingClient:
     async def __aexit__(self, *exc_info: object) -> None:
         del exc_info
         self.closed = True
+
+    async def resolve_scope_binding(self, request: Any) -> ScopeDescriptor:
+        self.resolve_scope_requests.append(request)
+        return scope_descriptor(request.explicit_scope_id or type(self).default_scope_id)
 
     async def search_memory(self, request: Any) -> Any:
         self.search_requests.append(request)

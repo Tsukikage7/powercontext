@@ -15,6 +15,7 @@
 """Scoped product statistics."""
 
 from powercontext.builtin.statistics.models import (
+    MAX_RECURRENCE_TOP_REVISIONS,
     ArtifactInventoryStatistics,
     CandidateFamilyCount,
     CandidateInventoryStatistics,
@@ -29,11 +30,15 @@ from powercontext.builtin.statistics.models import (
     ModelUsagePurposeBreakdown,
     ModelUsageStatistics,
     ModelUsageValue,
+    RecallEffortMeasurement,
     RecallTokenDay,
     RecallTokenMeasurement,
     RecallTokenStatistics,
     RecallTokenValue,
+    RecurrenceStatistics,
+    RecurrenceStreak,
     ResolvedUsagePeriod,
+    ScopeStatistics,
     SourceInventoryStatistics,
     Statistics,
     StatisticsPeriod,
@@ -41,6 +46,7 @@ from powercontext.builtin.statistics.models import (
 )
 
 __all__ = [
+    "MAX_RECURRENCE_TOP_REVISIONS",
     "ArtifactInventoryStatistics",
     "CandidateFamilyCount",
     "CandidateInventoryStatistics",
@@ -55,11 +61,15 @@ __all__ = [
     "ModelUsagePurposeBreakdown",
     "ModelUsageStatistics",
     "ModelUsageValue",
+    "RecallEffortMeasurement",
     "RecallTokenDay",
     "RecallTokenMeasurement",
     "RecallTokenStatistics",
     "RecallTokenValue",
+    "RecurrenceStatistics",
+    "RecurrenceStreak",
     "ResolvedUsagePeriod",
+    "ScopeStatistics",
     "SourceInventoryStatistics",
     "Statistics",
     "StatisticsPeriod",

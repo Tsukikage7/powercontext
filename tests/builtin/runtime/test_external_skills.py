@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import asyncio
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -24,17 +26,20 @@ from powercontext.builtin.artifacts.skill import (
     ExternalSkillResolutionStatus,
     ExternalSkillSnapshotUnavailableError,
     SkillContent,
+    package_file,
 )
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.review.generation import GenerationCapabilityUnavailableError
 from powercontext.builtin.runtime import (
     BuiltinConfig,
+    BuiltinRuntime,
     ExternalSkillsConfig,
     ImportExternalSkillRequest,
     ListExternalSkillsRequest,
     ResolveExternalSkillRequest,
     open_builtin_runtime,
 )
+from powercontext.builtin.scope import ScopeDraft
 from powercontext.builtin.sources import ExternalSkillImportMode
 
 
@@ -46,6 +51,16 @@ def _write_skill(root: Path) -> Path:
         encoding="utf-8",
     )
     return package
+
+
+async def _create_scope(runtime: BuiltinRuntime) -> str:
+    assert runtime.scopes is not None
+    scope = await runtime.scopes.create(
+        ScopeDraft(
+            title="External Skills Test", summary="External skill integration test", idempotency_key="external-skills"
+        )
+    )
+    return scope.scope_id
 
 
 def test_runtime_exposes_configured_external_skill_registry_without_a_model(tmp_path: Path) -> None:
@@ -72,7 +87,8 @@ def test_runtime_exposes_configured_external_skill_registry_without_a_model(tmp_
             assert capabilities.experience_generation is False
             assert capabilities.managed_skill_generation is False
 
-            scoped = runtime.external_skills.for_scope("project:example")
+            scope_id = await _create_scope(runtime)
+            scoped = runtime.external_skills.for_scope(scope_id)
             registration = (await scoped.scan()).registrations[0]
             available = await scoped.list(ListExternalSkillsRequest())
             assert len(available) == 1
@@ -94,8 +110,9 @@ def test_runtime_reports_unconfigured_external_skill_registry(tmp_path: Path) ->
         config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{database}"))
         async with open_builtin_runtime(config) as runtime:
             assert (await runtime.capabilities()).external_skill_registry is False
+            scope_id = await _create_scope(runtime)
             with pytest.raises(ExternalSkillRegistryUnavailableError):
-                await runtime.external_skills.for_scope("project:example").scan()
+                await runtime.external_skills.for_scope(scope_id).scan()
 
     asyncio.run(exercise())
 
@@ -117,7 +134,13 @@ class _SkillGenerator:
 def test_explicit_external_skill_import_captures_exact_snapshot_and_enters_review(tmp_path: Path) -> None:
     async def exercise() -> None:
         root = tmp_path / ".agents" / "skills"
-        _write_skill(root)
+        package = _write_skill(root)
+        (package / "scripts").mkdir()
+        script = package / "scripts" / "check.py"
+        script.write_bytes(b"print('exact external snapshot')\n")
+        script.chmod(0o755)
+        (package / "references").mkdir()
+        (package / "references" / "guide.md").write_text("# Exact guide\n", encoding="utf-8")
         config = BuiltinConfig(
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'powercontext.db'}"),
             external_skills=ExternalSkillsConfig(
@@ -127,7 +150,8 @@ def test_explicit_external_skill_import_captures_exact_snapshot_and_enters_revie
         )
         generator = _SkillGenerator()
         async with open_builtin_runtime(config, skill_generator=generator) as runtime:
-            scoped = runtime.external_skills.for_scope("project:example")
+            scope_id = await _create_scope(runtime)
+            scoped = runtime.external_skills.for_scope(scope_id)
             registration = (await scoped.scan()).registrations[0]
 
             result = await scoped.import_managed(
@@ -143,14 +167,29 @@ def test_explicit_external_skill_import_captures_exact_snapshot_and_enters_revie
             assert result.candidate.family == "skill"
             assert result.candidate.sources[0].source_type == "external-skill-snapshot"
             assert result.candidate.artifacts == ()
-            assert registration.fingerprint in generator.inputs[0].evidence[0].content
-            assert "Keep boundaries explicit." in generator.inputs[0].evidence[0].content
+            assert isinstance(result.candidate.proposal, SkillContent)
+            assert result.candidate.proposal.name == "friendly-python"
+            assert result.candidate.proposal.instructions == "Keep boundaries explicit."
+            assert result.candidate.proposal.package is not None
+            snapshot = await runtime.skill.for_scope(scope_id).package_snapshot(result.candidate.proposal.package)
+            assert [entry.path for entry in snapshot.entries] == [
+                "SKILL.md",
+                "references/guide.md",
+                "scripts/check.py",
+            ]
+            assert snapshot.archive_bytes
+            expected_mode = 0o644 if os.name == "nt" else 0o755
+            assert next(entry for entry in snapshot.entries if entry.path == "scripts/check.py").mode == expected_mode
+            if os.name != "nt":
+                assert stat.S_IXUSR & script.stat().st_mode
+            for entry in snapshot.entries:
+                assert package_file(snapshot, entry.path) == (package / entry.path).read_bytes()
             assert (await scoped.list(ListExternalSkillsRequest()))[0].registration == registration
 
     asyncio.run(exercise())
 
 
-def test_external_skill_import_requires_generation_model_before_snapshot(tmp_path: Path) -> None:
+def test_external_skill_fork_requires_generation_model_before_snapshot(tmp_path: Path) -> None:
     async def exercise() -> None:
         root = tmp_path / ".agents" / "skills"
         _write_skill(root)
@@ -162,7 +201,8 @@ def test_external_skill_import_requires_generation_model_before_snapshot(tmp_pat
             ),
         )
         async with open_builtin_runtime(config) as runtime:
-            scoped = runtime.external_skills.for_scope("project:example")
+            scope_id = await _create_scope(runtime)
+            scoped = runtime.external_skills.for_scope(scope_id)
             registration = (await scoped.scan()).registrations[0]
 
             with pytest.raises(GenerationCapabilityUnavailableError):
@@ -190,7 +230,8 @@ def test_external_skill_import_rejects_package_drift_before_generation(tmp_path:
         )
         generator = _SkillGenerator()
         async with open_builtin_runtime(config, skill_generator=generator) as runtime:
-            scoped = runtime.external_skills.for_scope("project:example")
+            scope_id = await _create_scope(runtime)
+            scoped = runtime.external_skills.for_scope(scope_id)
             registration = (await scoped.scan()).registrations[0]
             manifest = package / "SKILL.md"
             manifest.write_text(manifest.read_text(encoding="utf-8") + "\nChanged.\n", encoding="utf-8")

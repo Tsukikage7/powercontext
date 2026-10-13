@@ -22,6 +22,8 @@ from typing import Generic, TypeVar
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 from powercontext.artifacts import ArtifactRef
+from powercontext.artifacts.models import _reject_legacy_memory_citations
+from powercontext.builtin.evidence.models import ResolvedEvidence
 from powercontext.limits import MAX_ARTIFACT_ID_LENGTH
 from powercontext.sources import SourceRef
 
@@ -44,6 +46,8 @@ class CandidateStatus(StrEnum):
 class ArtifactCandidate(BaseModel, Generic[ProposalT]):
     """One current Candidate head with its immutable proposal version."""
 
+    _reject_legacy_citations = model_validator(mode="before")(_reject_legacy_memory_citations)
+
     candidate_id: str = Field(min_length=1, max_length=MAX_ARTIFACT_ID_LENGTH)
     version: StrictInt = Field(ge=1)
     family: str
@@ -64,13 +68,17 @@ class ArtifactCandidate(BaseModel, Generic[ProposalT]):
         return value
 
     @model_validator(mode="after")
-    def validate_lifecycle(self):
+    def validate_evidence(self):
         if not self.sources and not self.artifacts:
             raise ValueError("Candidate evidence must include a Source or Artifact reference")  # noqa: TRY003
         if len(self.sources) + len(self.artifacts) > MAX_CANDIDATE_EVIDENCE:
             raise ValueError(f"Candidate evidence must not exceed {MAX_CANDIDATE_EVIDENCE} references")  # noqa: TRY003
         if self.target is not None and self.target.family != self.family:
             raise ValueError("Candidate target must belong to the proposed family")  # noqa: TRY003
+        return self
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self):
         if self.status is CandidateStatus.APPROVED:
             if self.result_artifact is None:
                 raise ValueError("approved Candidate must identify its result Artifact")  # noqa: TRY003
@@ -89,6 +97,15 @@ class ArtifactCandidatePage(BaseModel, Generic[ProposalT]):
 
     candidates: tuple[ArtifactCandidate[ProposalT], ...]
     next_cursor: str | None = None
+
+
+class CandidateEvidenceView(BaseModel):
+    """Current Candidate evidence expanded under the reader's current authority."""
+
+    candidate_id: str
+    version: int
+    resolved: ResolvedEvidence | None = None
+    unavailable: str | None = None
 
 
 __all__ = [

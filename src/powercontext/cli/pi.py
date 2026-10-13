@@ -35,13 +35,14 @@ from powercontext.cli.git_source import (
 from powercontext.cli.git_source import (
     is_local_source as _is_local_source,
 )
+from powercontext.cli.guidance import HOST_GUIDANCE, SKILL_FILE
 from powercontext.cli.system import Diagnostic, DiagnosticStatus, SetupError
 from powercontext.paths import powercontext_data_dir
 
 PI_PACKAGE_NAME = "powercontext-pi"
-PI_PLUGIN_RELATIVE = Path("integrations") / "pi" / "plugins" / "powercontext"
+PI_PLUGIN_RELATIVE = Path(HOST_GUIDANCE["pi"].plugin)
 PI_EXTENSION = Path("extensions") / "powercontext.ts"
-PI_SKILL = Path("skills") / "project-context" / "SKILL.md"
+PI_SKILL = SKILL_FILE
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +50,7 @@ class PiSetupResult:
     package: str
     package_path: str
     data_dir: str
+    authorization_state: str = "not_attempted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +60,7 @@ class _PiPackageListing:
     scope: str
 
 
-def install_pi_plugin(*, source: str, ref: str) -> PiSetupResult:
+def install_pi_plugin(*, source: str, ref: str, server_url: str = "http://127.0.0.1:8000") -> PiSetupResult:
     """Install the native Pi package from a checkout or Git source."""
 
     pi_executable()
@@ -71,10 +73,20 @@ def install_pi_plugin(*, source: str, ref: str) -> PiSetupResult:
     require_pi_package(package_dir)
     _run_pi("install", str(package_dir))
     _remove_existing_pi_packages(keep=package_dir)
+    from powercontext.cli.authorization import (
+        configure_stored_authorization,
+        setup_authorization_value,
+    )
+
     return PiSetupResult(
         package=PI_PACKAGE_NAME,
         package_path=str(package_dir),
         data_dir=str(data_dir),
+        authorization_state=configure_stored_authorization(
+            "pi",
+            server_url=server_url,
+            value=setup_authorization_value("pi"),
+        ),
     )
 
 

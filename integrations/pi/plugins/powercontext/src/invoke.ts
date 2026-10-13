@@ -17,10 +17,12 @@
 import type { JsonObject, PowerContextClient } from './client.ts'
 import {
   SecretRejectedError,
+  RequestTimeoutError,
   ServerResponseError,
   UnknownOperationError,
 } from './errors.ts'
 import { OPERATIONS, type OperationId } from './operations.generated.ts'
+import { MemoryOperationError, requestMemoryOperation } from './memory-operations.ts'
 import { containsSecret } from './secrets.ts'
 
 export interface ToolResult {
@@ -29,6 +31,7 @@ export interface ToolResult {
   message?: string
   status?: number
   request_id?: string
+  etag?: string
   data?: unknown
 }
 
@@ -45,6 +48,7 @@ export interface DurableWriteConfirmationContext {
 
 export interface ScopedOperationRuntime {
   client: PowerContextClient
+  config: { generationTimeoutMs?: number }
   resolveScope: (cwd: string) => Promise<string>
 }
 
@@ -75,8 +79,20 @@ const WRITE_OPERATIONS = new Set<OperationId>([
   'capture_content_source',
   'revise_memory_entry',
   'retire_memory_entry',
+  'replace_artifact',
+  'change_atomic_memory_lifecycle',
   'activate_handoff',
   'commit_handoff',
+  'create_work_contract',
+  'handoff_current_work',
+  'acknowledge_handoff',
+  'record_task_outcome',
+  'generate_experience',
+  'generate_skill',
+  'approve_artifact_candidate',
+  'reject_artifact_candidate',
+  'revise_artifact_candidate',
+  'import_external_skill',
 ])
 
 function mapServerError(error: ServerResponseError): ToolResult {
@@ -126,6 +142,7 @@ function mapServerError(error: ServerResponseError): ToolResult {
 }
 
 export function toToolResult(error: unknown): ToolResult {
+  if (error instanceof MemoryOperationError) return { ok: false, code: error.code, message: error.message }
   if (error instanceof SecretRejectedError) return { ok: false, code: 'secret_rejected', message: error.message }
   if (error instanceof UnknownOperationError) return { ok: false, code: 'unknown_operation', message: error.message }
   if (error instanceof ServerResponseError) return mapServerError(error)
@@ -137,8 +154,11 @@ export function injectScope(
   payload: JsonObject | undefined,
   scopeId: string,
 ): JsonObject | undefined {
-  if (!OPERATIONS[operationId].scope) return payload
-  return { ...payload, scope_id: scopeId }
+  const mode = OPERATIONS[operationId].scopeMode
+  if (mode === 'selection') {
+    return { ...payload, selection: { mode: 'exact', scope_ids: [scopeId] } }
+  }
+  return mode === 'current' || operationId === 'get_atomic_memory_state' ? { ...payload, scope_id: scopeId } : payload
 }
 
 function hasSecret(value: unknown): boolean {
@@ -149,7 +169,8 @@ function hasSecret(value: unknown): boolean {
 }
 
 function encodeSuccess(result: Awaited<ReturnType<PowerContextClient['request']>>): ToolResult {
-  return { ok: true, status: result.status, request_id: result.requestId, data: result.value }
+  return { ok: true, status: result.status, request_id: result.requestId,
+    ...(result.etag === undefined ? {} : { etag: result.etag }), data: result.value }
 }
 
 export async function invokeOperation(
@@ -158,14 +179,23 @@ export async function invokeOperation(
   payload: JsonObject | undefined,
   scopeId: string,
   signal?: AbortSignal,
+  timeoutMs?: number,
 ): Promise<ToolResult> {
   if (!(operationId in OPERATIONS)) return toToolResult(new UnknownOperationError(operationId))
   const id = operationId as OperationId
   const body = injectScope(id, payload, scopeId)
   if (WRITE_OPERATIONS.has(id) && hasSecret(body)) return toToolResult(new SecretRejectedError())
   try {
-    return encodeSuccess(await client.request(id, body, signal))
+    const memory = await requestMemoryOperation(client, id, body, scopeId, signal)
+    return encodeSuccess(memory ?? await client.request(id, body, signal, timeoutMs))
   } catch (error) {
+    if ((id === 'generate_experience' || id === 'generate_skill') && error instanceof RequestTimeoutError) {
+      return {
+        ok: false,
+        code: 'unknown_write_outcome',
+        message: 'Generation timed out; it may have created a pending candidate. Use pc_review_list to retrieve it before retrying.',
+      }
+    }
     return toToolResult(error)
   }
 }
@@ -180,7 +210,10 @@ export async function invokeScopedOperation(
   const id = operationId as OperationId
   try {
     const scopeId = await runtime.resolveScope(context.cwd)
-    return invokeOperation(runtime.client, id, payload, scopeId, context.signal)
+    const timeoutMs = id === 'generate_experience' || id === 'generate_skill'
+      ? runtime.config.generationTimeoutMs ?? 30_000
+      : undefined
+    return invokeOperation(runtime.client, id, payload, scopeId, context.signal, timeoutMs)
   } catch {
     return unavailableResult()
   }

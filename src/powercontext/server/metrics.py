@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import re
+from collections.abc import Iterator, Mapping
 from contextlib import suppress
 from time import perf_counter
 from typing import Any
@@ -33,10 +36,67 @@ from prometheus_client import (
     ProcessCollector,
     generate_latest,
 )
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from typing_extensions import override
 
+from powercontext.limits import MAX_ARTIFACT_FAMILY_LENGTH
 from powercontext.server.context import is_internal_bridge
+
+_PROCESSING_INSTRUMENTS = (
+    ("max_workers", "Configured Worker capacity for this Artifact Family.", False),
+    ("available_workers", "Available Worker slots for this Artifact Family.", False),
+    ("used_workers", "Worker slots currently in use for this Artifact Family.", False),
+    ("ready", "Scope invocations in this Artifact Family's bounded ready queue.", False),
+    ("retry_wait", "Scope invocations retained in this Artifact Family's bounded retry cache.", False),
+    (
+        "unacknowledged_requests",
+        "Snapshot of Scopes with unacknowledged requests at the latest requested-work discovery pass.",
+        False,
+    ),
+    ("discovery_seconds", "Duration in seconds of this Artifact Family's most recent discovery pass.", False),
+    ("last_invocation_seconds", "Duration in seconds of this Artifact Family's most recent invocation.", False),
+    ("completed", "Acknowledged invocations accumulated by the current Supervisor instance; resets on restart.", True),
+    ("failed", "Failed invocations accumulated by the current Supervisor instance; resets on restart.", True),
+    ("timeouts", "Timed-out invocations accumulated by the current Supervisor instance; resets on restart.", True),
+)
+
+
+class _ProcessingMetricsCollector:
+    """Render registered Family snapshots without retaining stale label values."""
+
+    def __init__(self) -> None:
+        self._snapshot: dict[str, dict[str, float]] = {}
+
+    def replace(self, families: Mapping[str, Mapping[str, int | float | str]]) -> None:
+        snapshot: dict[str, dict[str, float]] = {}
+        for family, values in families.items():
+            if len(family) > MAX_ARTIFACT_FAMILY_LENGTH or re.fullmatch(r"[a-z][a-z0-9-]*", family) is None:
+                continue
+            measurements: dict[str, float] = {}
+            for field, _, _ in _PROCESSING_INSTRUMENTS:
+                value = values.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    with suppress(OverflowError):
+                        number = float(value)
+                        if math.isfinite(number) and number >= 0:
+                            measurements[field] = number
+            snapshot[family] = measurements
+        # A scrape observes one complete snapshot even when another thread
+        # replaces the registered Family set during collection.
+        self._snapshot = snapshot
+
+    def collect(self) -> Iterator[Metric]:
+        snapshot = self._snapshot
+        for field, description, counter in _PROCESSING_INSTRUMENTS:
+            instrument_type = CounterMetricFamily if counter else GaugeMetricFamily
+            instrument = instrument_type(
+                f"powercontext_server_artifact_processing_{field}", description, labels=["family"]
+            )
+            for family, measurements in snapshot.items():
+                if field in measurements:
+                    instrument.add_metric([family], measurements[field])
+            yield instrument
 
 
 class ServerMetrics:
@@ -77,6 +137,12 @@ class ServerMetrics:
             ("operation", "outcome"),
             registry=self.registry,
         )
+        self.topic_memory_searches = Counter(
+            "powercontext_server_topic_memory_searches_total",
+            "Topic Memory searches by actual mode and embedding fallback outcome.",
+            ("mode", "fallback"),
+            registry=self.registry,
+        )
         self.runtime_ready = Gauge(
             "powercontext_server_runtime_ready",
             "Whether the built-in Runtime can accept operations.",
@@ -88,6 +154,8 @@ class ServerMetrics:
             ("state",),
             registry=self.registry,
         )
+        self._processing = _ProcessingMetricsCollector()
+        self.registry.register(self._processing)
         self.set_runtime_scopes(0, 0)
 
     def start_transport(self, transport: str, operation: str) -> float:
@@ -119,6 +187,10 @@ class ServerMetrics:
         with suppress(Exception):
             self.application_duration.labels(operation=operation, outcome=outcome).observe(duration)
 
+    def observe_topic_memory_search(self, mode: str, fallback: bool) -> None:
+        with suppress(Exception):
+            self.topic_memory_searches.labels(mode=mode, fallback=str(fallback).lower()).inc()
+
     def set_ready(self, ready: bool) -> None:
         with suppress(Exception):
             self.runtime_ready.set(1 if ready else 0)
@@ -127,6 +199,12 @@ class ServerMetrics:
         for state, value in (("active", active), ("cached", cached)):
             with suppress(Exception):
                 self.runtime_scopes.labels(state=state).set(value)
+
+    def set_processing_families(self, families: Mapping[str, Mapping[str, int | float | str]]) -> None:
+        """Refresh bounded scheduler observations using only registered Family labels."""
+
+        with suppress(Exception):
+            self._processing.replace(families)
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

@@ -1,8 +1,9 @@
 # Using the Builtin Memory layer
 
-The Builtin Memory family stores reusable entries as immutable Artifact revisions. The `builtin` extra includes the
-complete runtime and both supported database integrations. Remote applications should use the Server API described in the
-[remote access guide](remote-access-implementation.md).
+Builtin Memory stores each durable fact, preference, or decision as an independent `atomic-memory` Artifact. Each
+memory has its own identity, revisions, state, tags, and access relationships. The `builtin` extra includes the
+complete runtime and both supported database integrations. Remote applications should use the Server API described in
+the [remote access guide](remote-access-implementation.md).
 
 ## Select a database
 
@@ -16,13 +17,9 @@ SQLite is the default. `open_builtin_runtime()` owns the selected database profi
 `BuiltinRuntime` interface for either database:
 
 ```python
-from powercontext.builtin.artifacts.memory import MemoryEntryInput
+from powercontext.builtin.artifacts.atomic_memory import AtomicMemoryContent
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
-from powercontext.builtin.runtime import (
-    BuiltinConfig,
-    RememberMemoryRequest,
-    open_builtin_runtime,
-)
+from powercontext.builtin.runtime import BuiltinConfig, open_builtin_runtime
 
 
 async def save_note() -> None:
@@ -30,65 +27,64 @@ async def save_note() -> None:
         database=SQLiteConfig(url="sqlite+aiosqlite:///powercontext.db")
     )
     async with open_builtin_runtime(config) as runtime:
-        result = await runtime.memory.for_scope("project-alpha").remember(
-            RememberMemoryRequest(
-                entries=(
-                    MemoryEntryInput(
-                        kind="decision",
-                        text="Use one composition root for the process.",
-                    ),
-                )
-            )
+        assert runtime.atomic_memory is not None
+        result = await runtime.atomic_memory.for_scope("project-alpha").create(
+            (AtomicMemoryContent(kind="decision", text="Use one composition root for the process."),)
         )
-        assert result.memory_ref.revision == 1
+        assert result.primary.ref.revision == 1
 ```
 
-The scope ID selects an isolated Source journal, Memory lifecycle, and Trigger cursor within the database.
+The scope ID selects an isolated Source journal, Memory set, and Trigger cursor within the database.
 
-## Write and evolve entries
+## Write, extract, and change memories
 
-`ScopedMemoryApplication.remember()` accepts explicit `MemoryEntryInput` values. Source-based extraction follows a
-separate path: capture Sources, then flush the pending Source window with a configured candidate pipeline.
+`ScopedAtomicMemoryApplication.create()` writes explicit memories in one all-or-nothing batch and returns one record per
+input. Source-based extraction follows a separate path: capture Sources, then call `flush()` to process the pending
+Source window with the configured extraction pipeline. `cursor()` reports the processed Source position.
 
-The result contains the new immutable Memory reference and the changed entry. Use its citation for later mutations:
+Every memory changes independently. `forget()` deactivates one memory and `merge()` replaces several memories with a
+new one. `forget()` takes the expected content revision and state version, and `merge()` takes the exact records read
+by the caller, so a stale caller fails instead of overwriting a concurrent change. `restore()` applies the token
+returned by `preview_restoration()`:
 
 ```python
-from powercontext.builtin.runtime import ReviseMemoryEntryRequest
-
-memory = runtime.memory.for_scope("project-alpha")
-entries = await memory.list()
-current = entries.entries[0]
-revised = await memory.revise(
-    ReviseMemoryEntryRequest(
-        citation=current.citation,
-        kind=current.entry.kind,
-        text="Use PowerContext as the only composition root.",
-        reason="Clarify ownership.",
-    )
+memory = runtime.atomic_memory.for_scope("project-alpha")
+current = (await memory.list()).items[0]
+await memory.forget(
+    current.ref.artifact_id,
+    expected_revision=current.ref.revision,
+    expected_state_version=current.state.state_version,
 )
 ```
 
-`retire()` marks an entry inactive without deleting immutable content. `changes()` returns compact revision changes.
-Expected revisions and citations preserve optimistic concurrency without requiring callers to rebuild references.
+`list()` pages memories by state, and `get()` reads one memory, optionally at an exact revision.
 
-## Search, expand, and cite
+## Search
 
 SQLite and OceanBase both initialize a full-text index, so either database can search without an embedding model:
 
 ```python
-from powercontext.builtin.runtime import SearchMemoryRequest
-
-result = await runtime.memory.for_scope("project-alpha").search(
-    SearchMemoryRequest(query="composition root", mode="fts")
-)
+result = await runtime.atomic_memory.for_scope("project-alpha").search("composition root", mode="text")
 ```
 
-Each hit contains the exact Memory revision, entry identity, and entry version used for ranking. The Runtime returns
-the same citation fields through list and exact-read operations.
+Each hit identifies the exact memory revision used for ranking. `mode="auto"` chooses the strongest available mode
+and can fall back to text search if query embedding is temporarily unavailable. Explicit `vector` and `hybrid`
+requests fail when the configured profile does not provide that capability.
 
-`mode="auto"` chooses the strongest available mode and can fall back to FTS if query embedding is temporarily
-unavailable. Explicit `vector` and `hybrid` requests fail when the configured profile does not provide that
-capability.
+## Legacy Memory HTTP operations
+
+The Server keeps five legacy entry points, each translated onto Atomic Memory:
+
+| Operation | Behavior |
+| --- | --- |
+| `POST /v1/memory/remember` | Creates one memory. `expected_revision` is rejected. |
+| `POST /v1/memory/search` | Searches active memories; `fts` maps to text search. |
+| `POST /v1/memory/entries/list` | Lists memories; `include_inactive` adds forgotten, merged, and retired ones. |
+| `POST /v1/memory/entries/get` | Reads the memory migrated from a legacy `target` collection and entry ID. |
+| `POST /v1/memory/flush` | Processes the next Source window. |
+
+Collection revisions, citations, capacity, changes, revise, retire, entry tags, and `memory` access targets have no
+Atomic equivalent and return `422 legacy_memory_operation_unsupported` before any work begins.
 
 ## Enable SQLite vector search
 
@@ -106,13 +102,10 @@ async with open_builtin_runtime(
     ...
 ```
 
-The SQLite profile composes FTS5 and sqlite-vec strategies. It reports `fts`, `vector`, and `hybrid` through Memory
-capabilities.
+The SQLite profile composes FTS5 and sqlite-vec strategies and reports `text`, `vector`, and `hybrid` search modes.
 Stored projections and query vectors must use the same `EmbeddingProfile`, including model name, dimension, distance,
-and normalization. Changing that profile requires rebuilding projections before vector search resumes.
-
-Call `MemoryService.rebuild_projections()` to reconstruct derived search data from authoritative Memory revisions.
-Revision and entry tables remain the source of truth.
+and normalization. Changing that profile requires rebuilding the derived search index before vector search resumes.
+Artifact revisions and states remain the source of truth.
 
 ## Use OceanBase persistence
 
@@ -134,7 +127,7 @@ async with open_builtin_runtime(
     BuiltinConfig(database=config),
     embedding_model=embedding_model,
 ) as runtime:
-    memory = runtime.memory.for_scope("project-alpha")
+    memory = runtime.atomic_memory.for_scope("project-alpha")
 ```
 
 The OceanBase profile uses the same index composition as SQLite. Its full-text strategy is always available. Supplying
@@ -148,7 +141,7 @@ Before serving requests, verify:
 
 - the selected profile opens and initializes successfully;
 - each tenant or project maps to the intended scope ID;
-- scheduled extraction has a candidate pipeline;
+- scheduled extraction has an extraction pipeline;
 - SQLite vector search has a matching embedding model;
 - OceanBase vector search has a matching embedding model;
 - capability responses match the indexes actually initialized;

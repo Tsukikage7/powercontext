@@ -1,0 +1,10 @@
+{
+  "legacy_sha256": {
+    "SKILL.md": "45c7a0702ab3d958bd55c221db3c46e24041d2cdc0af50b76c398f68e8d5bba7"
+  },
+  "resources": [
+    "SKILL.md",
+    "references/scope-memory.md"
+  ],
+  "schema_version": 1
+}

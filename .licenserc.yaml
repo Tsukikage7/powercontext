@@ -34,18 +34,25 @@ header:
 
   paths-ignore:
     - '**/*.md'
+    - '**/*.mdx'
     - '**/*.json'
+    # Notebook JSON stores the license in the first Markdown cell with escaped newlines.
+    - 'examples/jupyter/*.ipynb'
     - '**/*.svg'
     - '.github/**'
     - '**/.gitignore'
     - '**/.dockerignore'
     - '**/.env.example'
+    - '**/*.example.env'
     - '**/LICENSE'
     - 'NOTICE'
     - '**/LICENSE.oceanbase-design'
-    - '**/uv.lock'
-    - 'benchmark/locomo/dataset/**'
-    - 'benchmark/locomo/results/**'
+    - '**/*.lock'
+    - '**/*-lock.yaml'
+    - '**/*.lockb'
+    - 'evaluation/memory/locomo/dataset/**'
+    - 'evaluation/memory/locomo/results/**'
+    - 'evaluation/memory/locomo_plus/results/**'
     - 'tox.ini'
     - 'Makefile'
     - 'zensical.toml'
@@ -55,10 +62,20 @@ header:
     - 'theme/powercontext/assets/stylesheets/pygments-github-dark.css'
     - '**/py.typed'
     - 'src/powercontext/http/_generated/**'
+    # Vendored distributions retain their upstream licenses and copyright notices.
+    - 'src/powercontext/server/dashboard/static/vendor/**'
     - '.gitattributes'
     - '**/*.service.in'
     - '**/*.jsonl'
+    # license-eye cannot determine the comment style of patch files.
+    - '**/*.patch'
+    # PEM has no comment style; this is a test-only self-signed certificate and key.
+    - 'tests/fixtures/loopback_test_ca.pem'
+    # license-eye cannot determine the comment style of Mermaid diagrams.
+    - '**/*.mermaid'
     # license-eye cannot determine the comment style of uv requirements files.
     - 'e2e/bub/source-overrides.txt'
+    - 'integrations/dify/plugin/requirements.txt'
+    - 'integrations/dify/plugin/.difyignore'
 
   comment: on-failure

@@ -16,18 +16,23 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select, text
+from sqlalchemy import literal, select, text
 from sqlalchemy.dialects.mysql import match
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from powercontext.builtin.artifacts.experience import Experience, ExperienceSearchHit
+from powercontext.builtin.artifacts.experience import Experience, ExperienceSearchOutcome
 from powercontext.builtin.artifacts.memory import CapabilityNotSupportedError
-from powercontext.builtin.artifacts.search import analyze_text
+from powercontext.builtin.artifacts.search import AdmissionFloor, analyze_fts_query
+from powercontext.builtin.artifacts.skill import Skill, SkillPackageSnapshot, SkillSearchHit
 from powercontext.builtin.persistence.experience_index import (
     ensure_artifact_head_searchable_text,
     experience_search_hits,
     rebuild_experience_projections,
+    rebuild_skill_projections,
+    remove_experience_projection,
     replace_experience_projection,
+    replace_skill_projection,
+    skill_search_hits,
 )
 from powercontext.builtin.persistence.tables import ARTIFACT_HEADS_TABLE, ARTIFACTS_TABLE
 
@@ -55,6 +60,7 @@ class OceanBaseExperienceFTSIndex:
             raise CapabilityNotSupportedError("oceanbase-experience-fts")
         await ensure_artifact_head_searchable_text(connection)
         await rebuild_experience_projections(connection)
+        await rebuild_skill_projections(connection)
         count = await connection.scalar(
             _OCEANBASE_FTS_INDEX_EXISTS_SQL,
             {"index_name": _OCEANBASE_FTS_INDEX_NAME},
@@ -73,6 +79,9 @@ class OceanBaseExperienceFTSIndex:
     ) -> None:
         await replace_experience_projection(connection, scope_id, experience)
 
+    async def remove(self, connection: AsyncConnection, scope_id: str, artifact_id: str, /) -> None:
+        await remove_experience_projection(connection, scope_id, artifact_id)
+
     async def search(
         self,
         connection: AsyncConnection,
@@ -80,10 +89,14 @@ class OceanBaseExperienceFTSIndex:
         query: str,
         limit: int,
         /,
-    ) -> tuple[ExperienceSearchHit, ...]:
-        analyzed = analyze_text(query)
+        *,
+        admission: AdmissionFloor | None = None,
+        min_score: float | None = None,
+        require_scores: bool = False,
+    ) -> ExperienceSearchOutcome:
+        analyzed = analyze_fts_query(query)
         if not analyzed:
-            return ()
+            return ExperienceSearchOutcome()
         score = match(ARTIFACT_HEADS_TABLE.c.searchable_text, against=analyzed)
         rows = (
             await connection.execute(
@@ -91,6 +104,8 @@ class OceanBaseExperienceFTSIndex:
                     ARTIFACT_HEADS_TABLE.c.artifact_id,
                     ARTIFACT_HEADS_TABLE.c.revision,
                     ARTIFACTS_TABLE.c.content,
+                    score.label("raw_score"),
+                    literal("oceanbase_match").label("score_metric"),
                 )
                 .join(
                     ARTIFACTS_TABLE,
@@ -102,13 +117,73 @@ class OceanBaseExperienceFTSIndex:
                 .where(
                     ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
                     ARTIFACT_HEADS_TABLE.c.family == Experience.family,
+                    ARTIFACT_HEADS_TABLE.c.lifecycle_state == "active",
                     score,
                 )
                 .order_by(score.desc(), ARTIFACT_HEADS_TABLE.c.artifact_id, ARTIFACT_HEADS_TABLE.c.revision)
                 .limit(limit * 4)
             )
         ).mappings()
-        return experience_search_hits(rows, query, limit)
+        return experience_search_hits(
+            rows, query, limit, scope_id, admission=admission, min_score=min_score, require_scores=require_scores
+        )
+
+    async def replace_skill(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        skill: Skill,
+        package: SkillPackageSnapshot,
+        /,
+    ) -> None:
+        await replace_skill_projection(connection, scope_id, skill, package)
+
+    async def search_skills(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        query: str,
+        limit: int,
+        /,
+        *,
+        admission: AdmissionFloor | None = None,
+        min_score: float | None = None,
+        require_scores: bool = False,
+    ) -> tuple[SkillSearchHit, ...]:
+        analyzed = analyze_fts_query(query)
+        if not analyzed:
+            return ()
+        score = match(ARTIFACT_HEADS_TABLE.c.searchable_text, against=analyzed)
+        rows = (
+            await connection.execute(
+                select(
+                    ARTIFACT_HEADS_TABLE.c.artifact_id,
+                    ARTIFACT_HEADS_TABLE.c.revision,
+                    ARTIFACT_HEADS_TABLE.c.searchable_text,
+                    ARTIFACTS_TABLE.c.content,
+                    score.label("raw_score"),
+                    literal("oceanbase_match").label("score_metric"),
+                )
+                .join(
+                    ARTIFACTS_TABLE,
+                    (ARTIFACTS_TABLE.c.scope_id == ARTIFACT_HEADS_TABLE.c.scope_id)
+                    & (ARTIFACTS_TABLE.c.family == ARTIFACT_HEADS_TABLE.c.family)
+                    & (ARTIFACTS_TABLE.c.artifact_id == ARTIFACT_HEADS_TABLE.c.artifact_id)
+                    & (ARTIFACTS_TABLE.c.revision == ARTIFACT_HEADS_TABLE.c.revision),
+                )
+                .where(
+                    ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
+                    ARTIFACT_HEADS_TABLE.c.family == Skill.family,
+                    ARTIFACT_HEADS_TABLE.c.lifecycle_state == "active",
+                    score,
+                )
+                .order_by(score.desc(), ARTIFACT_HEADS_TABLE.c.artifact_id, ARTIFACT_HEADS_TABLE.c.revision)
+                .limit(limit * 4)
+            )
+        ).mappings()
+        return skill_search_hits(
+            rows, query, limit, admission=admission, min_score=min_score, require_scores=require_scores
+        )
 
 
 __all__ = ["OceanBaseExperienceFTSIndex"]

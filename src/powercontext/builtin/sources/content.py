@@ -16,10 +16,13 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, JsonValue, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
+from powercontext.artifacts import ArtifactRef
+from powercontext.limits import MAX_ARTIFACT_FAMILY_LENGTH
+from powercontext.sources import TEXT_EVIDENCE_PROJECTION_KEY, AdapterSourceDefinition, TextEvidence
 from powercontext.sources.models import Source, SourceMaterialization
 
 CONTENT_SOURCE_NAME = "content"
@@ -41,11 +44,63 @@ class ContentCapture(BaseModel):
         return value
 
 
+class ContentSourceTarget(BaseModel):
+    """Exact Artifact revision to which one system Source is bound."""
+
+    scope_id: str
+    family: Annotated[str, Field(min_length=1, max_length=MAX_ARTIFACT_FAMILY_LENGTH)]
+    artifact_id: str
+    revision: Annotated[int, Field(ge=1)] = 1
+
+    @field_validator("family")
+    @classmethod
+    def require_canonical_family(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("family must not contain leading or trailing whitespace")  # noqa: TRY003
+        return value
+
+
+class ArtifactRestorationWrite(BaseModel):
+    """Exact content source and committed result of one restoration write."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    before_ref: ArtifactRef
+    content_from_ref: ArtifactRef
+    after_ref: ArtifactRef
+    lifecycle_state: Literal["active", "retired"]
+
+
+class ArtifactRestorationOutcome(BaseModel):
+    """One successful restoration group retained with its primary revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation: Literal["restore", "undo_merge"]
+    target: ArtifactRef
+    writes: tuple[ArtifactRestorationWrite, ...]
+    undo_merge_results: tuple[ArtifactRef, ...]
+
+
+class ContentSourceInternal(BaseModel):
+    """Server-owned Source purpose data never exposed by the base REST API."""
+
+    role: Literal["lineage_only"]
+    operation: Literal["artifact_create", "artifact_replace", "artifact_restore", "artifact_undo_merge"]
+    target: ContentSourceTarget
+    restoration_outcome: ArtifactRestorationOutcome | None = None
+
+
 class ContentSource(Source):
-    """Captured text that can be used as Artifact evidence."""
+    """Captured content that can be used as Artifact evidence."""
 
     content: str
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    wire_content: JsonValue | None = None
+    wire_content_present: bool = False
+    internal: ContentSourceInternal | None = None
+    # Set only by the Work acknowledgement writer, never from capture metadata.
+    handoff_receipt: bool = False
 
 
 class ContentSourceAdapter:
@@ -64,6 +119,8 @@ class ContentSourceAdapter:
         )
 
     async def read(self, source: ContentSource, /) -> ContentCapture:
+        if not isinstance(source.content, str):
+            raise TypeError("system Content Sources cannot be read as integration captures")  # noqa: TRY003
         return ContentCapture(
             source_id=source.name,
             content=source.content,
@@ -71,4 +128,25 @@ class ContentSourceAdapter:
         )
 
 
+class ContentTextEvidenceProjection:
+    """Expose captured text without coupling consumers to ``ContentSource``."""
+
+    name = TEXT_EVIDENCE_PROJECTION_KEY.name
+    version = TEXT_EVIDENCE_PROJECTION_KEY.version
+    source_class = ContentSource
+    output_class: type[BaseModel] = TextEvidence
+
+    def project(self, source: ContentSource, /) -> TextEvidence:
+        return TextEvidence(
+            source_type=CONTENT_SOURCE_NAME,
+            source_id=source.name,
+            content=source.content,
+            metadata=source.metadata,
+        )
+
+
 CONTENT_SOURCE_ADAPTER = ContentSourceAdapter()
+CONTENT_SOURCE_DEFINITION = AdapterSourceDefinition(
+    CONTENT_SOURCE_ADAPTER,
+    projections=(ContentTextEvidenceProjection(),),
+)

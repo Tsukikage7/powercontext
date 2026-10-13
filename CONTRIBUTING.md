@@ -27,6 +27,11 @@ Anything tagged with "bug" and "help wanted" is open to whoever wants to impleme
 Look through the GitHub issues for features.
 Anything tagged with "enhancement" and "help wanted" is open to whoever wants to implement it.
 
+Dashboard contributors should follow the [implementation and verification baseline](docs/en/development/dashboard.md) ([中文](docs/zh/development/dashboard.md)).
+
+For release preparation, use the [version update and release guide](docs/en/development/releasing.md)
+([中文](docs/zh/development/releasing.md)). It documents the Makefile commands and the versions managed independently.
+
 ## Write Documentation
 
 powercontext could always use more documentation, whether as part of the official docs, in docstrings, or even on the web in blog posts, articles, and such.
@@ -91,7 +96,9 @@ make unit-test
 ```
 
 Use `make e2e-test` for cross-component behavior, `make contract-test` for OpenAPI changes, and
-`make docs-test` for documentation changes. `make test` runs the complete pytest suite.
+`make docs-test` for documentation changes. `make test` runs the complete pytest suite. These pytest targets
+spread tests across one worker per CPU with pytest-xdist; pass `PYTEST_WORKERS=0` to run them in a single process,
+for example when debugging with `pdb`.
 
 Before raising a pull request you should also run tox when a change may affect supported Python versions.
 This requires you to have the relevant Python versions installed. The same version matrix runs in CI.

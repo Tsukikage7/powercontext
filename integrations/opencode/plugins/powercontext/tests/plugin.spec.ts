@@ -57,6 +57,16 @@ function userMessage() {
   }
 }
 
+function bindingResponse(url: string, body: any): Response | undefined {
+  if (url.endsWith('/v1/scope-bindings/resolve')) {
+    return Response.json({ scope_id: body.explicit_scope_id ?? 'default-scope' })
+  }
+  if (url.endsWith('/v1/scope-bindings')) {
+    return Response.json({ key: body.key, scope_id: body.scope_id })
+  }
+  return undefined
+}
+
 afterEach(() => {
   vi.unstubAllGlobals()
   for (const key of ENV_KEYS) delete process.env[key]
@@ -82,6 +92,8 @@ describe('PowerContextPlugin', () => {
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
       const body = init.body ? JSON.parse(String(init.body)) : undefined
       calls.push({ url, body })
+      const binding = bindingResponse(url, body)
+      if (binding) return binding
       if (url.endsWith('/v1/context/prepare')) {
         const content = 'Parser decision: preserve the public token shape.'
         return Response.json({
@@ -110,11 +122,12 @@ describe('PowerContextPlugin', () => {
     expect(incoming.parts[1]).toMatchObject({ synthetic: true, messageID: 'msg-1', sessionID: 'session-1' })
     expect(incoming.parts[1]?.text).toContain('Parser decision')
     expect(calls.map((call) => call.url)).toEqual([
+      'http://127.0.0.1:8000/v1/scope-bindings/resolve',
       'http://127.0.0.1:8000/v1/context/prepare',
       'http://127.0.0.1:8000/v1/sources/content',
     ])
-    expect(calls[1]?.body.source_id).toMatch(/^opencode-user-prompt:/)
-    expect(calls[1]?.body.metadata.origin).toBe('opencode')
+    expect(calls[2]?.body.source_id).toMatch(/^opencode-user-prompt:/)
+    expect(calls[2]?.body.metadata.origin).toBe('opencode')
   })
 
   it('fails open when the Server is unavailable', async () => {
@@ -135,6 +148,8 @@ describe('PowerContextPlugin', () => {
     const calls: Array<{ url: string; body: any }> = []
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
       calls.push({ url, body: JSON.parse(String(init.body)) })
+      const binding = bindingResponse(url, calls.at(-1)?.body)
+      if (binding) return binding
       if (url.endsWith('/v1/context/prepare')) {
         return Response.json({
           schema: 'powercontext.prepared-context.v1',
@@ -154,8 +169,8 @@ describe('PowerContextPlugin', () => {
       { message: incoming.info, parts: incoming.parts } as any,
     )
 
-    expect(calls[0]?.body.query).toBe('multi word prompt')
-    expect(calls[1]?.body.content).toBe('multi word prompt')
+    expect(calls.find((call) => call.url.endsWith('/v1/context/prepare'))?.body.query).toBe('multi word prompt')
+    expect(calls.find((call) => call.url.endsWith('/v1/sources/content'))?.body.content).toBe('multi word prompt')
   })
 
   it('preserves intentional outer quotes in an already-decoded chat message', async () => {
@@ -163,6 +178,8 @@ describe('PowerContextPlugin', () => {
     const calls: Array<{ url: string; body: any }> = []
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
       calls.push({ url, body: JSON.parse(String(init.body)) })
+      const binding = bindingResponse(url, calls.at(-1)?.body)
+      if (binding) return binding
       if (url.endsWith('/v1/context/prepare')) {
         return Response.json({
           schema: 'powercontext.prepared-context.v1',
@@ -182,13 +199,16 @@ describe('PowerContextPlugin', () => {
       { message: incoming.info, parts: incoming.parts } as any,
     )
 
-    expect(calls[0]?.body.query).toBe('"preserve these quotes"')
-    expect(calls[1]?.body.content).toBe('"preserve these quotes"')
+    expect(calls.find((call) => call.url.endsWith('/v1/context/prepare'))?.body.query).toBe('"preserve these quotes"')
+    expect(calls.find((call) => call.url.endsWith('/v1/sources/content'))?.body.content).toBe('"preserve these quotes"')
   })
 
   it('asks before a durable tool operation', async () => {
     process.env.POWERCONTEXT_OPENCODE_SCOPE_ID = 'project:test'
-    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ revision: 1 })))
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      const body = init.body ? JSON.parse(String(init.body)) : undefined
+      return bindingResponse(url, body) ?? Response.json({ revision: 1 })
+    }))
     const hooks = await PowerContextPlugin(pluginInput())
     const ask = vi.fn(async () => undefined)
     const result = await hooks.tool?.pc_remember?.execute(
@@ -206,6 +226,56 @@ describe('PowerContextPlugin', () => {
     )
     expect(ask).toHaveBeenCalledWith(expect.objectContaining({ permission: 'powercontext' }))
     expect(JSON.parse(String(result))).toMatchObject({ ok: true })
+  })
+
+  it('forwards advisory rollover reasons through both Handoff draft tools', async () => {
+    process.env.POWERCONTEXT_OPENCODE_SCOPE_ID = 'project:test'
+    const calls: Array<{ url: string; body: any }> = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body))
+      calls.push({ url, body })
+      return bindingResponse(url, body) ?? Response.json({ ok: true })
+    }))
+    const hooks = await PowerContextPlugin(pluginInput())
+    const boundarySource = { name: 'content', source_id: 'turn-1' }
+    const reasons = ['host_context_budget', 'context_quality']
+    const context = {
+      sessionID: 'session-1',
+      messageID: 'msg-1',
+      agent: 'build',
+      directory: '/tmp/project',
+      worktree: '/tmp/project',
+      abort: new AbortController().signal,
+      metadata: vi.fn(),
+      ask: vi.fn(async () => undefined),
+    }
+
+    await hooks.tool?.pc_handoff_activate?.execute({
+      boundary_source: boundarySource,
+      objective: 'Continue in a fresh session.',
+      rollover_reasons: reasons,
+    }, context)
+    await hooks.tool?.pc_handoff_prepare?.execute({
+      objective: 'Continue in a fresh session.',
+      evidence: [{ kind: 'source', source_ref: boundarySource }],
+      rollover_reasons: reasons,
+    }, context)
+
+    expect(calls.filter((call) => call.url.includes('/v1/handoff/'))).toEqual([
+      { url: 'http://127.0.0.1:8000/v1/handoff/activate', body: {
+        boundary_source: boundarySource,
+        objective: 'Continue in a fresh session.',
+        evidence: [],
+        rollover_reasons: reasons,
+        scope_id: 'project:test',
+      } },
+      { url: 'http://127.0.0.1:8000/v1/handoff/prepare', body: {
+        objective: 'Continue in a fresh session.',
+        evidence: [{ kind: 'source', source_ref: boundarySource }],
+        rollover_reasons: reasons,
+        scope_id: 'project:test',
+      } },
+    ])
   })
 
   it('does not send secret-shaped prompts', async () => {
@@ -234,6 +304,8 @@ describe('PowerContextPlugin', () => {
       const calls: Array<{ url: string; body: any }> = []
       vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
         calls.push({ url, body: JSON.parse(String(init.body)) })
+        const binding = bindingResponse(url, calls.at(-1)?.body)
+        if (binding) return binding
         if (url.endsWith('/v1/context/prepare')) {
           return Response.json({
             schema: 'powercontext.prepared-context.v1',
@@ -268,7 +340,7 @@ describe('PowerContextPlugin', () => {
 
       const prepared = calls.filter((call) => call.url.endsWith('/v1/context/prepare'))
       expect(prepared).toHaveLength(2)
-      expect(new Set(prepared.map((call) => call.body.scope_id)).size).toBe(2)
+      expect(new Set(prepared.map((call) => call.body.scope_id))).toEqual(new Set(['default-scope']))
       const captured = calls.filter((call) => call.url.endsWith('/v1/sources/content'))
       expect(captured.map((call) => call.body.metadata.cwd)).toEqual([firstDirectory, secondDirectory])
       expect(input.client.session.get).not.toHaveBeenCalled()
@@ -278,13 +350,15 @@ describe('PowerContextPlugin', () => {
     }
   })
 
-  it('loads uncached session directories and shares scope only within the same project', async () => {
+  it('loads uncached session directories without inventing workspace Scopes', async () => {
     const firstProject = await mkdtemp(join(tmpdir(), 'powercontext-opencode-shared-'))
     const secondProject = await mkdtemp(join(tmpdir(), 'powercontext-opencode-isolated-'))
     try {
       const calls: Array<{ url: string; body: any }> = []
       vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
         calls.push({ url, body: JSON.parse(String(init.body)) })
+        const binding = bindingResponse(url, calls.at(-1)?.body)
+        if (binding) return binding
         if (url.endsWith('/v1/context/prepare')) {
           return Response.json({
             schema: 'powercontext.prepared-context.v1',
@@ -325,7 +399,7 @@ describe('PowerContextPlugin', () => {
         prepared[0]?.body.scope_id,
         prepared[2]?.body.scope_id,
       ])
-      expect(prepared[2]?.body.scope_id).not.toBe(prepared[0]?.body.scope_id)
+      expect(prepared[2]?.body.scope_id).toBe(prepared[0]?.body.scope_id)
       const captured = calls.filter((call) => call.url.endsWith('/v1/sources/content'))
       expect(captured.map((call) => call.body.metadata.cwd)).toEqual([firstProject, firstProject, secondProject])
       expect(input.client.session.get).toHaveBeenCalledTimes(3)
@@ -340,6 +414,8 @@ describe('PowerContextPlugin', () => {
     const calls: Array<{ url: string; body: any }> = []
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
       calls.push({ url, body: JSON.parse(String(init.body)) })
+      const binding = bindingResponse(url, calls.at(-1)?.body)
+      if (binding) return binding
       if (url.endsWith('/v1/context/prepare')) {
         return Response.json({
           schema: 'powercontext.prepared-context.v1',

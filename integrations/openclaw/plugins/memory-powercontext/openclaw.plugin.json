@@ -15,7 +15,13 @@
       "powercontext_memory_get",
       "powercontext_memory_store",
       "powercontext_memory_revise",
-      "powercontext_memory_retire"
+      "powercontext_memory_retire",
+      "powercontext_work_contract_create",
+      "powercontext_handoff_current_work",
+      "powercontext_handoff_commit",
+      "powercontext_handoff_continue",
+      "powercontext_handoff_acknowledge",
+      "powercontext_task_outcome"
     ]
   },
   "toolMetadata": {
@@ -26,6 +32,21 @@
       "sideEffecting": true
     },
     "powercontext_memory_retire": {
+      "sideEffecting": true
+    },
+    "powercontext_work_contract_create": {
+      "sideEffecting": true
+    },
+    "powercontext_handoff_current_work": {
+      "sideEffecting": true
+    },
+    "powercontext_handoff_commit": {
+      "sideEffecting": true
+    },
+    "powercontext_handoff_acknowledge": {
+      "sideEffecting": true
+    },
+    "powercontext_task_outcome": {
       "sideEffecting": true
     }
   },
@@ -44,6 +65,10 @@
             "pattern": "^https?://"
           }
         ]
+      },
+      "allowInsecureHttp": {
+        "type": "boolean",
+        "description": "Explicitly permit plaintext HTTP to a non-loopback server. HTTPS certificate verification remains enabled."
       },
       "tokenEnv": {
         "type": "string",
@@ -77,13 +102,15 @@
         "maximum": 20000,
         "default": 4000
       },
-      "scopeMode": {
+      "scopeId": {
         "type": "string",
-        "enum": [
-          "agent",
-          "project"
-        ],
-        "default": "agent"
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": ".*\\S.*"
+      },
+      "contextAssembly": {
+        "type": "object",
+        "description": "Optional context assembly request. Omit for legacy output; use {} for standard text or set sections and show."
       }
     }
   },
@@ -92,13 +119,24 @@
       "label": "PowerContext Endpoint",
       "help": "Base URL of the PowerContext server."
     },
+    "allowInsecureHttp": {
+      "label": "Allow insecure HTTP",
+      "help": "Explicit consent to send requests and credentials over plaintext HTTP outside loopback."
+    },
     "tokenEnv": {
       "label": "PowerContext Token Environment Variable",
       "help": "Environment variable containing the Bearer token, read by the Gateway process."
     },
-    "scopeMode": {
-      "label": "Memory Scope",
-      "help": "Agent scope is the default. Project scope is used only when OpenClaw supplies exactly one trusted project identity for a turn."
+    "scopeId": {
+      "label": "Explicit Scope ID",
+      "help": "Optional existing PowerContext Scope. When unset, the Server resolves durable OpenClaw bindings and then its default Scope."
+    },
+    "contextAssembly": {
+      "label": "Context text assembly",
+      "help": "Select Memory, Experience, and Profile sections and their order, limits, and displayed metadata."
     }
-  }
+  },
+  "skills": [
+    "./skills"
+  ]
 }
