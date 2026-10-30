@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+import time_machine
 
 from powercontext.builtin.artifacts.atomic_memory import AtomicMemoryContent
 from powercontext.builtin.artifacts.atomic_memory.extraction import (
@@ -32,14 +34,18 @@ from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.runtime import (
     BuiltinConfig,
     CaptureSource,
+    CaptureWorkingNote,
     CommitConnectorCheckpoint,
+    InvalidRuntimeRequestError,
     PrepareContextRequest,
     SubmitSourceObservation,
+    WorkingNoteKind,
     open_builtin_contexts,
     open_builtin_runtime,
 )
 from powercontext.builtin.scope import ScopeDraft, ScopeMutation, ScopeNotFoundError
 from powercontext.builtin.sources import CONTENT_SOURCE_DEFINITION, ContentCapture
+from powercontext.errors import SourceConflictError
 from powercontext.sources import ConnectorBinding, SourceDefinitionRegistry, project_source_for_transport
 from tests.e2e.dream_support import atomic_memory_pipeline, memory_source_text
 
@@ -49,12 +55,67 @@ class _ContentCandidatePipeline:
         return GenerationResult(
             output=AtomicMemoryExtractionOutput(
                 candidates=tuple(
-                    AtomicMemoryCandidate(kind="fact", text=text, evidence_ids=(evidence.evidence_id,))
+                    AtomicMemoryCandidate(
+                        kind="fact",
+                        text=text,
+                        evidence_ids=(evidence.evidence_id,),
+                        description="Extracted fixture fact",
+                    )
                     for evidence in request.evidence
                     if (text := memory_source_text(evidence)) is not None
                 )
             )
         )
+
+
+def test_scoped_source_capture_many_keeps_order_and_replay_identity() -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Batch capture", summary="Stable ordered input", idempotency_key="batch-capture")
+            )
+            sources = runtime.sources.for_scope(scope.scope_id)
+            values = (
+                CaptureSource(source_id="first", content="First fact", metadata={}),
+                CaptureSource(source_id="second", content="Second fact", metadata={}),
+                CaptureSource(source_id="third", content="Third fact", metadata={}),
+            )
+            receipts = await sources.capture_many(values)
+            assert tuple(receipt.sequence for receipt in receipts) == (1, 2, 3)
+            assert await sources.capture_many(values) == receipts
+            with pytest.raises(SourceConflictError):
+                await sources.capture_many((
+                    values[0],
+                    CaptureSource(source_id="second", content="Changed", metadata={}),
+                ))
+            assert (
+                await sources.capture(CaptureSource(source_id="fourth", content="Fourth fact", metadata={}))
+            ).sequence == 4
+
+    asyncio.run(scenario())
+
+
+def test_atomic_memory_create_many_returns_exact_current_records() -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+            assert runtime.scopes is not None
+            assert runtime.atomic_memory is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Memory batch", summary="Complete returned records", idempotency_key="memory-batch")
+            )
+            memories = runtime.atomic_memory.for_scope(scope.scope_id)
+            contents = tuple(AtomicMemoryContent(kind="fact", text=f"Fact {index}") for index in range(3))
+            created = await memories.create(contents)
+            assert tuple(record.artifact.content for record in created.records) == tuple(
+                content.model_copy(update={"description": content.text}) for content in contents
+            )
+            assert tuple(record.artifact.revision for record in created.records) == (1, 1, 1)
+            assert all(len(record.artifact.lineage.sources) == 1 for record in created.records)
+            for record in created.records:
+                assert await memories.get(record.artifact.artifact_id) == record
+
+    asyncio.run(scenario())
 
 
 def test_builtin_runtime_rejects_unregistered_scope_without_persisting_data(tmp_path) -> None:
@@ -168,6 +229,104 @@ def test_builtin_runtime_uses_sqlite_fts_without_vector_extension(tmp_path, monk
     asyncio.run(scenario())
 
 
+def test_working_note_capture_does_not_promote_into_memory() -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(
+            BuiltinConfig(database=SQLiteConfig()),
+            candidate_pipeline=atomic_memory_pipeline(_ContentCandidatePipeline()),
+        ) as runtime:
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Project", summary="Working note boundary", idempotency_key="working-note")
+            )
+            for field, field_value in (
+                ("kind", "working_note"),
+                ("session_id", "metadata-session"),
+                ("note_kind", "validation"),
+                ("expires_at", "2000-01-01T00:00:00+00:00"),
+            ):
+                with pytest.raises(InvalidRuntimeRequestError):
+                    await runtime.sources.for_scope(scope.scope_id).capture_working_note(
+                        CaptureWorkingNote(
+                            source_id=f"reserved-{field}",
+                            content="Caller metadata cannot set server-owned Working Note fields.",
+                            session_id="session-1",
+                            note_kind=WorkingNoteKind.VALIDATION,
+                            metadata={field: field_value},
+                        )
+                    )
+            with pytest.raises(InvalidRuntimeRequestError) as naive_expiry:
+                await runtime.sources.for_scope(scope.scope_id).capture_working_note(
+                    CaptureWorkingNote(
+                        source_id="naive-expiry",
+                        content="The expiry has no time zone.",
+                        session_id="session-1",
+                        note_kind=WorkingNoteKind.VALIDATION,
+                        expires_at=datetime(2099, 1, 1),  # noqa: DTZ001 - naive on purpose
+                    )
+                )
+            assert naive_expiry.value.code == "working-note-expiry-timezone"
+            captured = await runtime.sources.for_scope(scope.scope_id).capture_working_note(
+                CaptureWorkingNote(
+                    source_id="note-1",
+                    content="The rejected approach depended on an unavailable API.",
+                    session_id="session-1",
+                    note_kind=WorkingNoteKind.ABANDONED_APPROACH,
+                    expires_at=datetime(2099, 1, 1, tzinfo=timezone(-timedelta(hours=8))),
+                )
+            )
+            replayed = await runtime.sources.for_scope(scope.scope_id).capture_working_note(
+                CaptureWorkingNote(
+                    source_id="note-1",
+                    content="The rejected approach depended on an unavailable API.",
+                    session_id="session-1",
+                    note_kind=WorkingNoteKind.ABANDONED_APPROACH,
+                    expires_at=datetime(2099, 1, 1, 8, tzinfo=UTC),
+                )
+            )
+            with time_machine.travel(datetime(2100, 1, 1, tzinfo=UTC)):
+                expired_replay = await runtime.sources.for_scope(scope.scope_id).capture_working_note(
+                    CaptureWorkingNote(
+                        source_id="note-1",
+                        content="The rejected approach depended on an unavailable API.",
+                        session_id="session-1",
+                        note_kind=WorkingNoteKind.ABANDONED_APPROACH,
+                        expires_at=datetime(2099, 1, 1, 8, tzinfo=UTC),
+                    )
+                )
+                with pytest.raises(SourceConflictError):
+                    await runtime.sources.for_scope(scope.scope_id).capture_working_note(
+                        CaptureWorkingNote(
+                            source_id="note-1",
+                            content="Different content cannot reuse the identity.",
+                            session_id="session-1",
+                            note_kind=WorkingNoteKind.ABANDONED_APPROACH,
+                            expires_at=datetime(2099, 1, 1, 8, tzinfo=UTC),
+                        )
+                    )
+                with pytest.raises(InvalidRuntimeRequestError) as past_expiry:
+                    await runtime.sources.for_scope(scope.scope_id).capture_working_note(
+                        CaptureWorkingNote(
+                            source_id="never-accepted",
+                            content="A new expired note is invalid.",
+                            session_id="session-1",
+                            note_kind=WorkingNoteKind.ABANDONED_APPROACH,
+                            expires_at=datetime(2099, 1, 1, 8, tzinfo=UTC),
+                        )
+                    )
+                assert past_expiry.value.code == "working-note-expiry-past"
+
+            assert runtime.atomic_memory is not None
+            flushed = await runtime.atomic_memory.for_scope(scope.scope_id).flush()
+
+            assert replayed == captured
+            assert expired_replay == captured
+            assert flushed.current_cursor == captured.sequence
+            assert flushed.memory_ref is None
+
+    asyncio.run(scenario())
+
+
 def test_prepare_context_reads_only_direct_context_references() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
@@ -201,10 +360,14 @@ def test_prepare_context_reads_only_direct_context_references() -> None:
             )
             assert runtime.atomic_memory is not None
             shared_memory = await runtime.atomic_memory.for_scope(shared.scope_id).create((
-                AtomicMemoryContent(kind="fact", text="Shared direct context evidence."),
+                AtomicMemoryContent(
+                    kind="fact", text="Shared direct context evidence.", description="Explicit fixture memory"
+                ),
             ))
             await runtime.atomic_memory.for_scope(middle.scope_id).create((
-                AtomicMemoryContent(kind="fact", text="Middle reverse-only evidence."),
+                AtomicMemoryContent(
+                    kind="fact", text="Middle reverse-only evidence.", description="Explicit fixture memory"
+                ),
             ))
 
             direct = await runtime.context.for_scope(middle.scope_id).prepare(
@@ -265,12 +428,18 @@ def test_prepare_context_keeps_referenced_scope_eligible_when_local_recall_is_fu
             assert runtime.atomic_memory is not None
             await runtime.atomic_memory.for_scope(reader.scope_id).create(
                 tuple(
-                    AtomicMemoryContent(kind="fact", text=f"Candidate saturation local evidence {index}.")
+                    AtomicMemoryContent(
+                        kind="fact",
+                        text=f"Candidate saturation local evidence {index}.",
+                        description="Explicit fixture memory",
+                    )
                     for index in range(16)
                 )
             )
             shared_memory = await runtime.atomic_memory.for_scope(shared.scope_id).create((
-                AtomicMemoryContent(kind="fact", text="Candidate saturation shared evidence."),
+                AtomicMemoryContent(
+                    kind="fact", text="Candidate saturation shared evidence.", description="Explicit fixture memory"
+                ),
             ))
 
             prepared = await runtime.context.for_scope(reader.scope_id).prepare(
@@ -317,7 +486,7 @@ def test_prepare_build_reports_no_recall_effort_while_the_gate_is_disabled() -> 
             )
             assert runtime.atomic_memory is not None
             await runtime.atomic_memory.for_scope(scope.scope_id).create((
-                AtomicMemoryContent(kind="fact", text="Disabled gate evidence."),
+                AtomicMemoryContent(kind="fact", text="Disabled gate evidence.", description="Explicit fixture memory"),
             ))
             request = PrepareContextRequest(query="disabled gate evidence")
             application = runtime.context.for_scope(scope.scope_id)
@@ -342,7 +511,9 @@ def test_same_scope_read_only_searches_do_not_serialize_reranking() -> None:
             )
             assert runtime.atomic_memory is not None
             memory = runtime.atomic_memory.for_scope(scope.scope_id)
-            await memory.create((AtomicMemoryContent(kind="fact", text="Parallel search fact."),))
+            await memory.create((
+                AtomicMemoryContent(kind="fact", text="Parallel search fact.", description="Explicit fixture memory"),
+            ))
 
             first = asyncio.create_task(memory.search("parallel", mode="text", limit=1))
             second = asyncio.create_task(memory.search("parallel", mode="text", limit=1))
@@ -359,7 +530,15 @@ def test_atomic_get_inside_in_memory_write_keeps_the_outer_rollback() -> None:
             with pytest.raises(RuntimeError, match="abort outer write"):
                 async with contexts.database.transaction():
                     created = await contexts.records.create_artifact(
-                        "project", "atomic-memory", ArtifactWrite(content={"kind": "fact", "text": "Uncommitted fact"})
+                        "project",
+                        "atomic-memory",
+                        ArtifactWrite(
+                            content={
+                                "kind": "fact",
+                                "text": "Uncommitted fact",
+                                "description": "Explicit fixture memory",
+                            }
+                        ),
                     )
                     loaded = await contexts.atomic_memory.for_scope("project").get(created.artifact_id)
                     assert loaded.artifact.content.text == "Uncommitted fact"

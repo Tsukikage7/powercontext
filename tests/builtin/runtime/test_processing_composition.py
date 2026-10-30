@@ -18,7 +18,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -29,6 +29,7 @@ from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
 from powercontext.builtin.persistence.processing_migration import (
     ProcessingSchemaNotReadyError,
     apply_processing_migration,
+    bootstrap_processing_schema,
 )
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
 from powercontext.builtin.persistence.supervision import ArtifactProcessingFence
@@ -56,6 +57,18 @@ from powercontext.builtin.runtime.topic_memory_processing import TopicMemoryWork
 
 _FAMILIES = {"memory", "topic-memory", "experience", "profile"}
 _BINDING = "topic-memory-source-window"
+_PRE_HANDOFF_PROMPT_MANIFEST = {
+    "mode": "global",
+    "capabilities": [],
+    "bindings": {
+        "memory-source-window": "memory",
+        "topic-memory-source-window": "topic-memory",
+        "experience-incubation": "experience",
+        "profile-source-window": "profile",
+        "skill.dream.v1": "skill",
+    },
+    "legacy_automatic_bindings": ["topic-memory-source-window"],
+}
 _OCEANBASE = OceanBaseConfig(
     url=SecretStr("mysql+aoceanbase://root%40test@127.0.0.1:2881/composition_unused?charset=utf8mb4")
 )
@@ -110,6 +123,32 @@ def test_fresh_sqlite_bootstraps_and_reopens_after_business_data_is_written(tmp_
     asyncio.run(scenario())
 
 
+def test_startup_rejects_legacy_dream_manifest_without_rewriting_it(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = _sqlite(tmp_path / "pre-dream-bindings.db")
+        config = BuiltinConfig(database=database, runtime=RuntimeConfig(dream_enabled=False))
+        async with (
+            SQLiteProfile.open(database, tables=SHARED_TABLES) as profile,
+            profile.database.transaction() as connection,
+        ):
+            await bootstrap_processing_schema(connection, _PRE_HANDOFF_PROMPT_MANIFEST)
+            before = (await connection.execute(select(ARTIFACT_PROCESSING_SCHEMA_TABLE))).mappings().one()
+
+        for _ in range(2):
+            with pytest.raises(ProcessingSchemaNotReadyError, match="configuration differs"):
+                async with open_builtin_contexts(config):
+                    pytest.fail("Legacy Dream bindings require explicit maintenance")
+
+        async with (
+            SQLiteProfile.open(database, tables=SHARED_TABLES) as profile,
+            profile.database.transaction() as connection,
+        ):
+            after = (await connection.execute(select(ARTIFACT_PROCESSING_SCHEMA_TABLE))).mappings().one()
+        assert after == before
+
+    asyncio.run(scenario())
+
+
 def test_nonempty_legacy_sqlite_is_rejected_without_importing_or_discarding_work(tmp_path: Path) -> None:
     async def scenario() -> None:
         database = _sqlite(tmp_path / "legacy.db")
@@ -149,8 +188,8 @@ def test_partial_migration_refuses_split_role_startup(
         # Exercise the OceanBase role's real startup gate against a real SQLite
         # transaction. A failed gate must run before dialect-specific indexes.
         @asynccontextmanager
-        async def local_profile(_config, *, tables):
-            async with SQLiteProfile.open(database, tables=tables) as profile:
+        async def local_profile(_config, *, tables, _archive_recovery=False):
+            async with SQLiteProfile.open(database, tables=tables, _archive_recovery=_archive_recovery) as profile:
                 yield profile
 
         monkeypatch.setattr(composition.OceanBaseProfile, "open", local_profile)
@@ -318,3 +357,48 @@ def test_composition_opens_one_global_or_four_dedicated_controllers(
         launch.assert_not_called()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("missing_profile", [False, True])
+def test_injected_components_skip_unneeded_provider_initialization(tmp_path, monkeypatch, missing_profile):
+    from powercontext.builtin.artifacts.atomic_memory.extraction import AtomicMemoryGenerationPipeline
+    from powercontext.builtin.inference import character_token_estimator
+    from tests.builtin.runtime.test_decision_composition import _FakeDecisionModel
+
+    async def open_provider(*args, **kwargs):
+        raise RuntimeError("default provider initialization requested")  # noqa: TRY003
+
+    monkeypatch.setattr(composition, "_open_pydantic_ai_model", open_provider)
+    component = cast(Any, SimpleNamespace(supports_atomic_memory=True))
+    pipeline = AtomicMemoryGenerationPipeline(
+        extractor=component, reconciler=component, estimator=character_token_estimator()
+    )
+    config = BuiltinConfig(
+        database=_sqlite(tmp_path / "injected.db"),
+        inference=InferenceConfig(generation_model="openai:unused"),
+        runtime=RuntimeConfig(
+            artifact_processing_families=(), memory_rerank_enabled=True, decision_assistance_enabled=True
+        ),
+    )
+
+    async def scenario():
+        async with open_builtin_runtime(
+            config,
+            candidate_pipeline=pipeline,
+            profile_generator=None if missing_profile else component,
+            experience_pipeline=component,
+            experience_generator=component,
+            skill_generator=component,
+            handoff_pipeline=component,
+            memory_reranker=component,
+            decision_model=_FakeDecisionModel(),
+            scheduler_path=tmp_path / "injected.scheduler.db",
+        ) as runtime:
+            assert runtime.decision_model is not None
+            assert await runtime.readiness()
+
+    if missing_profile:
+        with pytest.raises(RuntimeError, match="default provider initialization requested"):
+            asyncio.run(scenario())
+    else:
+        asyncio.run(scenario())

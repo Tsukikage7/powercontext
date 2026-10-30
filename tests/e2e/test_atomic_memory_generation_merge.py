@@ -29,6 +29,7 @@ from powercontext.builtin.artifacts.atomic_memory.extraction import (
     AtomicMemoryGenerationPipeline,
 )
 from powercontext.builtin.artifacts.atomic_memory.reconciliation import (
+    ATOMIC_MEMORY_RECONCILIATION_INSTRUCTIONS,
     AtomicMemoryArtifactEvidence,
     AtomicMemoryReconciliationContent,
     AtomicMemoryReconciliationInput,
@@ -58,6 +59,7 @@ class _PolicyExtractor:
                         kind="constraint",
                         text=POLICY if text == CONSOLIDATION else text,
                         evidence_ids=(item.evidence_id,),
+                        description="Extracted fixture fact",
                     )
                     for item in request.evidence
                     if (text := memory_source_text(item)) is not None
@@ -87,7 +89,9 @@ class _PolicyReconciler:
                 action="merge" if merge else "create",
                 compared_ids=tuple(item.item_id for item in request.related),
                 target_ids=tuple(item.item_id for item in inputs) if merge else (),
-                content=AtomicMemoryReconciliationContent(kind=request.proposal.kind, text=request.proposal.text),
+                content=AtomicMemoryReconciliationContent(
+                    kind=request.proposal.kind, text=request.proposal.text, description="Reconciled fixture fact"
+                ),
                 evidence_ids=evidence_ids,
                 reason="Combine the two existing rollout rules with the consolidation Source evidence."
                 if merge
@@ -101,7 +105,12 @@ class _RevisionExtractor:
         return GenerationResult(
             output=AtomicMemoryExtractionOutput(
                 candidates=tuple(
-                    AtomicMemoryCandidate(kind="fact", text=text.split("\n", 1)[0], evidence_ids=(item.evidence_id,))
+                    AtomicMemoryCandidate(
+                        kind="fact",
+                        text=text.split("\n", 1)[0],
+                        evidence_ids=(item.evidence_id,),
+                        description="Extracted fixture fact",
+                    )
                     for item in request.evidence
                     if (text := memory_source_text(item)) is not None
                 )
@@ -121,7 +130,9 @@ class _RevisionReconciler:
                 action="create" if target is None else "merge" if request.proposal.original_refs else "revise",
                 compared_ids=tuple(item.item_id for item in request.related),
                 target_ids=() if target is None else (target.item_id,),
-                content=AtomicMemoryReconciliationContent(kind="fact", text=request.proposal.text),
+                content=AtomicMemoryReconciliationContent(
+                    kind="fact", text=request.proposal.text, description="Reconciled fixture fact"
+                ),
                 evidence_ids=request.proposal.evidence_ids
                 if target is None
                 else (*request.proposal.evidence_ids, *target.evidence_ids),
@@ -137,7 +148,9 @@ class _SupportedCreateReconciler(_RevisionReconciler):
             output=AtomicMemoryReconciliationOutput(
                 action="create",
                 compared_ids=tuple(item.item_id for item in request.related),
-                content=AtomicMemoryReconciliationContent(kind="constraint", text=request.proposal.text),
+                content=AtomicMemoryReconciliationContent(
+                    kind="constraint", text=request.proposal.text, description="Reconciled fixture fact"
+                ),
                 evidence_ids=tuple(item.evidence_id for item in request.evidence),
                 reason="Keep the independent precheck rule with supporting budget facts without consuming them.",
             )
@@ -250,7 +263,8 @@ def test_repeated_source_evolution_keeps_flush_bounded_and_exact_history_readabl
             # The default budget continues to admit a new Source and the compact
             # published fact while exact predecessor revisions grow independently.
             assert all(
-                estimator.estimate(request.model_dump_json()) < config.runtime.atomic_memory_input_tokens_limit
+                estimator.estimate(f"{ATOMIC_MEMORY_RECONCILIATION_INSTRUCTIONS}\n{request.model_dump_json()}")
+                <= config.runtime.atomic_memory_input_tokens_limit
                 for request in reconciler.requests
             )
             for request in reconciler.requests:
@@ -290,8 +304,16 @@ def test_batched_reconciliation_keeps_published_evidence_fixed_when_working_cont
             originals = await contexts.records.create_atomic_memories(
                 SCOPE,
                 (
-                    {"kind": "fact", "text": "Database rollout budget is 1 units."},
-                    {"kind": "fact", "text": "Database rollout budget is 2 units."},
+                    {
+                        "kind": "fact",
+                        "text": "Database rollout budget is 1 units.",
+                        "description": "Database rollout budget: one unit",
+                    },
+                    {
+                        "kind": "fact",
+                        "text": "Database rollout budget is 2 units.",
+                        "description": "Database rollout budget: two units",
+                    },
                 ),
             )
             published = {record.ref.artifact_id: record for record in (await memory.list()).items}
@@ -341,8 +363,16 @@ def test_batched_create_can_cite_existing_artifacts_without_consuming_their_iden
             await contexts.records.create_atomic_memories(
                 SCOPE,
                 (
-                    {"kind": "fact", "text": "Database rollout budget is 1 units."},
-                    {"kind": "fact", "text": "Database rollout budget is 2 units."},
+                    {
+                        "kind": "fact",
+                        "text": "Database rollout budget is 1 units.",
+                        "description": "Database rollout budget: one unit",
+                    },
+                    {
+                        "kind": "fact",
+                        "text": "Database rollout budget is 2 units.",
+                        "description": "Database rollout budget: two units",
+                    },
                 ),
             )
             originals = (await memory.list()).items

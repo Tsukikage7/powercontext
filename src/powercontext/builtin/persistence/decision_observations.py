@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.builtin.decision_observations import DecisionObservation
+from powercontext.builtin.decision_projection_contract import DecisionProjectionFact
 from powercontext.builtin.persistence.codec import dump_model, load_model, stored_bytes
 from powercontext.builtin.persistence.errors import StoredPayloadConflictError
 from powercontext.builtin.persistence.tables import DECISION_OBSERVATIONS_TABLE
@@ -35,7 +36,8 @@ _SAFE_REASON = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 _SAFE_REFERENCE = re.compile(
     r"(?:candidate|evidence):[0-9]+|(?:candidate:[0-9]+ )?(?:entry|source|artifact):[A-Za-z0-9_.:@-]{1,2200}\Z"
 )
-_SAFE_METADATA_KEYS = frozenset({"candidate_count", "evidence_count", "incomplete_subject_count"})
+_SAFE_METADATA_KEYS = frozenset({"candidate_count", "evidence_count", "incomplete_subject_count", "redaction_facts"})
+_SAFE_REDACTION_FACTS = frozenset(fact.value for fact in DecisionProjectionFact)
 
 
 class DecisionObservationRepository:
@@ -149,10 +151,16 @@ def _validate_observation(observation: DecisionObservation, /) -> None:
     for reason in (observation.assessment.reason, observation.fallback_reason):
         if reason is not None and _SAFE_REASON.fullmatch(reason) is None:
             raise ValueError("decision observation reasons must be bounded codes")  # noqa: TRY003
-    if set(observation.metadata) - _SAFE_METADATA_KEYS or any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in observation.metadata.values()
-    ):
+    if set(observation.metadata) - _SAFE_METADATA_KEYS:
         raise ValueError("decision observation metadata must contain only nonnegative safe counters")  # noqa: TRY003
+    for key, value in observation.metadata.items():
+        if key == "redaction_facts":
+            if not isinstance(value, list | tuple) or not all(
+                isinstance(fact, str) and fact in _SAFE_REDACTION_FACTS for fact in value
+            ):
+                raise ValueError("decision observation redaction facts must be bounded codes")  # noqa: TRY003
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("decision observation metadata must contain only nonnegative safe counters")  # noqa: TRY003
 
 
 async def _ensure_sqlite_outer_transaction(connection: AsyncConnection, /) -> None:

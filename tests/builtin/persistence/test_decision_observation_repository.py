@@ -119,6 +119,24 @@ def test_repository_accepts_gate_generated_ordinal_references() -> None:
     asyncio.run(scenario())
 
 
+def test_repository_round_trips_bounded_redaction_facts() -> None:
+    async def scenario() -> None:
+        repository = DecisionObservationRepository()
+        observation = _observation().model_copy(
+            update={"metadata": {"candidate_count": 1, "evidence_count": 1, "redaction_facts": ["subject_redacted"]}}
+        )
+        async with SQLiteProfile.open(SQLiteConfig(), tables=SHARED_TABLES + DECISION_OBSERVATION_TABLES) as profile:
+            async with profile.database.transaction() as connection:
+                inserted = await repository.append(connection, observation)
+            async with profile.database.transaction() as connection:
+                stored = await repository.observations(connection, SCOPE)
+
+        assert inserted is True
+        assert stored == (observation,)
+
+    asyncio.run(scenario())
+
+
 def test_repository_treats_an_exact_observation_replay_as_idempotent() -> None:
     async def scenario() -> None:
         repository = DecisionObservationRepository()

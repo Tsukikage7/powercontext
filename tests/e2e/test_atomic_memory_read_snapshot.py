@@ -31,6 +31,7 @@ from powercontext.builtin.persistence.oceanbase import OceanBaseConfig, OceanBas
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
+from tests.e2e.atomic_memory_migration_backend import MigrationBackend
 
 
 class _Embedding:
@@ -73,7 +74,8 @@ def test_atomic_search_keeps_candidates_and_authority_in_one_snapshot(database, 
             await contexts.get("project")
             memory = contexts.atomic_memory.for_scope("project")
             (created,) = await contexts.records.create_atomic_memories(
-                "project", ({"kind": "fact", "text": "Alpha beta original body."},)
+                "project",
+                ({"kind": "fact", "text": "Alpha beta original body.", "description": "Original alpha beta fact"},),
             )
             index = contexts.atomic_memory.index
             original_search = index.search
@@ -90,7 +92,13 @@ def test_atomic_search_keeps_candidates_and_authority_in_one_snapshot(database, 
                             "atomic-memory",
                             created.artifact_id,
                             '"revision:1"',
-                            ArtifactWrite(content={"kind": "fact", "text": "Alpha beta revised body."}),
+                            ArtifactWrite(
+                                content={
+                                    "kind": "fact",
+                                    "text": "Alpha beta revised body.",
+                                    "description": "Revised alpha beta fact",
+                                }
+                            ),
                         )
                     )
                     assert revised.revision == 2
@@ -119,7 +127,8 @@ def test_atomic_reads_do_not_commit_the_in_memory_writer() -> None:
             with pytest.raises(RuntimeError, match="abort outer write"):
                 async with contexts.database.transaction():
                     (created,) = await contexts.records.create_atomic_memories(
-                        "project", ({"kind": "fact", "text": "Alpha pending write."},)
+                        "project",
+                        ({"kind": "fact", "text": "Alpha pending write.", "description": "Pending alpha fact"},),
                     )
                     record = await memory.get(created.artifact_id)
                     assert record.artifact.revision == 1
@@ -135,22 +144,27 @@ def test_atomic_reads_do_not_commit_the_in_memory_writer() -> None:
 
 
 @pytest.mark.parametrize("operation", ["get", "list"])
-def test_atomic_read_keeps_content_and_state_in_one_snapshot(database, operation: str, monkeypatch) -> None:
+def test_atomic_read_keeps_content_and_state_in_one_snapshot(
+    migration_backend: MigrationBackend, operation: str, monkeypatch
+) -> None:
+    database = migration_backend.config
+
     async def scenario() -> None:
         async with open_builtin_contexts(BuiltinConfig(database=database)) as contexts:
             await contexts.get("project")
             memory = contexts.atomic_memory.for_scope("project")
             (created,) = await contexts.records.create_atomic_memories(
-                "project", ({"kind": "fact", "text": "Original body."},)
+                "project", ({"kind": "fact", "text": "Original body.", "description": "Original fact"},)
             )
             repository = contexts.atomic_memory.service.artifacts
-            latest = repository.latest
+            read_method = "latest" if operation == "get" else "decode_many"
+            load = getattr(repository, read_method)
             changed = False
 
-            async def interleaved_latest(connection, scope_id, family, artifact_id, **kwargs):
+            async def interleaved_read(*args, **kwargs):
                 nonlocal changed
-                value = await latest(connection, scope_id, family, artifact_id, **kwargs)
-                if not changed and artifact_id == created.artifact_id:
+                value = await load(*args, **kwargs)
+                if not changed:
                     changed = True
 
                     async def publish() -> None:
@@ -159,7 +173,9 @@ def test_atomic_read_keeps_content_and_state_in_one_snapshot(database, operation
                             "atomic-memory",
                             created.artifact_id,
                             '"revision:1"',
-                            ArtifactWrite(content={"kind": "fact", "text": "Revised body."}),
+                            ArtifactWrite(
+                                content={"kind": "fact", "text": "Revised body.", "description": "Revised fact"}
+                            ),
                         )
                         await memory.forget(created.artifact_id, expected_revision=2, expected_state_version=0)
 
@@ -167,7 +183,7 @@ def test_atomic_read_keeps_content_and_state_in_one_snapshot(database, operation
                 return value
 
             with monkeypatch.context() as patch:
-                patch.setattr(repository, "latest", interleaved_latest)
+                patch.setattr(repository, read_method, interleaved_read)
                 if operation == "get":
                     first = await asyncio.wait_for(memory.get(created.artifact_id), timeout=20)
                 else:

@@ -15,15 +15,31 @@
 import re
 from pathlib import Path
 
-from sqlalchemy import BigInteger, Date, DateTime, Integer, LargeBinary, String, Table
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    inspect,
+)
 from sqlalchemy.dialects import mysql
 from sqlalchemy.schema import CreateTable, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 
+from powercontext.builtin.persistence.schema import _create_mysql_tables
 from powercontext.builtin.persistence.tables import (
     AGENT_SKILL_TARGETS_TABLE,
+    ARTIFACT_HANDLES_TABLE,
     ARTIFACTS_TABLE,
     BUILTIN_TABLES,
     SHARED_METADATA,
+    SHARED_TABLES,
     SKILL_PACKAGES_TABLE,
     SOURCE_CURSORS_TABLE,
     SOURCES_TABLE,
@@ -31,6 +47,22 @@ from powercontext.builtin.persistence.tables import (
 
 INNODB_MAX_INDEX_BYTES = 3072
 UTF8MB4_MAX_BYTES_PER_CHARACTER = 4
+
+
+def test_mysql_initialization_ignores_unselected_table_with_unresolved_foreign_key() -> None:
+    metadata = MetaData()
+    selected = Table("pc_selected", metadata, Column("id", Integer, primary_key=True))
+    Table(
+        "pc_unselected",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("missing_id", Integer, ForeignKey("pc_missing.id")),
+    )
+
+    with create_engine("sqlite://").begin() as connection:
+        _create_mysql_tables(connection, (selected,))
+        assert inspect(connection).has_table(selected.name)
+        assert not inspect(connection).has_table("pc_unselected")
 
 
 class _UnbudgetedColumnTypeError(AssertionError):
@@ -49,6 +81,8 @@ def _column_budget(column) -> int:
         return column.type.length
     if isinstance(column.type, Integer):
         return 4
+    if isinstance(column.type, DateTime):
+        return 8
     if isinstance(column.type, Date):
         return 3
     if isinstance(column.type, DateTime):
@@ -62,6 +96,35 @@ def test_mysql_ddl_uses_utf8mb4_bin_for_identity_keys() -> None:
     assert "scope_id VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in ddl
     assert "source_id VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in ddl
     assert "source_type VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in ddl
+
+
+def test_artifact_handles_use_scope_local_identity_and_exact_revision_target() -> None:
+    primary_key = tuple(column.name for column in ARTIFACT_HANDLES_TABLE.primary_key.columns)
+    foreign_keys = tuple(
+        constraint
+        for constraint in ARTIFACT_HANDLES_TABLE.foreign_key_constraints
+        if constraint.referred_table is ARTIFACTS_TABLE
+    )
+
+    assert primary_key == ("scope_id", "family", "handle_key")
+    assert len(foreign_keys) == 1
+    assert tuple(element.parent.name for element in foreign_keys[0].elements) == (
+        "scope_id",
+        "family",
+        "artifact_id",
+        "revision",
+    )
+    assert tuple(element.column.name for element in foreign_keys[0].elements) == (
+        "scope_id",
+        "family",
+        "artifact_id",
+        "revision",
+    )
+    assert foreign_keys[0].ondelete == "RESTRICT"
+    assert "ck_pc_artifact_handles_revision_positive" in {
+        constraint.name for constraint in ARTIFACT_HANDLES_TABLE.constraints
+    }
+    assert ARTIFACT_HANDLES_TABLE in SHARED_TABLES
 
 
 def test_mysql_ddl_uses_mediumblob_for_every_canonical_payload() -> None:

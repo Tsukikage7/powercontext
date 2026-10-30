@@ -74,8 +74,6 @@ def test_native_vector_initialization_is_idempotent_and_preserves_hnsw(family):
             else {
                 "CREATE VECTOR INDEX IF NOT EXISTS ix_pc_topic_memory_vector_topics_embedding "
                 "ON pc_topic_memory_vector_topics (embedding) WITH (distance=l2,type=hnsw)",
-                "CREATE VECTOR INDEX IF NOT EXISTS ix_pc_topic_memory_vector_chunks_embedding "
-                "ON pc_topic_memory_vector_chunks (embedding) WITH (distance=l2,type=hnsw)",
             }
         )
         assert set(vector_ddl) == expected

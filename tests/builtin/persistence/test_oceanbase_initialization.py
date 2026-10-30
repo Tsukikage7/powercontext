@@ -238,7 +238,6 @@ def test_live_vector_initialization_is_concurrent_and_repeatable() -> None:
                 expected = {
                     ("pc_atomic_memory_current", "ix_pc_atomic_memory_current_embedding"),
                     ("pc_topic_memory_vector_topics", "ix_pc_topic_memory_vector_topics_embedding"),
-                    ("pc_topic_memory_vector_chunks", "ix_pc_topic_memory_vector_chunks_embedding"),
                 }
                 rows = (
                     await connection.execute(

@@ -203,6 +203,37 @@ describe('PowerContextPlugin', () => {
     expect(calls.find((call) => call.url.endsWith('/v1/sources/content'))?.body.content).toBe('"preserve these quotes"')
   })
 
+  it('sends the end of a long prompt as the recall query and captures the whole prompt', async () => {
+    process.env.POWERCONTEXT_OPENCODE_SCOPE_ID = 'project:test'
+    const calls: Array<{ url: string; body: any }> = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      calls.push({ url, body: JSON.parse(String(init.body)) })
+      const binding = bindingResponse(url, calls.at(-1)?.body)
+      if (binding) return binding
+      if (url.endsWith('/v1/context/prepare')) {
+        return Response.json({
+          schema: 'powercontext.prepared-context.v1',
+          status: 'empty',
+          content: null,
+          content_bytes: 0,
+        })
+      }
+      return Response.json({ position: 7 }, { status: 202 })
+    }))
+    const hooks = await PowerContextPlugin(pluginInput())
+    const incoming = userMessage()
+    const prompt = `${'earlier context '.repeat(1_000)}Which service owns the retry?`
+    incoming.parts[0]!.text = prompt
+
+    await hooks['chat.message']?.(
+      { sessionID: 'session-1', messageID: 'msg-1' },
+      { message: incoming.info, parts: incoming.parts } as any,
+    )
+
+    expect(calls.find((call) => call.url.endsWith('/v1/context/prepare'))?.body.query).toBe(prompt.slice(-8_192))
+    expect(calls.find((call) => call.url.endsWith('/v1/sources/content'))?.body.content).toBe(prompt)
+  })
+
   it('asks before a durable tool operation', async () => {
     process.env.POWERCONTEXT_OPENCODE_SCOPE_ID = 'project:test'
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
@@ -228,6 +259,92 @@ describe('PowerContextPlugin', () => {
     expect(JSON.parse(String(result))).toMatchObject({ ok: true })
   })
 
+  it('captures a Working Note through the scoped operation', async () => {
+    process.env.POWERCONTEXT_OPENCODE_SCOPE_ID = 'project:test'
+    const calls: Array<{ url: string; body: any }> = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      const body = init.body ? JSON.parse(String(init.body)) : undefined
+      calls.push({ url, body })
+      return bindingResponse(url, body) ?? Response.json({ status: 'accepted' }, { status: 202 })
+    }))
+    const hooks = await PowerContextPlugin(pluginInput())
+    const ask = vi.fn(async () => undefined)
+    const result = await hooks.tool?.pc_capture_working_note?.execute(
+      {
+        source_id: 'note-1',
+        content: 'Parser validation is still in progress.',
+        session_id: 'session-1',
+        note_kind: 'validation',
+        expires_at: '2030-01-02T00:00:00Z',
+      },
+      {
+        sessionID: 'session-1', messageID: 'msg-1', agent: 'build',
+        directory: '/tmp/project', worktree: '/tmp/project',
+        abort: new AbortController().signal, metadata: vi.fn(), ask,
+      },
+    )
+    expect(ask).toHaveBeenCalledWith(expect.objectContaining({ permission: 'powercontext' }))
+    expect(calls.find((call) => call.url.endsWith('/v1/sources/working-notes'))?.body).toEqual({
+      source_id: 'note-1',
+      content: 'Parser validation is still in progress.',
+      session_id: 'session-1',
+      note_kind: 'validation',
+      expires_at: '2030-01-02T00:00:00Z',
+      scope_id: 'project:test',
+    })
+    expect(JSON.parse(String(result))).toMatchObject({ ok: true, status: 202 })
+  })
+
+  it('forwards advisory rollover reasons through both Handoff draft tools', async () => {
+    process.env.POWERCONTEXT_OPENCODE_SCOPE_ID = 'project:test'
+    const calls: Array<{ url: string; body: any }> = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body))
+      calls.push({ url, body })
+      return bindingResponse(url, body) ?? Response.json({ ok: true })
+    }))
+    const hooks = await PowerContextPlugin(pluginInput())
+    const boundarySource = { name: 'content', source_id: 'turn-1' }
+    const reasons = ['host_context_budget', 'context_quality']
+    const context = {
+      sessionID: 'session-1',
+      messageID: 'msg-1',
+      agent: 'build',
+      directory: '/tmp/project',
+      worktree: '/tmp/project',
+      abort: new AbortController().signal,
+      metadata: vi.fn(),
+      ask: vi.fn(async () => undefined),
+    }
+
+    await hooks.tool?.pc_handoff_activate?.execute({
+      boundary_source: boundarySource,
+      objective: 'Continue in a fresh session.',
+      rollover_reasons: reasons,
+    }, context)
+    await hooks.tool?.pc_handoff_prepare?.execute({
+      objective: 'Continue in a fresh session.',
+      evidence: [{ kind: 'source', source_ref: boundarySource }],
+      rollover_reasons: reasons,
+    }, context)
+
+    expect(calls.filter((call) => call.url.includes('/v1/handoff/'))).toEqual([
+      { url: 'http://127.0.0.1:8000/v1/handoff/activate', body: {
+        boundary_source: boundarySource,
+        objective: 'Continue in a fresh session.',
+        evidence: [],
+        rollover_reasons: reasons,
+        scope_id: 'project:test',
+      } },
+      { url: 'http://127.0.0.1:8000/v1/handoff/prepare', body: {
+        objective: 'Continue in a fresh session.',
+        evidence: [{ kind: 'source', source_ref: boundarySource }],
+        rollover_reasons: reasons,
+        scope_id: 'project:test',
+      } },
+    ])
+  })
+
   it('does not send secret-shaped prompts', async () => {
     process.env.POWERCONTEXT_OPENCODE_SCOPE_ID = 'project:test'
     const fetchMock = vi.fn(async () => Response.json({
@@ -245,6 +362,7 @@ describe('PowerContextPlugin', () => {
       { message: incoming.info, parts: incoming.parts } as any,
     )
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(fetchMock.mock.calls)).not.toContain('sk-1234567890')
   })
 
   it('resolves automatic scope and capture cwd per OpenCode session', async () => {

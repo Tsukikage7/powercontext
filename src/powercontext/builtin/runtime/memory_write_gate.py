@@ -16,9 +16,10 @@
 
 The gate answers one narrow question: are the citations behind a pending Memory write strong
 enough to record it now? It never decides content, only whether to proceed. A ``HOLD`` is a
-visible refusal — it carries a structured code and a bounded reason back to its caller — and
-never a silent drop or an automatic approval. Any backend failure degrades to ``ACCEPT`` so an
-unavailable judge can never block a write.
+visible refusal — it carries a structured code and a bounded reason back to its caller — and never
+an automatic approval. The gate does not decide what happens to the refused window: the Runtime
+reports the hold through ``MemoryFlushResult`` and consumes the window instead of retrying it. Any
+backend failure degrades to ``ACCEPT`` so an unavailable judge can never block a write.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 from time import perf_counter
-from typing import Literal
+from typing import Literal, cast
 
 from powercontext._logging import log_safely
 from powercontext.builtin.artifacts.memory.protocols import (
@@ -56,6 +57,12 @@ from powercontext.builtin.runtime.decision_policy import (
     assess_local_rule,
     emit_decision_observation,
     unadjudicated_decision_assessment,
+)
+from powercontext.builtin.runtime.decision_projection import (
+    DecisionProjectionReason,
+    DecisionRequestProjectionSanitizer,
+    InvalidDecisionProjectionError,
+    apply_decision_request_sanitizer,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,6 +136,7 @@ def build_memory_write_gate(
     threshold: float | None = None,
     mode: DecisionPolicyMode = DecisionPolicyMode.SHADOW,
     privacy_boundary: DecisionPrivacyBoundary = DecisionPrivacyBoundary.LOCAL_ONLY,
+    decision_request_sanitizer: DecisionRequestProjectionSanitizer | None = None,
 ) -> MemoryWriteGate | None:
     """Build the opt-in gate, or return ``None`` while it stays disabled.
 
@@ -151,6 +159,7 @@ def build_memory_write_gate(
         hold_on=DecisionOutcome(hold_on),
         threshold=threshold,
         policy=policy,
+        decision_request_sanitizer=decision_request_sanitizer,
     )
 
 
@@ -173,6 +182,7 @@ class DecisionMemoryWriteGate:
         threshold: float | None = None,
         policy: DecisionPolicy | None = None,
         allow_model_evaluation: bool | None = None,
+        decision_request_sanitizer: DecisionRequestProjectionSanitizer | None = None,
     ) -> None:
         if hold_on is DecisionOutcome.ABSTAIN:
             raise ValueError("the hold direction cannot be abstain")  # noqa: TRY003
@@ -195,10 +205,32 @@ class DecisionMemoryWriteGate:
         self._hold_on = resolved_hold_on
         self._threshold = threshold
         self._policy = policy
+        self._decision_request_sanitizer = decision_request_sanitizer
+        if (
+            self._policy.privacy_boundary is DecisionPrivacyBoundary.HOSTED_REDACTED
+            and decision_model is not None
+            and not bool(getattr(decision_model, "is_local_only", False))
+            and decision_request_sanitizer is None
+        ):
+            # Composition raises the named configuration error. Direct construction remains
+            # fail-open and simply refuses the hosted call below when no sanitizer is supplied.
+            self._sanitizer_missing = True
+        else:
+            self._sanitizer_missing = False
         self._allow_model_evaluation = (
             decision_model is not None
-            and self._policy.privacy_boundary is DecisionPrivacyBoundary.LOCAL_ONLY
-            and bool(getattr(decision_model, "is_local_only", False))
+            and (
+                (
+                    self._policy.privacy_boundary is DecisionPrivacyBoundary.LOCAL_ONLY
+                    and bool(getattr(decision_model, "is_local_only", False))
+                )
+                or (
+                    self._policy.privacy_boundary is DecisionPrivacyBoundary.HOSTED_REDACTED
+                    and (
+                        bool(getattr(decision_model, "is_local_only", False)) or decision_request_sanitizer is not None
+                    )
+                )
+            )
             and allow_model_evaluation is not False
         )
         self.policy_id = "memory.write-gate.no-backend" if decision_model is None else decision_model.policy_id
@@ -229,40 +261,90 @@ class DecisionMemoryWriteGate:
             self._log(assessment)
             return assessment
         if not self._allow_model_evaluation:
-            policy_assessment = unadjudicated_decision_assessment(self._policy, reason="privacy_boundary")
-            assessment = MemoryWriteAssessment(
-                verdict=MemoryWriteVerdict.ACCEPT,
-                policy_id=self.policy_id,
-                used_fallback=True,
-            )
-            await self._observe(request, policy_assessment, assessment)
-            self._log(assessment)
-            return assessment
-        if self._decision_model is None:
-            policy_assessment = unadjudicated_decision_assessment(self._policy, reason="decision_model_unavailable")
-            assessment = MemoryWriteAssessment(
-                verdict=MemoryWriteVerdict.ACCEPT,
-                policy_id=self.policy_id,
-                used_fallback=True,
-            )
-            await self._observe(request, policy_assessment, assessment)
-            self._log(assessment)
-            return assessment
-        started = perf_counter()
-        decision = await self._decision_model.evaluate(
-            DecisionRequest(
-                decision_kind=DecisionKind.MEMORY_WRITE_GATE.value,
-                question=_GATE_QUESTION,
-                subject=_bounded_subject(request.candidates),
-                evidence=request.evidence,
-            )
+            reason = "projection_sanitizer_missing" if self._sanitizer_missing else "privacy_boundary"
+            return await self._privacy_fallback(request, reason=reason)
+        decision_request = DecisionRequest(
+            decision_kind=DecisionKind.MEMORY_WRITE_GATE.value,
+            question=_GATE_QUESTION,
+            subject=_bounded_subject(request.candidates),
+            evidence=request.evidence,
         )
+        redaction_facts: tuple[str, ...] = ()
+        projection_applied = False
+        if self._policy.privacy_boundary is DecisionPrivacyBoundary.HOSTED_REDACTED and not bool(
+            getattr(self._decision_model, "is_local_only", False)
+        ):
+            sanitizer = self._decision_request_sanitizer
+            if sanitizer is None:
+                return await self._privacy_fallback(
+                    request,
+                    reason=DecisionProjectionReason.SANITIZER_FAILED.value,
+                )
+            try:
+                projection = apply_decision_request_sanitizer(sanitizer, decision_request)
+            except InvalidDecisionProjectionError:
+                return await self._privacy_fallback(
+                    request,
+                    reason=DecisionProjectionReason.SANITIZER_INVALID.value,
+                )
+            except Exception:
+                return await self._privacy_fallback(
+                    request,
+                    reason=DecisionProjectionReason.SANITIZER_FAILED.value,
+                )
+            if not projection.is_permitted:
+                return await self._privacy_fallback(
+                    request,
+                    reason=projection.reason_code or DecisionProjectionReason.SANITIZER_INVALID.value,
+                )
+            sanitized_request = projection.request
+            if sanitized_request is None:
+                return await self._privacy_fallback(
+                    request,
+                    reason=DecisionProjectionReason.SANITIZER_INVALID.value,
+                )
+            decision_request = sanitized_request
+            redaction_facts = projection.redaction_facts
+            projection_applied = True
+        started = perf_counter()
+        decision_model = cast(DecisionModel, self._decision_model)
+        decision = await decision_model.evaluate(decision_request)
         latency_ms = (perf_counter() - started) * 1000
         assessment = self._map(request, decision)
         policy_assessment = _assess_memory_write_decision(
             decision, hold_on=self._hold_on, policy=self._policy
         ).model_copy(update={"latency_ms": latency_ms})
-        await self._observe(request, policy_assessment, assessment)
+        await self._observe(
+            request,
+            policy_assessment,
+            assessment,
+            redaction_facts=redaction_facts,
+            projection_applied=projection_applied,
+        )
+        self._log(assessment)
+        return assessment
+
+    async def _privacy_fallback(
+        self,
+        request: MemoryWriteGateRequest,
+        *,
+        reason: str,
+        redaction_facts: tuple[str, ...] = (),
+        projection_applied: bool = False,
+    ) -> MemoryWriteAssessment:
+        policy_assessment = unadjudicated_decision_assessment(self._policy, reason=reason)
+        assessment = MemoryWriteAssessment(
+            verdict=MemoryWriteVerdict.ACCEPT,
+            policy_id=self.policy_id,
+            used_fallback=True,
+        )
+        await self._observe(
+            request,
+            policy_assessment,
+            assessment,
+            redaction_facts=redaction_facts,
+            projection_applied=projection_applied,
+        )
         self._log(assessment)
         return assessment
 
@@ -325,6 +407,9 @@ class DecisionMemoryWriteGate:
         request: MemoryWriteGateRequest,
         policy_assessment: DecisionAssessment,
         assessment: MemoryWriteAssessment,
+        *,
+        redaction_facts: tuple[str, ...] = (),
+        projection_applied: bool = False,
     ) -> None:
         observation = DecisionObservation(
             operation_id=request.operation_id or f"memory-write:{request.expected_revision or 'new'}",
@@ -338,7 +423,7 @@ class DecisionMemoryWriteGate:
             evidence_refs=request.evidence_refs
             or tuple(f"evidence:{index}" for index in range(1, len(request.evidence) + 1)),
             privacy_boundary=self._policy.privacy_boundary,
-            privacy_outcome=self._privacy_outcome(policy_assessment),
+            privacy_outcome=self._privacy_outcome(policy_assessment, projection_applied=projection_applied),
             provider_id=_model_identity(self._decision_model, "provider_id"),
             backend_model_id=_model_identity(self._decision_model, "backend_model_id"),
             model_policy_id=None if policy_assessment.source.value == "none" else self.policy_id,
@@ -347,7 +432,11 @@ class DecisionMemoryWriteGate:
             fallback_reason=_safe_observation_reason(policy_assessment.reason)
             if policy_assessment.used_fallback
             else None,
-            metadata={"candidate_count": len(request.candidates), "evidence_count": len(request.evidence)},
+            metadata={
+                "candidate_count": len(request.candidates),
+                "evidence_count": len(request.evidence),
+                "redaction_facts": list(redaction_facts),
+            },
         )
         if not request.defer_observation_emission:
             emit_decision_observation(observation)
@@ -369,11 +458,28 @@ class DecisionMemoryWriteGate:
                 },
             )
 
-    def _privacy_outcome(self, assessment: DecisionAssessment) -> str:
+    def _privacy_outcome(self, assessment: DecisionAssessment, *, projection_applied: bool = False) -> str:
         if assessment.source.value == "local_rule":
             return "local_rule"
         if assessment.source.value == "decision_model":
-            return "local_model_called"
+            return (
+                "hosted_redacted_model_called"
+                if projection_applied and self._policy.privacy_boundary is DecisionPrivacyBoundary.HOSTED_REDACTED
+                else "local_model_called"
+            )
+        if self._policy.privacy_boundary is DecisionPrivacyBoundary.HOSTED_REDACTED:
+            if assessment.reason == "decision_model_fallback":
+                return (
+                    "local_model_fallback"
+                    if bool(getattr(self._decision_model, "is_local_only", False))
+                    else "hosted_redacted_model_fallback"
+                )
+            return {
+                DecisionProjectionReason.MATERIAL_REMOVED.value: "hosted_redacted_withheld",
+                DecisionProjectionReason.SANITIZER_FAILED.value: "hosted_redacted_sanitizer_failed",
+                DecisionProjectionReason.SANITIZER_INVALID.value: "hosted_redacted_sanitizer_invalid",
+                "projection_sanitizer_missing": "hosted_redacted_sanitizer_missing",
+            }.get(assessment.reason, "hosted_redacted_no_call")
         if self._policy.privacy_boundary is DecisionPrivacyBoundary.NO_EXTERNAL_CALL:
             return "no_external_call"
         if not self._allow_model_evaluation:
@@ -524,6 +630,10 @@ def _safe_observation_reason(reason: str | None, /) -> str | None:
         "evidence_projection_budget": "evidence_projection_budget",
         "privacy_boundary": "privacy_boundary",
         "decision_model_fallback": "decision_model_fallback",
+        "projection_sanitizer_missing": "projection_sanitizer_missing",
+        "projection_material_removed": "projection_material_removed",
+        "projection_sanitizer_failed": "projection_sanitizer_failed",
+        "projection_sanitizer_invalid": "projection_sanitizer_invalid",
         "abstain": "abstain",
     }.get(reason, "decision_model_verdict" if reason is not None else None)
 

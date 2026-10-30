@@ -26,18 +26,21 @@ def independent_atomic_memory_model(text: str, *, kind: str = "decision") -> Fun
     """Retain a supplied fixture fact with the actual input evidence identities."""
 
     def respond(messages, _info) -> ModelResponse:
-        request = next(
-            json.loads(part.content)
+        prompt = next(
+            part.content
             for message in reversed(messages)
             for part in message.parts
             if isinstance(part, UserPromptPart) and isinstance(part.content, str)
         )
+        if prompt == "Reply with one token.":
+            return ModelResponse(parts=[TextPart("ok")])
+        request = json.loads(prompt)
         if "proposal" in request:
             proposal = request["proposal"]
             value = {
                 "action": "create",
                 "compared_ids": [item["item_id"] for item in request["related"]],
-                "content": {"kind": proposal["kind"], "text": proposal["text"]},
+                "content": {"kind": proposal["kind"], "text": proposal["text"], "description": proposal["description"]},
                 "evidence_ids": proposal["evidence_ids"],
                 "reason": "Preserve the independent host workflow fact.",
             }
@@ -47,6 +50,7 @@ def independent_atomic_memory_model(text: str, *, kind: str = "decision") -> Fun
                     {
                         "kind": kind,
                         "text": text,
+                        "description": "Independent workflow fact",
                         "evidence_ids": [request["evidence"][0]["evidence_id"]],
                     }
                 ]

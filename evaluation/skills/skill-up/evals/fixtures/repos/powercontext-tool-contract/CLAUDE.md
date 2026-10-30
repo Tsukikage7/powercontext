@@ -18,9 +18,9 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 ## mcp__powercontext__activate_handoff
 
 - Required: `boundary_source: SourceReference`, `objective: string`, `scope_id: string`.
-- Optional: `evidence: array<HandoffCitation> = []`, `max_bytes: integer = 8000`.
+- Optional: `evidence: array<HandoffCitation> = []`, `max_bytes: integer = 8000`, `rollover_reasons: array<"user_requested" | "host_context_budget" | "host_compaction" | "context_quality" | "delegation" | "manual_checkpoint"> = []`.
 
-## mcp__powercontext__approve_artifact_candidate
+## mcp__powercontext__approve_candidate
 
 - Required: `candidate_id: string`, `expected_version: integer`, `scope_id: string`.
 - Optional: (none).
@@ -29,6 +29,11 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 
 - Required: `content: string`, `scope_id: string`, `source_id: string`.
 - Optional: `metadata: object | null`.
+
+## mcp__powercontext__capture_working_note
+
+- Required: `content: string`, `note_kind: "inspection" | "abandoned_approach" | "validation" | "unresolved" | "host_context"`, `scope_id: string`, `session_id: string`, `source_id: string`.
+- Optional: `expires_at: string | null`.
 
 ## mcp__powercontext__change_atomic_memory_lifecycle
 
@@ -52,8 +57,8 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 
 ## mcp__powercontext__create_dream_run
 
-- Required: `idempotency_key: string`, `operation: "refine_experience" | "derive_skill"`, `scope_id: string`.
-- Optional: `artifacts: array<ArtifactReference> = []`, `sources: array<DreamSourceReference> = []`, `target: ArtifactReference | null`.
+- Required: `idempotency_key: string`, `operation: "refine_experience" | "derive_skill" | "revise_skill" | "revise_profile" | "revise_memory" | "revise_topic_memory" | "refresh_handoff" | "revise_prompt" | "revise_tags"`, `scope_id: string`.
+- Optional: `artifacts: array<ArtifactReference> = []`, `sources: array<DreamSourceReference> = []`, `tag_target: TagDreamTarget | null`, `target: ArtifactReference | null`.
 
 ## mcp__powercontext__create_scope
 
@@ -85,11 +90,6 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 - Required: `artifact_id: string`, `family: "memory" | "atomic-memory" | "experience" | "skill" | "handoff" | "profile" | "prompt" | "topic-memory"`, `scope_id: string`.
 - Optional: `If-None-Match: string`.
 
-## mcp__powercontext__get_artifact_candidate
-
-- Required: `candidate_id: string`, `scope_id: string`.
-- Optional: (none).
-
 ## mcp__powercontext__get_artifact_revision
 
 - Required: `artifact_id: string`, `family: "memory" | "atomic-memory" | "experience" | "skill" | "handoff" | "profile" | "prompt" | "topic-memory"`, `revision: integer`, `scope_id: string`.
@@ -99,6 +99,16 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 
 - Required: `artifact_id: string`, `scope_id: string`.
 - Optional: `If-None-Match: string`.
+
+## mcp__powercontext__get_candidate
+
+- Required: `candidate_id: string`, `scope_id: string`.
+- Optional: (none).
+
+## mcp__powercontext__get_candidate_history
+
+- Required: `candidate_id: string`, `scope_id: string`.
+- Optional: (none).
 
 ## mcp__powercontext__get_dream_run
 
@@ -119,6 +129,11 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 
 - Required: `scope_id: string`.
 - Optional: `citation: object`, `target: LegacyMemoryTarget`.
+
+## mcp__powercontext__get_recall_manifest
+
+- Required: `scope_id: string`.
+- Optional: `cursor: string | null`, `kind: string | null`, `limit: integer = 50`, `tag_match: "all" | "any"`, `tags: array<string>`.
 
 ## mcp__powercontext__get_scope
 
@@ -145,15 +160,15 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 - Required: `external_skill_id: string`, `fingerprint: string`, `mode: "import" | "fork"`, `scope_id: string`.
 - Optional: `reason: string | null`.
 
-## mcp__powercontext__list_artifact_candidates
-
-- Required: `scope_id: string`.
-- Optional: `cursor: string | null`, `family: "experience" | "skill" | "profile" | null`, `limit: integer = 50`, `status: "pending" | "approved" | "rejected" = "pending"`.
-
 ## mcp__powercontext__list_atomic_memories
 
 - Required: `scope_id: string`.
 - Optional: `cursor: string | null`, `kind: string | null`, `limit: integer = 50`, `states: array<"active" | "forgotten" | "merged" | "retired">`, `tag_match: "all" | "any"`, `tags: array<string>`.
+
+## mcp__powercontext__list_candidates
+
+- Required: `scope_id: string`.
+- Optional: `candidate_kind: "artifact" | "tag" | null`, `cursor: string | null`, `family: "experience" | "skill" | "profile" | "atomic-memory" | "topic-memory" | "handoff" | "prompt" | null`, `limit: integer = 50`, `status: "pending" | "approved" | "rejected" = "pending"`.
 
 ## mcp__powercontext__list_dream_runs
 
@@ -184,6 +199,36 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 
 - Required: `content: AtomicMemoryWriteContent`, `inputs: array<AtomicMemoryInput>`, `scope_id: string`.
 - Optional: `artifact_refs: array<ArtifactReference>`, `source_refs: array<SourceReference>`.
+
+## mcp__powercontext__pc_source_add
+
+- Required: `capability: string`, `capability_version: string`, `input: object`, `scope_id: string`.
+- Optional: `instance_id: string`.
+
+## mcp__powercontext__pc_source_capabilities
+
+- Required: `scope_id: string`.
+- Optional: `capability: string`, `input: object`, `instance_id: string`.
+
+## mcp__powercontext__pc_source_instance_set_enabled
+
+- Required: `enabled: boolean`, `instance_id: string`.
+- Optional: (none).
+
+## mcp__powercontext__pc_source_instances
+
+- Required: (none).
+- Optional: `capability: string`, `input: object`, `instance_id: string`, `scope_id: string`, `view: "discovery" | "control" = "discovery"`.
+
+## mcp__powercontext__pc_source_status
+
+- Required: `scope_id: string`, `target_id: string`.
+- Optional: `view: "result" | "control" = "result"`.
+
+## mcp__powercontext__pc_source_target_set_enabled
+
+- Required: `enabled: boolean`, `scope_id: string`, `target_id: string`.
+- Optional: (none).
 
 ## mcp__powercontext__prepare_handoff_hint
 
@@ -220,7 +265,7 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 - Required: `outcome: TaskOutcome`, `scope_id: string`, `source_id: string`.
 - Optional: (none).
 
-## mcp__powercontext__reject_artifact_candidate
+## mcp__powercontext__reject_candidate
 
 - Required: `candidate_id: string`, `expected_version: integer`, `reason: string`, `scope_id: string`.
 - Optional: (none).
@@ -228,7 +273,7 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 ## mcp__powercontext__remember_memory
 
 - Required: `kind: string`, `scope_id: string`, `text: string`.
-- Optional: `expected_revision: integer | null`, `reason: string | null`.
+- Optional: `description: string | null`, `expected_revision: integer | null`, `reason: string | null`.
 
 ## mcp__powercontext__replace_artifact
 
@@ -250,10 +295,10 @@ not replace those schemas or enforce their constraints. It contains no scenario 
 - Required: `scope_id: string`, `target: AtomicMemoryTarget`.
 - Optional: `operation: "restore" | "undo_merge" = "restore"`, `preview_token: string | null`.
 
-## mcp__powercontext__revise_artifact_candidate
+## mcp__powercontext__revise_candidate
 
-- Required: `artifact_refs: array<ArtifactReference>`, `candidate_id: string`, `expected_version: integer`, `proposal: ExperienceProposal | SkillProposal | ProfileWriteContent`, `scope_id: string`, `source_refs: array<SourceReference>`.
-- Optional: `reason: string | null`, `target: ArtifactReference | null`.
+- Required: `candidate_id: string`, `expected_version: integer`, `proposal: ExperienceProposal | SkillProposal | ProfileWriteContent | AtomicMemoryWriteContent | TopicMemoryDreamProposal | HandoffContent | PromptContent | CatalogChangeProposal`, `scope_id: string`.
+- Optional: `artifact_refs: array<ArtifactReference> | null`, `artifacts: array<ArtifactReference> | null`, `reason: string | null`, `source_refs: array<SourceReference> | null`, `sources: array<DreamSourceReference> | null`, `target: ArtifactReference | null`.
 
 ## mcp__powercontext__scan_external_skills
 

@@ -53,7 +53,12 @@ def _case(key: str) -> dict[str, Any]:  # noqa: C901 - one branch per prompt key
             "content": "Prefers Chinese.",
             "source_metadata": {},
         }
-        candidate = {"kind": "preference", "text": "Prefers Chinese.", "evidence_ids": [evidence["evidence_id"]]}
+        candidate = {
+            "kind": "preference",
+            "text": "Prefers Chinese.",
+            "description": "Chinese preference",
+            "evidence_ids": [evidence["evidence_id"]],
+        }
         if key == "atomic_memory.extract":
             return {"input": {"evidence": [evidence]}, "expected_output": {"candidates": [candidate]}}
         return {
@@ -65,7 +70,7 @@ def _case(key: str) -> dict[str, Any]:  # noqa: C901 - one branch per prompt key
             "expected_output": {
                 "action": "create",
                 "compared_ids": [],
-                "content": {"kind": "preference", "text": "Prefers Chinese."},
+                "content": {"kind": "preference", "text": "Prefers Chinese.", "description": "Chinese preference"},
                 "evidence_ids": [evidence["evidence_id"]],
                 "reason": "The supplied Source supports this independent preference.",
             },
@@ -292,6 +297,64 @@ def test_atomic_extraction_demonstration_rejects_published_artifact_evidence() -
     with pytest.raises(PromptError) as caught:
         PromptRegistry(builtin_prompt_definitions()).get("atomic_memory.extract").validate(_content(case))
     assert caught.value.code == "prompt_definition_incompatible"
+
+
+@pytest.mark.parametrize(
+    "rollover_reasons",
+    [
+        ["user_requested", "user_requested"],
+        ["manual_checkpoint"] * 7,
+    ],
+)
+def test_custom_handoff_demonstrations_reject_invalid_rollover_reasons(
+    rollover_reasons: list[str],
+) -> None:
+    case = deepcopy(_case("handoff.generate"))
+    case["input"]["rollover_reasons"] = rollover_reasons
+    definition = PromptRegistry(builtin_prompt_definitions()).get("handoff.generate")
+
+    with pytest.raises(PromptError) as caught:
+        definition.validate(_content(case))
+
+    assert caught.value.code == "prompt_definition_incompatible"
+    assert not caught.value.during_inference
+
+
+def test_custom_handoff_demonstrations_reject_rollover_outputs_that_prepare_would_reject() -> None:
+    case = deepcopy(_case("handoff.generate"))
+    case["input"]["rollover_reasons"] = ["user_requested"]
+    case["expected_output"] = {
+        "state": [{"text": "The smoke tests passed.", "evidence_ids": ["source:1"]}],
+        "disposition": "continuable",
+        "next_action": {"text": "Continue above.", "evidence_ids": ["source:1"]},
+    }
+    definition = PromptRegistry(builtin_prompt_definitions()).get("handoff.generate")
+
+    with pytest.raises(PromptError) as caught:
+        definition.validate(_content(case))
+
+    assert caught.value.code == "prompt_definition_incompatible"
+    assert not caught.value.during_inference
+
+
+def test_custom_handoff_demonstrations_allow_descriptive_rollover_mentions() -> None:
+    case = deepcopy(_case("handoff.generate"))
+    case["input"]["rollover_reasons"] = ["user_requested"]
+    case["expected_output"] = {
+        "state": [
+            {
+                "text": 'The validator now rejects "continue above" wording; focused tests passed.',
+                "evidence_ids": ["source:1"],
+            }
+        ],
+        "disposition": "continuable",
+        "next_action": {
+            "text": 'Document why "continue above" wording is invalid, then run tests.',
+            "evidence_ids": ["source:1"],
+        },
+    }
+
+    PromptRegistry(builtin_prompt_definitions()).get("handoff.generate").validate(_content(case))
 
 
 @pytest.mark.parametrize(

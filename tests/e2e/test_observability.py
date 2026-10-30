@@ -52,7 +52,6 @@ from powercontext.builtin.inference import GenerationResult
 from powercontext.builtin.inference.pydantic_ai import PydanticAIEmbeddingModel
 from powercontext.builtin.persistence.atomic_memory_index import (
     AtomicMemoryIndexCapabilities,
-    AtomicMemoryProjection,
     AtomicMemorySearchChannels,
     AtomicMemorySearchRequest,
 )
@@ -245,7 +244,10 @@ class _VectorMemoryIndex:
     async def initialize(self, connection: AsyncConnection, /):
         pass
 
-    async def replace(self, connection: AsyncConnection, scope_id: str, projection: AtomicMemoryProjection, /):
+    async def validate_current(self, connection: AsyncConnection, /):
+        pass
+
+    async def replace_many(self, connection: AsyncConnection, scope_id: str, projections, /):
         pass
 
     async def delete(self, connection: AsyncConnection, scope_id: str, artifact_id: str, /):
@@ -259,8 +261,8 @@ class _VectorMemoryIndex:
     async def probe_recoverable(self, connection, scope_id, request, floor, /):
         return False
 
-    async def enumerate_related(self, connection: AsyncConnection, scope_id: str, request, /):
-        return ()
+    async def enumerate_related_with_heads(self, connection: AsyncConnection, scope_id: str, request, /):
+        return (), {}
 
     async def refresh_tags(self, connection: AsyncConnection, scope_id: str, artifact_id: str, tag_keys, /):
         pass
@@ -383,7 +385,12 @@ def test_database_failure_log_does_not_include_memory_content(caplog, tmp_path) 
         with caplog.at_level(logging.ERROR, logger="powercontext.server.app"):
             response = client.post(
                 "/v1/memory/remember",
-                json={"scope_id": scope_id, "kind": "fact", "text": memory_content},
+                json={
+                    "scope_id": scope_id,
+                    "kind": "fact",
+                    "text": memory_content,
+                    "description": "Explicit fixture memory",
+                },
             )
 
     records = [
@@ -452,6 +459,7 @@ def test_memory_write_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) 
                 "kind": "decision",
                 "text": private_memory_content,
                 "evidence_ids": ["source:1"],
+                "description": "Explicit fixture memory",
             }
         ]
     })
@@ -466,7 +474,11 @@ def test_memory_write_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) 
                 model.custom_output_text = json.dumps({
                     "action": "create",
                     "compared_ids": [],
-                    "content": {"kind": "decision", "text": private_memory_content},
+                    "content": {
+                        "kind": "decision",
+                        "text": private_memory_content,
+                        "description": "Explicit fixture memory",
+                    },
                     "evidence_ids": ["source:1"],
                     "reason": "Preserve the exact fixture Source.",
                 })
@@ -669,6 +681,7 @@ def test_memory_commit_failure_is_traced_and_rolls_back(tmp_path) -> None:
         "powercontext.memory.commit.artifact_revision_count": 1,
         "powercontext.operation.outcome": "failure",
         "error.type": "IntegrityError",
+        "powercontext.error.category": "internal",
     }
     exported = _exported_span_data(failed_spans)
     assert source_content not in exported
@@ -753,7 +766,12 @@ def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -
         )
         remembered = client.post(
             "/v1/memory/remember",
-            json={"scope_id": scope_id, "kind": "fact", "text": memory_content},
+            json={
+                "scope_id": scope_id,
+                "kind": "fact",
+                "text": memory_content,
+                "description": "Explicit fixture memory",
+            },
         )
         searched = client.post(
             "/v1/memory/search",
@@ -924,7 +942,7 @@ def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -
     assert no_match_query not in exported
 
 
-def test_scope_lock_stage_span_reports_contention_and_closes_at_acquisition(tmp_path) -> None:
+def test_scope_lock_stage_span_reports_contention_and_closes_at_acquisition(monkeypatch, tmp_path) -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider(sampler=ALWAYS_ON, shutdown_on_exit=False)
     provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -948,13 +966,25 @@ def test_scope_lock_stage_span_reports_contention_and_closes_at_acquisition(tmp_
             async with runtime._scope_operation(scope_id):
                 lock = runtime._lock(scope_id)
                 await lock.acquire()
-                contending = asyncio.create_task(
-                    sources.capture(CaptureSource(source_id="second", content="Second fact.", metadata={}))
-                )
-                await asyncio.sleep(0.05)
-                assert not contending.done()
-                lock.release()
-                await contending
+                acquisition_started = asyncio.Event()
+                acquire = lock.acquire
+
+                async def observe_acquire() -> bool:
+                    acquisition_started.set()
+                    return await acquire()
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(lock, "acquire", observe_acquire)
+                    contending = asyncio.create_task(
+                        sources.capture(CaptureSource(source_id="second", content="Second fact.", metadata={}))
+                    )
+                    try:
+                        # Scope/context preparation can await before the write reaches this lock.
+                        await asyncio.wait_for(acquisition_started.wait(), timeout=10)
+                        assert not contending.done()
+                    finally:
+                        lock.release()
+                        await asyncio.wait_for(contending, timeout=10)
 
             with pytest.raises(SourceConflictError):
                 await sources.capture(CaptureSource(source_id="first", content="Conflicting fact.", metadata={}))
@@ -973,7 +1003,9 @@ def test_scope_lock_stage_span_reports_contention_and_closes_at_acquisition(tmp_
             assert (span.attributes or {}).get("powercontext.operation.outcome") == "success"
         allowed_keys = _STAGE_ATTRIBUTE_KEYS.get(span.name)
         if (span.attributes or {}).get("powercontext.operation.outcome") == "failure":
-            allowed_keys = None if allowed_keys is None else allowed_keys | {"error.type"}
+            allowed_keys = (
+                None if allowed_keys is None else allowed_keys | {"error.type", "powercontext.error.category"}
+            )
         assert allowed_keys is None or (span.attributes or {}).keys() <= allowed_keys
     exported = _exported_span_data(spans)
     assert scope_id not in exported
@@ -1018,7 +1050,10 @@ class _FixedCandidatePipeline:
             output=AtomicMemoryExtractionOutput(
                 candidates=(
                     AtomicMemoryCandidate(
-                        kind="fact", text=self._text, evidence_ids=tuple(item.evidence_id for item in request.evidence)
+                        kind="fact",
+                        text=self._text,
+                        evidence_ids=tuple(item.evidence_id for item in request.evidence),
+                        description="Extracted fixture fact",
                     ),
                 )
             )
@@ -1249,7 +1284,12 @@ def test_vector_search_exports_embedding_under_memory_search_without_recording_t
         scope_id = _get_default_scope_id(client)
         remembered = client.post(
             "/v1/memory/remember",
-            json={"scope_id": scope_id, "kind": "fact", "text": memory_content},
+            json={
+                "scope_id": scope_id,
+                "kind": "fact",
+                "text": memory_content,
+                "description": "Explicit fixture memory",
+            },
         )
         searched = client.post(
             "/v1/memory/search",
@@ -1321,7 +1361,12 @@ def test_injected_always_on_embedding_skips_readiness_but_traces_vector_search(m
         scope_id = _get_default_scope_id(client)
         remembered = client.post(
             "/v1/memory/remember",
-            json={"scope_id": scope_id, "kind": "fact", "text": "Private injected vector memory."},
+            json={
+                "scope_id": scope_id,
+                "kind": "fact",
+                "text": "Private injected vector memory.",
+                "description": "Explicit fixture memory",
+            },
         )
         exporter.clear()
         searched = client.post(
@@ -1444,7 +1489,9 @@ def _wait_for_named_span(
 def _assert_stage_attribute_keys(span: ReadableSpan) -> None:
     allowed_keys = _STAGE_ATTRIBUTE_KEYS[span.name]
     attributes = dict(span.attributes or {})
-    assert attributes.keys() <= allowed_keys
+    assert attributes.keys() <= allowed_keys | {"powercontext.error.category"}
+    if "powercontext.error.category" in attributes:
+        assert attributes["powercontext.error.category"] in {"internal", "timeout", "cancelled"}
     assert all(isinstance(value, str | bool | int | float) for value in attributes.values())
 
 

@@ -41,6 +41,11 @@ PARAMETERS = {
     "if_match": ("当前内容 ETag", "Real content ETag returned by pc_memory_get for this exact current revision."),
     "kind": ("记忆类型", "One of the six supported curated Memory kinds."),
     "text": ("记忆正文", "Curated Memory text: nonblank after NFC/trim and at most 8192 UTF-8 bytes."),
+    "description": (
+        "记忆简介",
+        "Optional single-line Memory description of at most 200 characters. "
+        "When omitted, the Server stores a bounded text preview without calling a generation model.",
+    ),
     "reason": ("操作原因", "Reason for this explicit operation; preserve the user's intent."),
     "source_id": ("稳定 Source ID", "Stable caller-selected Source ID for explicitly retained evidence."),
     "content": (
@@ -74,6 +79,11 @@ PARAMETERS = {
     "family": ("候选类型", "Optional experience/skill filter; omission keeps the Server's unfiltered listing."),
     "cursor": ("分页游标", "Complete next_cursor from the previous candidate page; do not invent or rewrite it."),
     "candidate_id": ("候选 ID", "Exact candidate ID returned by generation or candidate listing."),
+    "candidate_kind": ("候选类别", "Optional artifact/tag filter; omission lists both kinds of candidates."),
+    "rollover_reasons": (
+        "轮换原因",
+        "Optional advisory rollover reasons for this preparation; they do not authorize commit or execution.",
+    ),
 }
 OUTPUT: dict[str, Any] = {
     "type": "object",

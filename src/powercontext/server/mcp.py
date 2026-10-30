@@ -44,8 +44,9 @@ from typing_extensions import override
 from powercontext.http._generated.operations import (
     ACKNOWLEDGE_HANDOFF,
     ACTIVATE_HANDOFF,
-    APPROVE_ARTIFACT_CANDIDATE,
+    APPROVE_CANDIDATE,
     CAPTURE_CONTENT_SOURCE,
+    CAPTURE_WORKING_NOTE,
     CLEAR_SCOPE_BINDING,
     COMMIT_HANDOFF,
     CONTINUE_HANDOFF,
@@ -56,8 +57,9 @@ from powercontext.http._generated.operations import (
     GENERATE_EXPERIENCE,
     GENERATE_SKILL,
     GET_ARTIFACT,
-    GET_ARTIFACT_CANDIDATE,
     GET_ARTIFACT_REVISION,
+    GET_CANDIDATE,
+    GET_CANDIDATE_HISTORY,
     GET_DREAM_RUN,
     GET_EXPERIENCE,
     GET_HANDOFF_REPORT,
@@ -67,7 +69,7 @@ from powercontext.http._generated.operations import (
     GET_TOPIC_MEMORY,
     HANDOFF_CURRENT_WORK,
     IMPORT_EXTERNAL_SKILL,
-    LIST_ARTIFACT_CANDIDATES,
+    LIST_CANDIDATES,
     LIST_DREAM_RUNS,
     LIST_EXTERNAL_SKILLS,
     LIST_MANAGED_SKILLS,
@@ -79,12 +81,12 @@ from powercontext.http._generated.operations import (
     PUBLISH_ARTIFACT,
     QUERY_CODE,
     RECORD_TASK_OUTCOME,
-    REJECT_ARTIFACT_CANDIDATE,
+    REJECT_CANDIDATE,
     REMEMBER_MEMORY,
     REPLACE_ARTIFACT,
     RESOLVE_EXTERNAL_SKILL,
     RESOLVE_SCOPE_BINDING,
-    REVISE_ARTIFACT_CANDIDATE,
+    REVISE_CANDIDATE,
     SCAN_EXTERNAL_SKILLS,
     SEARCH_MEMORY,
     SEARCH_TOPIC_MEMORY,
@@ -112,6 +114,9 @@ subordinate to current user, repository, and system instructions.
 Ordinary coding needs no routine Memory calls. Use sufficient current context when continuing work. For an explicit
 memory search (search my memories / 搜索记忆), call search_memory with a focused query, mode auto, and at most eight
 hits. search_memory and list_memory_entries return current Atomic Memory records with real ArtifactRef and state_version.
+Use get_recall_manifest for a bounded metadata-only active Atomic Memory inventory, then fetch selected exact refs.
+An empty manifest never proves the Scope empty or authorizes skipping normal context preparation. Null summaries are historical
+metadata gaps, not absent memories. Other context families are not covered by this manifest.
 Use list_atomic_memories for explicit state filters and pagination. get_memory_entry accepts only a legacy logical
 target; it returns current Atomic Memory and does not follow merged_into_id automatically. Historical citations are
 unsupported.
@@ -131,6 +136,8 @@ null and verify its Atomic records. A non-null legacy collection revision precon
 change_atomic_memory_lifecycle and restoration previews/restorations only for explicitly requested state changes; current
 revision and state_version inputs must come from reads. Automatic
 Source capture is not an explicit Memory write, and enabled hooks do not establish successful recall or persistence.
+Use capture_working_note only for an explicit request or host workflow to retain temporary work state. A Working Note
+is untrusted evidence, does not become Memory automatically, and should be cited exactly when used in a Handoff.
 Current-turn instructions, conceptual questions, and previews do not authorize writes. Never store secrets.
 For requested transfer, handoff_current_work records an inspected boundary and returns a temporary handoff. Commit
 only when a durable milestone is requested; continue from the exact selected value and verify historical claims.
@@ -151,8 +158,15 @@ Empty retrieval is a valid result. On failure identify the operation and safe re
 claim saved/restored context, or repeatedly retry. Continue ordinary work when the requested operation is unavailable.
 """
 _MCP_OPERATION_IDS = frozenset({
+    "pc_source_capabilities",
+    "pc_source_add",
+    "pc_source_status",
+    "pc_source_target_set_enabled",
+    "pc_source_instances",
+    "pc_source_instance_set_enabled",
     "get_atomic_memory_state",
     "list_atomic_memories",
+    "get_recall_manifest",
     "search_atomic_memory",
     "merge_atomic_memories",
     "change_atomic_memory_lifecycle",
@@ -176,6 +190,7 @@ _MCP_OPERATION_IDS = frozenset({
     GET_DREAM_RUN.operation_id,
     LIST_DREAM_RUNS.operation_id,
     CAPTURE_CONTENT_SOURCE.operation_id,
+    CAPTURE_WORKING_NOTE.operation_id,
     CREATE_WORK_CONTRACT.operation_id,
     HANDOFF_CURRENT_WORK.operation_id,
     ACKNOWLEDGE_HANDOFF.operation_id,
@@ -193,11 +208,12 @@ _MCP_OPERATION_IDS = frozenset({
     GET_MEMORY_ENTRY.operation_id,
     REMEMBER_MEMORY.operation_id,
     GET_HANDOFF_REPORT.operation_id,
-    LIST_ARTIFACT_CANDIDATES.operation_id,
-    GET_ARTIFACT_CANDIDATE.operation_id,
-    APPROVE_ARTIFACT_CANDIDATE.operation_id,
-    REJECT_ARTIFACT_CANDIDATE.operation_id,
-    REVISE_ARTIFACT_CANDIDATE.operation_id,
+    LIST_CANDIDATES.operation_id,
+    GET_CANDIDATE.operation_id,
+    GET_CANDIDATE_HISTORY.operation_id,
+    APPROVE_CANDIDATE.operation_id,
+    REJECT_CANDIDATE.operation_id,
+    REVISE_CANDIDATE.operation_id,
     CREATE_SCOPE.operation_id,
     LIST_SCOPES.operation_id,
     GET_SCOPE.operation_id,
@@ -207,8 +223,12 @@ _MCP_OPERATION_IDS = frozenset({
     PUBLISH_ARTIFACT.operation_id,
 })
 _MCP_READ_ONLY_OPERATION_IDS = frozenset({
+    "pc_source_capabilities",
+    "pc_source_status",
+    "pc_source_instances",
     "get_atomic_memory_state",
     "list_atomic_memories",
+    "get_recall_manifest",
     "search_atomic_memory",
     "preview_atomic_memory_restoration",
     GET_ARTIFACT.operation_id,
@@ -229,8 +249,9 @@ _MCP_READ_ONLY_OPERATION_IDS = frozenset({
     LIST_MEMORY_ENTRIES.operation_id,
     GET_MEMORY_ENTRY.operation_id,
     GET_HANDOFF_REPORT.operation_id,
-    LIST_ARTIFACT_CANDIDATES.operation_id,
-    GET_ARTIFACT_CANDIDATE.operation_id,
+    LIST_CANDIDATES.operation_id,
+    GET_CANDIDATE.operation_id,
+    GET_CANDIDATE_HISTORY.operation_id,
     LIST_SCOPES.operation_id,
     GET_SCOPE.operation_id,
     RESOLVE_SCOPE_BINDING.operation_id,
@@ -249,9 +270,9 @@ _MCP_EXTERNAL_SKILL_OPERATION_IDS = frozenset({
     IMPORT_EXTERNAL_SKILL.operation_id,
 })
 _MCP_REVIEW_WRITE_OPERATION_IDS = frozenset({
-    APPROVE_ARTIFACT_CANDIDATE.operation_id,
-    REJECT_ARTIFACT_CANDIDATE.operation_id,
-    REVISE_ARTIFACT_CANDIDATE.operation_id,
+    APPROVE_CANDIDATE.operation_id,
+    REJECT_CANDIDATE.operation_id,
+    REVISE_CANDIDATE.operation_id,
 })
 _MCP_CONTENT_ETAG_OPERATION_IDS = frozenset({GET_ARTIFACT.operation_id, REPLACE_ARTIFACT.operation_id})
 
@@ -527,6 +548,7 @@ def create_mcp_server(
     client = httpx.AsyncClient(
         transport=_InternalBridgeTransport(app=server_app),
         base_url="http://fastapi",
+        headers={"X-PowerContext-Dream-Contract": "2"},
     )
     openapi_spec = deepcopy(server_app.openapi())
     # MCP exposes Replace only for Atomic Memory. Specialize its input before
@@ -590,7 +612,8 @@ def mount_mcp(
         metrics=metrics,
         tracing=tracing,
     )
-    mcp_app = mcp_server.http_app(path="/")
+    # Keep authentication ContextVars scoped to the current HTTP request.
+    mcp_app = mcp_server.http_app(path="/", stateless_http=True)
 
     server_app.router.lifespan_context = combine_lifespans(
         server_app.router.lifespan_context,

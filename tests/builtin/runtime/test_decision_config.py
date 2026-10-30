@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from pydantic import AnyHttpUrl, SecretStr, ValidationError
@@ -47,9 +47,17 @@ def test_decision_observation_retention_rejects_nonpositive_values(retention_day
         RuntimeConfig(decision_observation_retention_days=retention_days)
 
 
-def test_memory_write_gate_rejects_hosted_redaction_without_a_sanitizer() -> None:
-    with pytest.raises(ValidationError, match="hosted_redacted"):
-        RuntimeConfig(memory_write_gate_privacy_boundary=cast(DecisionPrivacyBoundary, "hosted_redacted"))
+def test_memory_write_gate_accepts_hosted_redaction_for_runtime_validation() -> None:
+    config = RuntimeConfig(memory_write_gate_privacy_boundary=DecisionPrivacyBoundary.HOSTED_REDACTED)
+
+    assert config.memory_write_gate_privacy_boundary is DecisionPrivacyBoundary.HOSTED_REDACTED
+    assert config.memory_write_gate_sanitizer == "none"
+
+
+def test_memory_write_gate_accepts_an_explicit_known_secret_sanitizer() -> None:
+    config = RuntimeConfig(memory_write_gate_sanitizer="known_secrets")
+
+    assert config.memory_write_gate_sanitizer == "known_secrets"
 
 
 def test_decision_inference_defaults_are_unset() -> None:

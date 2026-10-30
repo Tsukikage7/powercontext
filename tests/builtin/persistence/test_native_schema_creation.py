@@ -15,21 +15,21 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import Column, Index, Integer, MetaData, Table
+from sqlalchemy import Column, Index, Integer, MetaData, Table, create_engine, create_mock_engine, inspect, select
 from sqlalchemy.dialects.mysql import dialect
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.builtin.artifacts.memory import EmbeddingProfile
+from powercontext.builtin.persistence import schema
 from powercontext.builtin.persistence.oceanbase.atomic_memory_index import OceanBaseAtomicMemoryIndex
 from powercontext.builtin.persistence.oceanbase.topic_memory_index import OceanBaseTopicMemoryVectorIndex
-from powercontext.builtin.persistence.schema import create_tables
 
 
 @pytest.mark.parametrize("family", ["atomic-memory", "topic-memory"])
-def test_relational_schema_creation_preserves_native_vector_index_ownership(family):
+def test_relational_schema_creation_preserves_native_vector_index_ownership(family, monkeypatch):
     async def scenario():
         profile = EmbeddingProfile(
             profile_id="startup-test", model="test", dimension=3, distance="l2", normalization="unit"
@@ -39,29 +39,32 @@ def test_relational_schema_creation_preserves_native_vector_index_ownership(fami
             if family == "atomic-memory"
             else OceanBaseTopicMemoryVectorIndex(profile)
         )
+        statements = []
+        sync = create_mock_engine("mysql://", lambda sql, *_a, **_k: statements.append(str(sql.compile(dialect=dialect()))))
+        inspector = MagicMock()
+        inspector.get_table_names.return_value = []
+        inspector.has_table.return_value = False
+        monkeypatch.setattr(schema, "inspect", lambda _connection: inspector)
         connection = AsyncMock(spec=AsyncConnection)
         connection.dialect = dialect()
-        await create_tables(connection, index.tables)
-        statements = [str(call.args[0].compile(dialect=dialect())) for call in connection.execute.await_args_list]
+        connection.run_sync.side_effect = lambda callback: callback(sync)
+        await schema.create_tables(connection, index.tables)
+        assert len(statements) == len(index.tables)
         assert all("VECTOR(3)" in sql for sql in statements)
         assert all("CREATE TABLE IF NOT EXISTS" in sql for sql in statements)
-        # A plain INDEX over a VECTOR column loses the native type and HNSW
-        # parameters. Only the vector initializer may emit that specialized DDL.
-        assert not any("CREATE INDEX" in sql for sql in statements)
+        # Native initializers own VECTOR DDL; table creation must not replace
+        # it with an ordinary index or preempt the native race validation.
+        assert not any("CREATE INDEX" in sql or "CREATE VECTOR INDEX" in sql for sql in statements)
 
     asyncio.run(scenario())
 
 
-def test_relational_schema_creation_uses_idempotent_regular_index_ddl():
-    async def scenario():
-        table = Table("startup_probe", MetaData(), Column("id", Integer, primary_key=True), Column("value", Integer))
-        Index("ix_startup_probe_value", table.c.value)
-        connection = AsyncMock(spec=AsyncConnection)
-        connection.dialect = dialect()
-        await create_tables(connection, (table,))
-        statements = [str(call.args[0].compile(dialect=dialect())) for call in connection.execute.await_args_list]
-        assert any("CREATE TABLE IF NOT EXISTS startup_probe" in sql for sql in statements)
-        assert any("CREATE INDEX IF NOT EXISTS ix_startup_probe_value" in sql for sql in statements)
-        assert not any("DROP" in sql or "DELETE" in sql for sql in statements)
-
-    asyncio.run(scenario())
+def test_relational_schema_creation_preserves_rows_and_regular_indexes():
+    table = Table("startup_probe", MetaData(), Column("id", Integer, primary_key=True), Column("value", Integer))
+    Index("ix_startup_probe_value", table.c.value)
+    with create_engine("sqlite://").begin() as connection:
+        schema._create_mysql_tables(connection, (table,))
+        connection.execute(table.insert().values(id=1, value=42))
+        schema._create_mysql_tables(connection, (table,))
+        assert connection.execute(select(table)).all() == [(1, 42)]
+        assert [index["name"] for index in inspect(connection).get_indexes(table.name)] == ["ix_startup_probe_value"]

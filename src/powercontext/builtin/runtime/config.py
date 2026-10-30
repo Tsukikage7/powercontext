@@ -33,6 +33,7 @@ from pydantic import (
 )
 
 from powercontext.builtin.artifacts.memory.prompts import MemoryExtractionProfile
+from powercontext.builtin.artifacts.search import RecallChannelWeights
 from powercontext.builtin.artifacts.skill import AgentSkillTarget, CodexSkillRoot
 from powercontext.builtin.artifacts.topic_memory import MAX_TOPIC_MEMORY_SEARCH_LIMIT
 from powercontext.builtin.artifacts.topic_memory.generation import (
@@ -125,6 +126,8 @@ class RuntimeConfig(BaseModel):
         "topic_memory_max_workers",
         "experience_max_workers",
         "skill_max_workers",
+        "handoff_max_workers",
+        "prompt_max_workers",
         "profile_max_workers",
         "profile_max_concurrency",
         "artifact_processing_max_workers",
@@ -146,6 +149,7 @@ class RuntimeConfig(BaseModel):
     memory_write_gate_enabled: bool = False
     memory_write_gate_mode: DecisionPolicyMode = DecisionPolicyMode.SHADOW
     memory_write_gate_privacy_boundary: DecisionPrivacyBoundary = DecisionPrivacyBoundary.NO_EXTERNAL_CALL
+    memory_write_gate_sanitizer: Literal["none", "known_secrets"] = "none"
     # Direction only: which verdict means "evidence is insufficient". The strength threshold
     # stays unset until a calibration probe establishes it, so a hold never depends on a made-up
     # number.
@@ -163,8 +167,6 @@ class RuntimeConfig(BaseModel):
     def validate_memory_capacity_order(self) -> RuntimeConfig:
         if self.memory_max_active_entries > self.memory_max_manifest_entries:
             raise ValueError("memory_max_active_entries cannot exceed memory_max_manifest_entries")  # noqa: TRY003
-        if self.memory_write_gate_privacy_boundary is DecisionPrivacyBoundary.HOSTED_REDACTED:
-            raise ValueError("memory_write_gate_privacy_boundary does not support hosted_redacted without a sanitizer")  # noqa: TRY003
         return self
 
     recall_gate_enabled: bool = False
@@ -176,6 +178,14 @@ class RuntimeConfig(BaseModel):
     recall_gate_round1_min_semantic_similarity: float = Field(default=0.15, ge=0.0, le=1.0)
     recall_gate_round2_min_semantic_similarity: float = Field(default=0.10, ge=0.0, le=1.0)
     recall_gate_allow_with_rerank: bool = False
+    recall_fts_weight: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    recall_vector_weight: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    # Budget for waiting on query embeddings in one context preparation. The Atomic Memory searches of the Scope and
+    # each context reference and the Topic Memory search share it, and only their waits are charged, so database reads
+    # and reranking in between do not take a later search's share; a search that finds it spent continues with lexical
+    # matching only. The default covers a typical remote embedding round trip and leaves the rest of a one-second Hook
+    # request to the other work.
+    recall_embedding_timeout_seconds: float = Field(default=0.5, gt=0.0, le=60.0, allow_inf_nan=False)
     profile_schedule_enabled: bool = False
     profile_cron: str = "0 2 * * *"
     profile_timezone: str = "Asia/Shanghai"
@@ -204,6 +214,31 @@ class RuntimeConfig(BaseModel):
         if self.recall_gate_round2_min_semantic_similarity > self.recall_gate_round1_min_semantic_similarity:
             raise ValueError(_RECALL_GATE_ROUND2_ORDER_ERROR)
         return self
+
+    @field_validator("recall_embedding_timeout_seconds", mode="before")
+    @classmethod
+    def reject_boolean_recall_embedding_timeout(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("recall embedding timeout must be a number")  # noqa: TRY003, TRY004 - Pydantic validation
+        return value
+
+    @field_validator("recall_fts_weight", "recall_vector_weight", mode="before")
+    @classmethod
+    def reject_boolean_recall_weight(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("recall channel weights must be numbers")  # noqa: TRY003, TRY004 - Pydantic validation
+        return value
+
+    @model_validator(mode="after")
+    def validate_recall_channel_weights(self) -> RuntimeConfig:
+        RecallChannelWeights(fts=self.recall_fts_weight, vector=self.recall_vector_weight)
+        return self
+
+    @property
+    def recall_channel_weights(self) -> RecallChannelWeights:
+        """Return the deployment's normalized FTS/vector recall ratio."""
+
+        return RecallChannelWeights(fts=self.recall_fts_weight, vector=self.recall_vector_weight)
 
     schedule_seconds: float | None = Field(default=None, gt=0)
     memory_schedule_seconds: float | None = Field(default=None, gt=0)
@@ -235,11 +270,15 @@ class RuntimeConfig(BaseModel):
     topic_memory_max_workers: int = Field(default=10, ge=1)
     experience_max_workers: int = Field(default=1, ge=1)
     skill_max_workers: int = Field(default=1, ge=1)
+    handoff_max_workers: int = Field(default=1, ge=1)
+    prompt_max_workers: int = Field(default=1, ge=1)
     profile_max_workers: int = Field(default=4, ge=1)
     memory_worker_timeout_seconds: float = Field(default=600, gt=0)
     topic_memory_worker_timeout_seconds: float = Field(default=600, gt=0)
     experience_worker_timeout_seconds: float = Field(default=600, gt=0)
     skill_worker_timeout_seconds: float = Field(default=600, gt=0)
+    handoff_worker_timeout_seconds: float = Field(default=600, gt=0)
+    prompt_worker_timeout_seconds: float = Field(default=600, gt=0)
     profile_worker_timeout_seconds: float = Field(default=600, gt=0)
     model_usage_queue_capacity: int = Field(default=256, ge=1, le=16_384)
     model_usage_write_timeout_seconds: float = Field(default=1.0, gt=0, le=30)
@@ -276,6 +315,8 @@ class InferenceConfig(BaseModel):
     generation_model_settings: dict[str, JsonValue] = Field(default_factory=dict)
     generation_timeout_seconds: float = Field(default=30.0, gt=0)
     generation_max_requests: int = Field(default=2, ge=1)
+    generation_streaming: Literal["auto", "disabled"] = "disabled"
+    generation_stream_idle_timeout_seconds: float = Field(default=60.0, gt=0)
     generation_model_context_window_tokens: int = Field(default=125_000, ge=1)
     embedding_model: str | None = None
     embedding_base_url: AnyHttpUrl | None = None

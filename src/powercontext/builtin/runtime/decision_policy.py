@@ -31,10 +31,12 @@ from powercontext.builtin.decision_observations import (
     DecisionPrivacyBoundary,
     DecisionVerdict,
 )
+from powercontext.builtin.decision_projection_contract import DecisionProjectionFact
 from powercontext.builtin.inference import InferenceUsage
 from powercontext.builtin.runtime.decision_model import DecisionOutcome, DecisionResult
 
 logger = logging.getLogger(__name__)
+_SAFE_REDACTION_FACTS = frozenset(fact.value for fact in DecisionProjectionFact)
 
 
 _DEFAULT_OUTCOME_MAPPING: Mapping[DecisionOutcome, DecisionVerdict] = {
@@ -142,6 +144,8 @@ def assess_local_rule(
 def emit_decision_observation(observation: DecisionObservation, /) -> None:
     """Log bounded policy outcome fields without turning logs into a content ledger."""
 
+    raw_facts = observation.metadata.get("redaction_facts", ())
+    redaction_facts = raw_facts if isinstance(raw_facts, list | tuple) else ()
     log_safely(
         logger,
         logging.INFO,
@@ -160,6 +164,9 @@ def emit_decision_observation(observation: DecisionObservation, /) -> None:
             "fallback_reason": observation.fallback_reason,
             "candidate_count": observation.metadata.get("candidate_count", 0),
             "evidence_count": observation.metadata.get("evidence_count", 0),
+            "redaction_facts": tuple(
+                fact for fact in redaction_facts if isinstance(fact, str) and fact in _SAFE_REDACTION_FACTS
+            ),
         },
     )
 
