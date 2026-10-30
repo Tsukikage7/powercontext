@@ -37,19 +37,17 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
-        app.kubernetes.io/name: powercontext
+        {{- include "powercontext.labels" $root | nindent 8 }}
         app.kubernetes.io/component: {{ $role }}
+      {{- with $root.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        fsGroup: 10001
-        seccompProfile:
-          type: RuntimeDefault
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
       {{- with $root.Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -60,10 +58,7 @@ spec:
           imagePullPolicy: {{ $root.Values.image.pullPolicy }}
           args: ["server", "run"]
           securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
+            {{- toYaml $root.Values.securityContext | nindent 12 }}
           {{- with $root.Values.providerSecret }}
           envFrom:
             - secretRef:
@@ -109,9 +104,6 @@ spec:
               value: '{"targets": []}'
             - name: POWERCONTEXT_SERVER_LOGGING_FORMAT
               value: json
-            # Avoid process-local MCP sessions when traffic crosses API replicas.
-            - name: FASTMCP_STATELESS_HTTP
-              value: "true"
             {{- range $key, $value := $root.Values.inference }}
             - name: {{ $key }}
               value: {{ $value | quote }}

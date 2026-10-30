@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -73,10 +74,21 @@ def create_scope(payload: dict[str, str]):
             "title": "Helm acceptance",
             "summary": "Disposable deployment persistence check",
             "idempotency_key": payload["key"],
+            **({"parent_scope_id": payload["parent"]} if "parent" in payload else {}),
         },
     )
     assert status == 201, "Scope creation failed"
     return scope
+
+
+def page_scopes(payload: dict[str, str]):
+    query = {"limit": "1", "parent_scope_id": payload["parent"]}
+    if "cursor" in payload:
+        query["cursor"] = payload["cursor"]
+    status, page, _ = request(payload["base"], "/v1/scopes?" + urllib.parse.urlencode(query))
+    assert status == 200, "Scope pagination failed; check shared cursor signing keys"
+    assert len(page["items"]) == 1, "Expected one Scope per page"
+    return page
 
 
 def read_scope(payload: dict[str, str]):
@@ -120,6 +132,8 @@ def main() -> None:
         result = asyncio.run(read_lease())
     elif payload["action"] == "create":
         result = create_scope(payload)
+    elif payload["action"] == "page":
+        result = page_scopes(payload)
     else:
         result = read_scope(payload)
     print(json.dumps(result))

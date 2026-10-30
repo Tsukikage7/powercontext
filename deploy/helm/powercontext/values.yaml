@@ -21,6 +21,23 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
+# Extra resource and Pod labels; chart identity/selector labels are reserved.
+commonLabels: {}
+podAnnotations: {}
+# Set UID/GID fields to null to let cluster admission assign them (e.g. OpenShift).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
 # These keys must exist in a Secret in the release namespace.
 existingSecret: ""
 secretKeys:
@@ -63,6 +80,7 @@ api:
 
 background:
   replicas: 1
+  # Legacy alias for topic-memory's worker quota, not a global process limit.
   maxWorkers: 2
   resources:
     requests:

@@ -23,6 +23,9 @@ limitations under the License.
 {{- end -}}
 {{- end -}}
 {{- define "powercontext.labels" -}}
+{{- with .Values.commonLabels }}
+{{ toYaml . }}
+{{ end -}}
 app.kubernetes.io/name: powercontext
 app.kubernetes.io/instance: {{ .Release.Name | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}

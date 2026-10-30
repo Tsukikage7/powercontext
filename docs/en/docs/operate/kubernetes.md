@@ -12,6 +12,17 @@ API health probes, a ClusterIP Service, optional Ingress and configurable resour
 The chart requires an explicitly pinned application image and existing Secrets. Background
 replicas use a single active supervisor with database lease election. The background runner has
 no HTTP health endpoint; Pod readiness alone does not establish processing health.
+`background.maxWorkers` controls the Topic Memory quota through a legacy alias, not the
+total process count. With `maxWorkers=2` and all seven built-in families enabled, their quotas
+sum to 11; the acceptance profile's `test` model enables four families with quotas totaling eight.
+Without a generation model, no families are enabled by default. Actual concurrency depends on
+enabled capabilities and scheduling. Size resources accordingly.
+
+Use `commonLabels`, `podAnnotations`, `podSecurityContext` and `securityContext` for cluster
+policy overrides. In clusters that assign UID/GID values, set `runAsUser`, `runAsGroup` and
+`fsGroup` to `null` under `podSecurityContext`; validate admission and volume permissions.
+PDBs and topology-spread constraints are managed outside this chart. MCP is mounted as
+stateless Streamable HTTP by the runtime; the chart does not configure that property.
 
 Follow the chart's installation, coordinated upgrade and acceptance-test instructions. SQLite
 and embedded seekdb remain single-process evaluation options outside this chart.
@@ -32,4 +43,7 @@ Secret references. It configures two API replicas, one initial background replic
 `test` generation model. The acceptance script rejects fewer than two configured API replicas and
 requires two Ready API Pods before creating test data and after replacing API Pods. Run it only in
 an isolated test namespace with a disposable external OceanBase database; it creates data, deletes
-Pods, and changes background replica counts. A passing configuration test is not cluster acceptance.
+Pods, and changes background replica counts. Pass `--confirm-disposable` explicitly. The script
+also creates two child Scopes, obtains a cursor with `limit=1` on one API Pod and resumes it
+on each other API Pod to verify shared signing keys without skipped or repeated results.
+A passing configuration test is not cluster acceptance.

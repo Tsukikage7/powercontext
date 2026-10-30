@@ -131,11 +131,49 @@ controller-specific annotations when enabled. Bearer authentication and enforced
 always enabled. Use HTTPS or a trusted private network for clients. The Pod service account
 token is not mounted; no Kubernetes API permissions are required.
 
+## Cluster policy overrides
+
+`commonLabels` adds string-valued labels to resources and Pods without changing selectors.
+The chart's identity labels (`app.kubernetes.io/name`, `instance`, `component`, `managed-by`
+and `helm.sh/chart`) are reserved. `podAnnotations` adds string-valued Pod annotations.
+`podSecurityContext` and container `securityContext` expose the fields listed in
+`values.schema.json`; their defaults retain non-root execution, RuntimeDefault seccomp,
+dropped capabilities and a read-only root filesystem.
+
+For clusters that assign a UID/GID through admission, remove the fixed identity fields
+with Helm's `null` overrides. For example, an OpenShift SCC may assign the identity:
+
+```yaml
+commonLabels:
+  cost-center: platform
+podAnnotations:
+  example.com/owner: platform
+podSecurityContext:
+  runAsUser: null
+  runAsGroup: null
+  fsGroup: null
+```
+
+Validate the rendered Pod against your cluster's admission policy and volume permissions.
+The chart does not create PDBs or topology-spread constraints; manage any required PDB
+separately and use the existing `affinity`, `nodeSelector` and `tolerations` for placement.
+Ingress annotations must be strings; `ingress.tls` is an array of entries with a nonempty
+`secretName` and optional string-array `hosts`.
+
 ## Replicas and health
 
 `api.replicas` and `background.replicas` default to one. More background replicas are standby
 candidates for the **global** database lease, not extra active supervisors. Each active supervisor
-starts local workers, bounded by `background.maxWorkers`. Size memory for those child processes.
+starts local workers with per-family quotas. `background.maxWorkers` sets the legacy
+`artifact_processing_max_workers` alias and the `topic_memory_max_workers` quota; it is
+not a global process limit or an additional worker pool. Other quotas retain their defaults:
+Memory, Experience, Skill, Handoff and Prompt each allow one worker, and Profile allows four.
+With `maxWorkers=2` and all seven built-in families enabled, their quotas sum to 11 workers.
+The acceptance profile's `test` generation model enables four families with quotas totaling eight;
+without a generation model, no families are enabled by default.
+This is a quota estimate, not measured concurrency: enabled capabilities, available work and
+scheduling determine actual occupancy. Size memory for the supervisor and its child processes;
+the default 2 GiB limit is a starting configuration, not a capacity guarantee.
 The chart deliberately fixes global mode; switching supervisor modes requires a separate migration.
 
 API probes use `/health/live` and `/health/ready`. Startup has a five-minute budget by default;
@@ -151,10 +189,11 @@ lease renewal and durable processing progress separately. Standby candidates are
 owning the lease. Do not add a probe that kills every non-leader, or use `kill -0` as a claim of
 processing health. A dedicated background health endpoint remains a separate runtime improvement.
 
-All API Pods share a cursor key and use `FASTMCP_STATELESS_HTTP=true` so MCP requests can cross
-replicas. This transport does not offer persistent MCP sessions; clients must support stateless
-Streamable HTTP. Local `/data` and `/tmp` are ephemeral writable directories; durable application
-state lives in OceanBase. Local skill publication is disabled.
+All API Pods share a cursor key so paginated requests can cross replicas. The application
+runtime mounts MCP as stateless Streamable HTTP with `stateless_http=True`; this is a runtime
+property, not a Chart environment setting. This transport does not offer persistent MCP sessions;
+clients must support stateless Streamable HTTP. Local `/data` and `/tmp` are ephemeral writable
+directories; durable application state lives in OceanBase. Local skill publication is disabled.
 
 ## Upgrade and migration
 
@@ -230,16 +269,19 @@ helm upgrade pc-acceptance deploy/helm/powercontext \
   --namespace powercontext-acceptance -f values.acceptance.local.yaml \
   -f deploy/helm/powercontext/values-acceptance.yaml --wait --timeout 10m
 uv run python tests/e2e/helm_acceptance.py \
-  --namespace powercontext-acceptance --release pc-acceptance
+  --namespace powercontext-acceptance --release pc-acceptance --confirm-disposable
 ```
 
-This test writes one test Scope, replaces API Pods, scales background candidates from one to two,
+The explicit `--confirm-disposable` flag is required before any cluster access.
+This test writes a parent Scope and two child Scopes, replaces API Pods, scales background candidates from one to two,
 and removes the original leader Pod. It checks HTTP/MCP authentication through the Service, the
-Scope through each API replica after replacement, and database lease holder/generation change. It rejects
+parent Scope through each API replica after replacement, cross-Pod cursor continuation,
+and database lease holder/generation change. It lists the children with `limit=1` on one API Pod,
+then resumes that cursor on every other API Pod and checks for skipped or repeated Scopes. It rejects
 deployments with fewer than two configured API replicas before mutating the cluster, and requires at least
 two Ready, non-terminating API Pods before creating its Scope and after API Pod replacement. Exactly one
 initial background replica and a configured processing capability that acquires a lease are also required.
-It returns background replicas to one. It does not delete its Scope or database.
+It returns background replicas to one. It does not delete its test Scopes or database.
 Run only against a test deployment. A lease transition is not proof that all accepted inference work
 completed: validate application processing and provider-specific recovery separately with representative
 workloads. Multi-active-worker recovery and mixed-version rolling upgrades are outside this chart's scope.
@@ -275,5 +317,6 @@ the historical empty-database startup result does not certify it.
 
 The image ID is a local container identity, not a published registry manifest digest.
 Validation used the local `test` generation model and a native UTC tenant. It covers
-this deployment configuration; model/provider and schema-migration acceptance belong
+the historical deployment configuration only, including neither the current startup sequence
+nor cross-Pod cursor continuation; model/provider and schema-migration acceptance belong
 to their respective runtime changes.

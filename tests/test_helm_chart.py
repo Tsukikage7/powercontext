@@ -84,7 +84,6 @@ def test_role_configuration_and_service_isolation(monkeypatch):
         assert settings.cursor_signing_secret is not None
         assert settings.cursor_signing_secret.get_secret_value() == secrets["cursor-signing-secret"]
         assert settings.external_skills.targets == ()
-        assert os.environ["FASTMCP_STATELESS_HTTP"] == "true"
         assert spec["automountServiceAccountToken"] is False
         assert spec["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
         assert deployment["spec"]["strategy"]["type"] == "Recreate"
@@ -176,3 +175,56 @@ def test_acceptance_profile_renders_two_apis_and_one_background():
         model = next(item for item in env if item["name"] == "POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL")
         assert model["value"] == "test"
     assert replicas == {"api": 2, "background": 1}
+
+
+def test_metadata_security_overrides_and_ingress_tls(tmp_path):
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        yaml.safe_dump({
+            "commonLabels": {"cost-center": "platform"},
+            "podAnnotations": {"prometheus.io/scrape": "true"},
+            "podSecurityContext": {"runAsUser": None, "runAsGroup": None, "fsGroup": None},
+            "securityContext": {"runAsUser": 20000},
+            "ingress": {
+                "enabled": True,
+                "host": "context.example.com",
+                "tls": [{"secretName": "context-tls", "hosts": ["context.example.com"]}],
+            },
+        })
+    )
+    result = render(values=values)
+    assert result.returncode == 0, result.stderr
+    documents = [item for item in yaml.safe_load_all(result.stdout) if item]
+    for resource in documents:
+        assert resource["metadata"]["labels"]["cost-center"] == "platform"
+        if resource["kind"] == "Deployment":
+            template = resource["spec"]["template"]
+            assert template["metadata"]["labels"]["cost-center"] == "platform"
+            assert template["metadata"]["annotations"]["prometheus.io/scrape"] == "true"
+            context = template["spec"]["securityContext"]
+            assert not {"runAsUser", "runAsGroup", "fsGroup"} & context.keys()
+            assert context["runAsNonRoot"] is True
+            security = template["spec"]["containers"][0]["securityContext"]
+            assert security["runAsUser"] == 20000
+            assert security["allowPrivilegeEscalation"] is False
+            assert resource["spec"]["selector"]["matchLabels"].items() <= template["metadata"]["labels"].items()
+        if resource["kind"] == "Ingress":
+            assert resource["spec"]["tls"] == [{"secretName": "context-tls", "hosts": ["context.example.com"]}]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"ingress": {"tls": "context-tls"}},
+        {"ingress": {"tls": [{"hosts": ["context.example.com"]}]}},
+        {"ingress": {"tls": [{"secretName": "context-tls", "hosts": "context.example.com"}]}},
+        {"podAnnotations": {"prometheus.io/scrape": True}},
+        {"commonLabels": {"app.kubernetes.io/component": "custom"}},
+        {"podSecurityContext": {"runAsUser": "random"}},
+        {"securityContext": {"allowPrivilegeEscalation": "false"}},
+    ],
+)
+def test_invalid_operational_overrides_are_rejected(tmp_path, values):
+    path = tmp_path / "values.yaml"
+    path.write_text(yaml.safe_dump(values))
+    assert render(values=path).returncode != 0

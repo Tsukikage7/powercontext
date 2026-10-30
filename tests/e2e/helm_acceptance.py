@@ -62,10 +62,31 @@ def validate_topology(deployments) -> None:
         raise RuntimeError("Start with exactly one background replica in an isolated test deployment")  # noqa: TRY003
 
 
+def check_pagination(execute, api_pods, parent_scope, children) -> None:
+    page_request = {"base": "http://127.0.0.1:8000", "action": "page", "parent": parent_scope}
+    first_page = execute(page_request, api_pods[0])
+    first_ids = {item["scope_id"] for item in first_page["items"]}
+    if len(first_ids) != 1 or not first_ids < children or not first_page.get("next_cursor"):
+        raise RuntimeError("Expected a signed cursor and the first of two test child Scopes")  # noqa: TRY003
+    for pod in api_pods[1:]:
+        second_page = execute({**page_request, "cursor": first_page["next_cursor"]}, pod)
+        if {item["scope_id"] for item in second_page["items"]} != children - first_ids or second_page.get(
+            "next_cursor"
+        ):
+            raise RuntimeError("Cross-Pod pagination skipped or repeated test Scopes")  # noqa: TRY003
+    print("PASS: cursor issued by one API Pod resumes on every other API Pod without skipped or repeated Scopes")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--release", required=True)
+    parser.add_argument(
+        "--confirm-disposable",
+        action="store_true",
+        required=True,
+        help="Confirm this release and database are disposable; deletes Pods and writes test Scopes",
+    )
     args = parser.parse_args()
     selector = f"app.kubernetes.io/name=powercontext,app.kubernetes.io/instance={args.release}"
 
@@ -124,12 +145,21 @@ def main() -> None:
     service = services[0]
     base = f"http://{service['metadata']['name']}:{service['spec']['ports'][0]['port']}"
     scope = execute({"base": base, "action": "create", "key": "helm-" + str(uuid4())})
+    children = {
+        execute({"base": base, "action": "create", "key": "helm-" + str(uuid4()), "parent": scope["scope_id"]})[
+            "scope_id"
+        ]
+        for _ in range(2)
+    }
     kubectl("delete", "pods", "-l", selector + ",app.kubernetes.io/component=api", "--wait=true")
     rollout("api")
     execute({"base": base, "action": "read", "scope": scope["scope_id"]})
-    for pod in ready_api_pods():
+    api_pods = ready_api_pods()
+    for pod in api_pods:
         execute({"base": "http://127.0.0.1:8000", "action": "read", "scope": scope["scope_id"]}, pod)
     print("PASS: authenticated HTTP/MCP through Service and persisted Scope readable from every replacement API Pod")
+
+    check_pagination(execute, api_pods, scope["scope_id"], children)
 
     check_failover(kubectl, pods, execute, rollout, background["metadata"]["name"])
     print("Test Scope retained:", scope["scope_id"])
