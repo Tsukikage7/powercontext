@@ -1,19 +1,25 @@
 # PowerContext for Pydantic AI
 
+`community`
+
 This directory contains a preview `powercontext-pydantic-ai` adapter. It connects a Pydantic AI agent to a running
 PowerContext Server through the public asynchronous Python Client. It provides three tools, prepares relevant context
 before model requests, and can optionally capture bounded agent events and flush them into Memory.
 
-## Availability
+## Installation
 
-The adapter is not currently published on PyPI. Its source metadata requires a final `powercontext[client]>=0.0.3`,
-which the current public root package and the development version from `master` do not satisfy. Do not use the old
-PyPI command or a direct Git subdirectory install; both fail dependency resolution. Repository contributors can run
-the adapter tests through the root development environment.
+`experimental`
 
-The remaining sections document the preview API for development and review; they are not a supported installation
-path. The example uses OpenAI. For another provider, use the matching `pydantic-ai-slim` provider extra and change the
-model string after compatible packages are released.
+Install the Client and adapter from the same source ref in your application environment. This example uses OpenAI:
+
+```bash
+uv add "powercontext[client] @ git+https://github.com/oceanbase/powercontext.git@master"
+uv add "powercontext-pydantic-ai @ git+https://github.com/oceanbase/powercontext.git@master#subdirectory=integrations/pydantic-ai"
+uv add "pydantic-ai-slim[openai]>=2.29,<3"
+```
+
+Start a separate PowerContext Server from the same ref. The source adapter requires `powercontext[client]>=0.0.3`.
+For another provider, replace the `openai` extra and model string.
 
 ```python
 from pydantic_ai import Agent
@@ -44,8 +50,9 @@ Environment variables use the `POWERCONTEXT_PYDANTIC_AI_` prefix.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BASE_URL` | `http://127.0.0.1:8000` | PowerContext Server HTTP base URL |
+| `ALLOW_INSECURE_HTTP` | `false` | Explicitly allow non-loopback HTTP; HTTPS certificate validation stays enabled |
 | `TOKEN` | unset | Bare Server token; the Client adds the `Bearer` scheme |
-| `SCOPE_ID` | derived | Durable project scope |
+| `SCOPE_ID` | unset | Existing explicit Server Scope; unset selects the Server default |
 | `TIMEOUT` | `10` | HTTP timeout in seconds |
 | `MAX_BYTES` | `8000` | Maximum prepared-context bytes |
 | `CAPTURE_EVENTS` | `false` | Capture visible agent trajectory events as Sources |
@@ -56,9 +63,18 @@ The `TOKEN` value is deliberately different from the Codex and Claude Code plugi
 only the opaque token, not `Bearer TOKEN` or a complete `Authorization` header. It is stored as Pydantic `SecretStr`
 and passed to `PowerContextClient`, which constructs the header.
 
+`PowerContextSettings(allow_insecure_http=True)` also permits non-loopback HTTP. Transport settings resolve from
+constructor values, host environment, common `POWERCONTEXT_CLIENT_SERVER_URL` /
+`POWERCONTEXT_CLIENT_ALLOW_INSECURE_HTTP`, then the `pydantic-ai` entry in `~/.config/powercontext/clients.json`
+(overridden by `POWERCONTEXT_CLIENT_CONFIG_FILE`). A host value of `false` overrides common `true`.
+Saved consent applies only to its saved Server URL and is not reused when the URL changes.
+
 Both components accept `settings=`, `id=` (default `powercontext`), and `scope_id=`. `scope_id` can be a fixed string
-or a callable receiving the current `RunContext`. Resolution order is constructor value or callback, environment
-`SCOPE_ID`, normalized Git origin, then `local:<sha256-of-project-path>`. A callback is evaluated once per run.
+or a callable receiving the current `RunContext`. Resolution order is constructor value or callback, then environment
+`SCOPE_ID`. The adapter sends that explicit ID, or `None`, to the Server's `resolve_scope_binding` operation once per
+run and reuses the returned Scope ID throughout the run. Unset configuration selects the Server default. Explicit
+IDs must already identify a Server Scope. The adapter never inspects the working directory, Git repository, or path
+to create an ID. A callback is evaluated once per run.
 
 ## Recall, capture, and trust
 

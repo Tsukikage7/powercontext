@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Embedded seekDB async relational profile."""
+"""Embedded seekdb async relational profile."""
 
 from powercontext.builtin.persistence.seekdb.profile import (
+    LegacySeekDBDatabaseError,
     SeekDBConfig,
+    SeekDBInspectionError,
     SeekDBProfile,
     SeekDBUnavailableError,
 )
 
 __all__ = (
+    "LegacySeekDBDatabaseError",
     "SeekDBConfig",
+    "SeekDBInspectionError",
     "SeekDBProfile",
     "SeekDBUnavailableError",
 )

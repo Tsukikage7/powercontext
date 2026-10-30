@@ -15,18 +15,32 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy import event, func, insert, select, update
+from sqlalchemy.engine import Engine
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from powercontext.artifacts import ArtifactRef
-from powercontext.builtin.artifacts.experience import Experience, ExperienceContent, ExperienceSearchHit
-from powercontext.builtin.artifacts.memory import MemoryEntryInput
-from powercontext.builtin.artifacts.skill import SkillContent
-from powercontext.builtin.persistence.errors import RepositoryNotFoundError
+from powercontext.builtin.artifacts.atomic_memory import AtomicMemoryContent
+from powercontext.builtin.artifacts.experience import (
+    Experience,
+    ExperienceContent,
+    FailureRecord,
+    FailureSignature,
+    FailureVerification,
+)
+from powercontext.builtin.artifacts.handoff import HandoffArtifactCitation, HandoffSourceCitation
+from powercontext.builtin.artifacts.memory import EmbeddingProfile
+from powercontext.builtin.artifacts.skill import Skill, SkillContent, SkillPackageSnapshot
+from powercontext.builtin.artifacts.topic_memory import TopicMemoryContent
+from powercontext.builtin.inference import EmbeddingResult
+from powercontext.builtin.persistence.errors import InvalidStoredPayloadError, RepositoryNotFoundError
+from powercontext.builtin.persistence.experience_index import NoExperienceIndex
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
 from powercontext.builtin.persistence.tables import ARTIFACTS_TABLE, BUILTIN_TABLES
+from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.review import (
     ArtifactTargetConflictError,
     CandidateConflictError,
@@ -35,36 +49,93 @@ from powercontext.builtin.review import (
     InvalidCandidateError,
 )
 from powercontext.builtin.runtime import (
-    ApproveArtifactCandidateRequest,
+    ApproveCandidateRequest,
     BuiltinConfig,
+    BuiltinRuntime,
     CaptureSource,
-    GetArtifactCandidateRequest,
+    GetCandidateRequest,
     GetExperienceRequest,
     GetSkillRequest,
-    ListArtifactCandidatesRequest,
+    ListCandidatesRequest,
     PrepareContextRequest,
     ProposeExperienceRequest,
     ProposeSkillRequest,
-    RejectArtifactCandidateRequest,
-    RememberMemoryRequest,
-    ReviseArtifactCandidateRequest,
+    RejectCandidateRequest,
+    ReviseCandidateRequest,
+    open_builtin_contexts,
     open_builtin_runtime,
 )
 from powercontext.builtin.runtime.relational import RelationalContexts
+from powercontext.builtin.scope import ScopeDraft
+from powercontext.builtin.source_eligibility import SourceNotEligibleError
 from powercontext.builtin.sources import ContentCapture
+from powercontext.builtin.work.models import TaskCheck, TaskOutcome, WorkClaim
+from powercontext.sources import SourceRef
+
+
+async def _create_scope(runtime: BuiltinRuntime, idempotency_key: str = "project") -> str:
+    assert runtime.scopes is not None
+    scope = await runtime.scopes.create(
+        ScopeDraft(title="Project", summary="Review service tests", idempotency_key=idempotency_key)
+    )
+    return scope.scope_id
 
 
 class _InjectedCandidateStatusError(RuntimeError):
     pass
 
 
+def test_duplicate_candidate_identity_preserves_original_proposal() -> None:
+    async def scenario() -> None:
+        async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:
+            scope = await contexts.scopes.create(
+                ScopeDraft(title="Review", summary="Candidate identity", idempotency_key="duplicate-candidate")
+            )
+            source = await contexts.records.capture_source(
+                scope.scope_id, "content", "review-evidence", "Verified result", {}
+            )
+            review = contexts.review(scope.scope_id)
+            proposal = ExperienceContent(
+                situation="A verified task finished.",
+                action="Record the result.",
+                outcome="The next task can use it.",
+                lesson="Keep the verified evidence.",
+            )
+            source_ref = SourceRef(source_type="content", source_id=source.source_id)
+            original = await review.propose_experience(
+                proposal,
+                sources=(source_ref,),
+                artifacts=(),
+                target=None,
+                reason="Verified result",
+                candidate_id="same-candidate",
+            )
+            with pytest.raises(CandidateConflictError):
+                await review.propose_experience(
+                    proposal.model_copy(update={"lesson": "Different instruction."}),
+                    sources=(source_ref,),
+                    artifacts=(),
+                    target=None,
+                    reason="Verified result",
+                    candidate_id="same-candidate",
+                )
+            async with contexts.database.transaction() as connection:
+                stored = await contexts.repositories.candidates.get(connection, scope.scope_id, original.candidate_id)
+            assert stored.proposal == proposal and stored.version == 1
+
+    asyncio.run(scenario())
+
+
 class _InjectedExperienceProjectionError(RuntimeError):
     pass
 
 
-class _FailingExperienceIndex:
+class _FailingExperienceIndex(NoExperienceIndex):
     async def initialize(self, _connection: AsyncConnection, /) -> None:
         pass
+
+    async def remove(self, _connection: AsyncConnection, _scope_id: str, _artifact_id: str, /) -> None:
+        raise _InjectedExperienceProjectionError
 
     async def replace(
         self,
@@ -75,15 +146,15 @@ class _FailingExperienceIndex:
     ) -> None:
         raise _InjectedExperienceProjectionError
 
-    async def search(
+    async def replace_skill(
         self,
         _connection: AsyncConnection,
         _scope_id: str,
-        _query: str,
-        _limit: int,
+        _skill: Skill,
+        _package: SkillPackageSnapshot,
         /,
-    ) -> tuple[ExperienceSearchHit, ...]:
-        return ()
+    ) -> None:
+        pass
 
 
 def _proposal(lesson: str = "Regenerate the Client before contract tests.") -> ExperienceContent:
@@ -93,6 +164,271 @@ def _proposal(lesson: str = "Regenerate the Client before contract tests.") -> E
         outcome="The generated transport and contract remain aligned.",
         lesson=lesson,
     )
+
+
+def test_failure_proposal_requires_cited_failed_task_outcome_evidence() -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+            scope_id = await _create_scope(runtime)
+            source = await runtime.sources.for_scope(scope_id).capture(
+                CaptureSource(source_id="plain-source", content="not a Task Outcome", metadata={})
+            )
+            proposal = _proposal().model_copy(
+                update={
+                    "failure": FailureRecord(
+                        signature=FailureSignature(recall_cue="the contract test failed"),
+                        repair_surface="experience_content",
+                        verification=FailureVerification(
+                            condition="the contract file was edited",
+                            check_subject="generated code matches the contract",
+                        ),
+                    )
+                }
+            )
+
+            with pytest.raises(InvalidCandidateError, match="failed Task Outcome"):
+                await runtime.experience.for_scope(scope_id).propose(
+                    ProposeExperienceRequest(proposal=proposal, sources=(source.source_ref,))
+                )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "name, accepted", (("the contract test failed", True), ("the database migration failed", False))
+)
+def test_failure_proposal_requires_failure_evidence_to_match_its_recall_cue(name: str, accepted: bool) -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+            scope_id = await _create_scope(runtime)
+            proof = await runtime.sources.for_scope(scope_id).capture(
+                CaptureSource(source_id="plain-source", content="Verified failure output.", metadata={})
+            )
+            check = _failure_check(HandoffSourceCitation(source_ref=proof.source_ref)).model_copy(update={"name": name})
+            request = await _failure_request(runtime, scope_id, (check,))
+            if accepted:
+                candidate = await runtime.experience.for_scope(scope_id).propose(request)
+                await _assert_failure_candidate(runtime, scope_id, candidate, request)
+            else:
+                with pytest.raises(InvalidCandidateError, match="failed Task Outcome"):
+                    await runtime.experience.for_scope(scope_id).propose(request)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "citation",
+    (
+        HandoffSourceCitation(source_ref=SourceRef(source_type="content", source_id="never-existed")),
+        HandoffArtifactCitation(artifact_ref=ArtifactRef(family="experience", artifact_id="never-existed", revision=1)),
+    ),
+)
+def test_failure_proposal_rejects_missing_nested_task_outcome_evidence(citation) -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+            scope_id = await _create_scope(runtime)
+            request = await _failure_request(runtime, scope_id, (_failure_check(citation),))
+            with pytest.raises(InvalidCandidateError, match="failed Task Outcome"):
+                await runtime.experience.for_scope(scope_id).propose(request)
+            assert (await runtime.review.for_scope(scope_id).list(ListCandidatesRequest())).candidates == ()
+
+    asyncio.run(scenario())
+
+
+_FAILURE_CUE = "the contract test failed"
+
+
+def _failure_check(*citations: HandoffArtifactCitation | HandoffSourceCitation) -> TaskCheck:
+    return TaskCheck(name=_FAILURE_CUE, status="failed", basis="verified", evidence=citations)
+
+
+async def _failure_request(
+    runtime: BuiltinRuntime,
+    scope_id: str,
+    checks: tuple[TaskCheck, ...],
+) -> ProposeExperienceRequest:
+    outcome = TaskOutcome(
+        objective="Run contract tests.",
+        status="failed",
+        summary="The contract check failed.",
+        observations=(WorkClaim(text="The runner reported a failure."),),
+        checks=checks,
+    )
+    source = await runtime.sources.for_scope(scope_id).capture(
+        CaptureSource(
+            source_id="failed-task",
+            content=outcome.model_dump_json(by_alias=True),
+            metadata={"kind": "task-outcome"},
+        )
+    )
+    proposal = _proposal().model_copy(
+        update={
+            "failure": FailureRecord(
+                signature=FailureSignature(recall_cue=_FAILURE_CUE),
+                repair_surface="experience_content",
+                verification=FailureVerification(
+                    condition="the contract file was edited", check_subject="generated code matches the contract"
+                ),
+            )
+        }
+    )
+    return ProposeExperienceRequest(proposal=proposal, sources=(source.source_ref,))
+
+
+async def _assert_failure_candidate(runtime, scope_id, candidate, request) -> None:
+    stored = await runtime.review.for_scope(scope_id).get(GetCandidateRequest(candidate_id=candidate.candidate_id))
+    assert stored.proposal == candidate.proposal == request.proposal
+    assert stored.sources == candidate.sources == request.sources
+    assert stored.artifacts == candidate.artifacts == request.artifacts
+    assert stored.target == candidate.target == request.target
+    assert stored.status == candidate.status == CandidateStatus.PENDING
+
+
+async def _corrupt_artifact(config: SQLiteConfig, scope_id: str, ref: ArtifactRef) -> None:
+    engine = create_async_engine(config.url)
+    try:
+        async with engine.begin() as connection:
+            changed = await connection.execute(
+                update(ARTIFACTS_TABLE)
+                .where(
+                    ARTIFACTS_TABLE.c.scope_id == scope_id,
+                    ARTIFACTS_TABLE.c.family == ref.family,
+                    ARTIFACTS_TABLE.c.artifact_id == ref.artifact_id,
+                    ARTIFACTS_TABLE.c.revision == ref.revision,
+                )
+                .values(content=b"{}")
+            )
+            assert changed.rowcount == 1
+    finally:
+        await engine.dispose()
+
+
+def test_failure_proposal_uses_exact_evidence_and_stops_after_a_match(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'selection.db'}")
+        async with open_builtin_runtime(BuiltinConfig(database=config)) as runtime:
+            scope_id = await _create_scope(runtime)
+            records = runtime.records.for_scope(scope_id)
+            created = await records.create_artifact(
+                "experience", ArtifactWrite(content=_proposal().model_dump(mode="json"))
+            )
+            historical = ArtifactRef(family="experience", artifact_id=created.artifact_id, revision=1)
+            await records.replace_artifact(
+                "experience",
+                created.artifact_id,
+                '"revision:1"',
+                ArtifactWrite(content=_proposal().model_dump(mode="json")),
+            )
+            current = historical.model_copy(update={"revision": 2})
+            await _corrupt_artifact(config, scope_id, current)
+            missing = ArtifactRef(family="experience", artifact_id="absent", revision=1)
+            historical_citation = HandoffArtifactCitation(artifact_ref=historical)
+            request = await _failure_request(
+                runtime,
+                scope_id,
+                (
+                    _failure_check(HandoffArtifactCitation(artifact_ref=missing)),
+                    _failure_check(historical_citation, historical_citation),
+                    _failure_check(HandoffArtifactCitation(artifact_ref=current)),
+                ),
+            )
+            candidate = await runtime.experience.for_scope(scope_id).propose(request)
+            await _assert_failure_candidate(runtime, scope_id, candidate, request)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "other_family",
+    (
+        pytest.param("experience", id="missing-after"),
+        pytest.param("not-registered", id="unsupported-after"),
+        pytest.param("atomic-memory", id="atomic-after"),
+    ),
+)
+def test_failure_proposal_preserves_nested_evidence_error_precedence(tmp_path: Path, other_family: str) -> None:
+    async def scenario() -> None:
+        config = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'errors.db'}")
+        async with open_builtin_runtime(BuiltinConfig(database=config)) as runtime:
+            scope_id = await _create_scope(runtime)
+            records = runtime.records.for_scope(scope_id)
+            corrupt = await records.create_artifact(
+                "experience", ArtifactWrite(content=_proposal().model_dump(mode="json"))
+            )
+            corrupt_ref = ArtifactRef(family="experience", artifact_id=corrupt.artifact_id, revision=1)
+            await _corrupt_artifact(config, scope_id, corrupt_ref)
+            other = ArtifactRef(family=other_family, artifact_id="absent", revision=1)
+            if other_family == "atomic-memory":
+                atomic = await records.create_artifact(
+                    "atomic-memory", ArtifactWrite(content={"kind": "fact", "text": "Proof."})
+                )
+                other = ArtifactRef(family="atomic-memory", artifact_id=atomic.artifact_id, revision=1)
+                await _corrupt_artifact(config, scope_id, other)
+            request = await _failure_request(
+                runtime,
+                scope_id,
+                (
+                    _failure_check(
+                        HandoffArtifactCitation(artifact_ref=corrupt_ref), HandoffArtifactCitation(artifact_ref=other)
+                    ),
+                ),
+            )
+            with pytest.raises(InvalidStoredPayloadError) as error:
+                await runtime.experience.for_scope(scope_id).propose(request)
+            assert str(error.value) == str(
+                InvalidStoredPayloadError("artifact", "experience", "payload does not match the model")
+            )
+            assert (await runtime.review.for_scope(scope_id).list(ListCandidatesRequest())).candidates == ()
+
+    asyncio.run(scenario())
+
+
+# Measured at seven statements for a complete SQLite proposal; allow one statement of slack.
+_FAILURE_EVIDENCE_STATEMENT_CEILING = 8
+
+
+def test_failure_proposal_statement_count_does_not_grow_with_artifact_evidence(record_property) -> None:
+    async def counted(evidence_count: int) -> list[int]:
+        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+            scope_id = await _create_scope(runtime)
+            citations = []
+            for _ in range(evidence_count):
+                created = await runtime.records.for_scope(scope_id).create_artifact(
+                    "experience", ArtifactWrite(content=_proposal().model_dump(mode="json"))
+                )
+                citations.append(
+                    HandoffArtifactCitation(
+                        artifact_ref=ArtifactRef(family="experience", artifact_id=created.artifact_id, revision=1)
+                    )
+                )
+            request = await _failure_request(runtime, scope_id, (_failure_check(*citations),))
+            await runtime.experience.for_scope(scope_id).propose(request)
+            counts = []
+            candidate_ids = set()
+            statements = []
+
+            def record(_conn, _cursor, statement, *_args) -> None:
+                statements.append(statement)
+
+            for _ in range(3):
+                statements.clear()
+                event.listen(Engine, "before_cursor_execute", record)
+                try:
+                    candidate = await runtime.experience.for_scope(scope_id).propose(request)
+                finally:
+                    event.remove(Engine, "before_cursor_execute", record)
+                counts.append(len(statements))
+                candidate_ids.add(candidate.candidate_id)
+                await _assert_failure_candidate(runtime, scope_id, candidate, request)
+            assert len(candidate_ids) == 3
+            return counts
+
+    small = asyncio.run(counted(4))
+    large = asyncio.run(counted(32))
+    record_property("failure_evidence_statements", {4: small, 32: large})
+    assert small == large
+    assert len(set(small)) == 1
+    assert max(large) <= _FAILURE_EVIDENCE_STATEMENT_CEILING
 
 
 def _skill_proposal(
@@ -109,12 +445,16 @@ def _skill_proposal(
 def test_memory_write_remains_direct_and_does_not_create_a_candidate() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            remembered = await runtime.memory.for_scope("project").remember(
-                RememberMemoryRequest(entries=(MemoryEntryInput(kind="decision", text="Keep Memory direct."),))
-            )
-            inbox = await runtime.review.for_scope("project").list(ListArtifactCandidatesRequest())
+            scope_id = await _create_scope(runtime)
+            assert runtime.atomic_memory is not None
+            remembered = await runtime.atomic_memory.for_scope(scope_id).create((
+                AtomicMemoryContent(kind="decision", text="Keep Memory direct."),
+            ))
+            inbox = await runtime.review.for_scope(scope_id).list(ListCandidatesRequest())
 
-            assert remembered.memory_ref.family == "memory"
+            assert remembered.changed is True
+            assert len(remembered.records) == 1
+            assert remembered.records[0].ref.family == "atomic-memory"
             assert inbox.candidates == ()
 
     asyncio.run(scenario())
@@ -123,6 +463,20 @@ def test_memory_write_remains_direct_and_does_not_create_a_candidate() -> None:
 def test_experience_projection_failure_rolls_back_approval_artifact_and_status() -> None:
     async def scenario() -> None:
         async with SQLiteProfile.open(SQLiteConfig(), tables=BUILTIN_TABLES) as profile:
+            from powercontext.builtin.persistence.tables import SCOPES_TABLE
+
+            async with profile.database.transaction() as connection:
+                await connection.execute(
+                    insert(SCOPES_TABLE).values(
+                        scope_id="project",
+                        title="Project",
+                        summary="Review",
+                        scope_id_search="project",
+                        title_search="project",
+                        summary_search="review",
+                        version=1,
+                    )
+                )
             contexts = RelationalContexts(
                 database=profile.database,
                 experience_index=_FailingExperienceIndex(),
@@ -160,33 +514,93 @@ def test_experience_projection_failure_rolls_back_approval_artifact_and_status()
     asyncio.run(scenario())
 
 
+def test_approval_rechecks_sources_saved_by_an_older_candidate_path() -> None:
+    async def scenario() -> None:
+        async with SQLiteProfile.open(SQLiteConfig(), tables=BUILTIN_TABLES) as profile:
+            from powercontext.builtin.persistence.tables import SCOPES_TABLE
+
+            async with profile.database.transaction() as connection:
+                await connection.execute(
+                    insert(SCOPES_TABLE).values(
+                        scope_id="project",
+                        title="Project",
+                        summary="Review",
+                        scope_id_search="project",
+                        title_search="project",
+                        summary_search="review",
+                        version=1,
+                    )
+                )
+            contexts = RelationalContexts(database=profile.database)
+            async with profile.database.transaction() as connection:
+                await contexts.atomic_memory_index.initialize(connection)
+            await contexts.get("project")
+            created = await contexts.records.create_artifact(
+                "project",
+                "atomic-memory",
+                ArtifactWrite(content={"kind": "fact", "text": "Direct input."}),
+            )
+            async with contexts.database.transaction() as connection:
+                candidate = await contexts.repositories.candidates.create(
+                    connection,
+                    "project",
+                    "candidate-legacy",
+                    "experience",
+                    _proposal(),
+                    sources=created.sources,
+                    artifacts=(),
+                    target=None,
+                    reason=None,
+                )
+
+            with pytest.raises(SourceNotEligibleError):
+                await contexts.review("project").approve(candidate.candidate_id, candidate.version)
+
+            current = await contexts.review("project").get_candidate(candidate.candidate_id)
+            async with contexts.database.transaction() as connection:
+                experiences = await connection.scalar(
+                    select(func.count())
+                    .select_from(ARTIFACTS_TABLE)
+                    .where(
+                        ARTIFACTS_TABLE.c.scope_id == "project",
+                        ARTIFACTS_TABLE.c.family == Experience.family,
+                    )
+                )
+            assert current.status == "pending"
+            assert experiences == 0
+
+    asyncio.run(scenario())
+
+
 def test_experience_candidate_revise_approve_and_retrieval_gate() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            captured = await runtime.sources.for_scope("project").capture(
+            scope_id = await _create_scope(runtime)
+            isolated_scope_id = await _create_scope(runtime, "other-project")
+            captured = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-1", content="api-generate then contract-test passed", metadata={})
             )
-            candidate = await runtime.experience.for_scope("project").propose(
+            candidate = await runtime.experience.for_scope(scope_id).propose(
                 ProposeExperienceRequest(
                     proposal=_proposal(),
                     sources=(captured.source_ref,),
                 )
             )
-            inbox = await runtime.review.for_scope("project").list(ListArtifactCandidatesRequest())
-            prepared = await runtime.context.for_scope("project").prepare(
+            inbox = await runtime.review.for_scope(scope_id).list(ListCandidatesRequest())
+            prepared = await runtime.context.for_scope(scope_id).prepare(
                 PrepareContextRequest(query="Regenerate the Client before contract tests.")
             )
             with pytest.raises(InvalidCandidateError):
-                await runtime.review.for_scope("project").revise(
-                    ReviseArtifactCandidateRequest(
+                await runtime.review.for_scope(scope_id).revise(
+                    ReviseCandidateRequest(
                         candidate_id=candidate.candidate_id,
                         expected_version=1,
                         proposal=_skill_proposal(),
                         sources=(captured.source_ref,),
                     )
                 )
-            revised = await runtime.review.for_scope("project").revise(
-                ReviseArtifactCandidateRequest(
+            revised = await runtime.review.for_scope(scope_id).revise(
+                ReviseCandidateRequest(
                     candidate_id=candidate.candidate_id,
                     expected_version=1,
                     proposal=_proposal("Regenerate and inspect the Client before contract tests."),
@@ -194,25 +608,25 @@ def test_experience_candidate_revise_approve_and_retrieval_gate() -> None:
                 )
             )
             with pytest.raises(CandidateConflictError):
-                await runtime.review.for_scope("project").approve(
-                    ApproveArtifactCandidateRequest(candidate_id=candidate.candidate_id, expected_version=1)
+                await runtime.review.for_scope(scope_id).approve(
+                    ApproveCandidateRequest(candidate_id=candidate.candidate_id, expected_version=1)
                 )
-            approved = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(candidate_id=candidate.candidate_id, expected_version=2)
+            approved = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(candidate_id=candidate.candidate_id, expected_version=2)
             )
             assert approved.result_artifact is not None
-            experience = await runtime.experience.for_scope("project").get(
+            experience = await runtime.experience.for_scope(scope_id).get(
                 GetExperienceRequest(artifact=approved.result_artifact)
             )
-            approved_context = await runtime.context.for_scope("project").prepare(
+            approved_context = await runtime.context.for_scope(scope_id).prepare(
                 PrepareContextRequest(query="Regenerate and inspect the Client before contract tests.")
             )
-            isolated_context = await runtime.context.for_scope("other-project").prepare(
+            isolated_context = await runtime.context.for_scope(isolated_scope_id).prepare(
                 PrepareContextRequest(query="Regenerate and inspect the Client before contract tests.")
             )
-            pending = await runtime.review.for_scope("project").list(ListArtifactCandidatesRequest())
-            approved_page = await runtime.review.for_scope("project").list(
-                ListArtifactCandidatesRequest(status=CandidateStatus.APPROVED)
+            pending = await runtime.review.for_scope(scope_id).list(ListCandidatesRequest())
+            approved_page = await runtime.review.for_scope(scope_id).list(
+                ListCandidatesRequest(status=CandidateStatus.APPROVED)
             )
 
             assert candidate.status == "pending"
@@ -228,10 +642,10 @@ def test_experience_candidate_revise_approve_and_retrieval_gate() -> None:
             assert isolated_context.status == "empty"
             assert pending.candidates == ()
             assert approved_page.candidates == (approved,)
-            with pytest.raises(CandidateTerminalError):
-                await runtime.review.for_scope("project").approve(
-                    ApproveArtifactCandidateRequest(candidate_id=candidate.candidate_id, expected_version=2)
-                )
+            replay = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(candidate_id=candidate.candidate_id, expected_version=2)
+            )
+            assert replay == approved
 
     asyncio.run(scenario())
 
@@ -239,24 +653,26 @@ def test_experience_candidate_revise_approve_and_retrieval_gate() -> None:
 def test_rejected_candidate_is_terminal_and_scope_evidence_isolated() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            captured = await runtime.sources.for_scope("scope-a").capture(
+            scope_a = await _create_scope(runtime, "scope-a")
+            scope_b = await _create_scope(runtime, "scope-b")
+            captured = await runtime.sources.for_scope(scope_a).capture(
                 CaptureSource(source_id="task-1", content="bounded evidence", metadata={})
             )
             with pytest.raises(InvalidCandidateError):
-                await runtime.experience.for_scope("scope-b").propose(
+                await runtime.experience.for_scope(scope_b).propose(
                     ProposeExperienceRequest(proposal=_proposal(), sources=(captured.source_ref,))
                 )
-            candidate = await runtime.experience.for_scope("scope-a").propose(
+            candidate = await runtime.experience.for_scope(scope_a).propose(
                 ProposeExperienceRequest(proposal=_proposal(), sources=(captured.source_ref,))
             )
-            rejected = await runtime.review.for_scope("scope-a").reject(
-                RejectArtifactCandidateRequest(
+            rejected = await runtime.review.for_scope(scope_a).reject(
+                RejectCandidateRequest(
                     candidate_id=candidate.candidate_id,
                     expected_version=1,
                     reason="The outcome does not support the lesson.",
                 )
             )
-            prepared = await runtime.context.for_scope("scope-a").prepare(
+            prepared = await runtime.context.for_scope(scope_a).prepare(
                 PrepareContextRequest(query="Regenerate the Client before contract tests.")
             )
 
@@ -265,8 +681,8 @@ def test_rejected_candidate_is_terminal_and_scope_evidence_isolated() -> None:
             assert rejected.decision_reason == "The outcome does not support the lesson."
             assert prepared.status == "empty"
             with pytest.raises(CandidateTerminalError):
-                await runtime.review.for_scope("scope-a").revise(
-                    ReviseArtifactCandidateRequest(
+                await runtime.review.for_scope(scope_a).revise(
+                    ReviseCandidateRequest(
                         candidate_id=candidate.candidate_id,
                         expected_version=1,
                         proposal=_proposal("replacement"),
@@ -280,31 +696,30 @@ def test_rejected_candidate_is_terminal_and_scope_evidence_isolated() -> None:
 def test_managed_skill_uses_review_gate_and_exact_replacement_lineage() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            task = await runtime.sources.for_scope("project").capture(
+            scope_id = await _create_scope(runtime)
+            task = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-1", content="api generation and contract validation passed", metadata={})
             )
-            experience_candidate = await runtime.experience.for_scope("project").propose(
+            experience_candidate = await runtime.experience.for_scope(scope_id).propose(
                 ProposeExperienceRequest(proposal=_proposal(), sources=(task.source_ref,))
             )
-            experience_approval = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(
+            experience_approval = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(
                     candidate_id=experience_candidate.candidate_id,
                     expected_version=1,
                 )
             )
             assert experience_approval.result_artifact is not None
 
-            candidate = await runtime.skill.for_scope("project").propose(
+            candidate = await runtime.skill.for_scope(scope_id).propose(
                 ProposeSkillRequest(
                     proposal=_skill_proposal(),
                     artifacts=(experience_approval.result_artifact,),
                     reason="Incubated from reviewed task evidence.",
                 )
             )
-            pending_skills = await runtime.review.for_scope("project").list(
-                ListArtifactCandidatesRequest(family="skill")
-            )
-            pending_context = await runtime.context.for_scope("project").prepare(
+            pending_skills = await runtime.review.for_scope(scope_id).list(ListCandidatesRequest(family="skill"))
+            pending_context = await runtime.context.for_scope(scope_id).prepare(
                 PrepareContextRequest(query="Regenerate clients and run contract tests")
             )
 
@@ -316,20 +731,20 @@ def test_managed_skill_uses_review_gate_and_exact_replacement_lineage() -> None:
             assert '"kind":"experience"' in pending_context.content
             assert '"family":"skill"' not in pending_context.content
 
-            approved = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(candidate_id=candidate.candidate_id, expected_version=1)
+            approved = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(candidate_id=candidate.candidate_id, expected_version=1)
             )
             assert approved.result_artifact is not None
-            first = await runtime.skill.for_scope("project").get(GetSkillRequest(artifact=approved.result_artifact))
+            first = await runtime.skill.for_scope(scope_id).get(GetSkillRequest(artifact=approved.result_artifact))
 
-            usage = await runtime.sources.for_scope("project").capture(
+            usage = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(
                     source_id="task-2",
                     content="The managed Skill was used and both validation commands passed.",
                     metadata={},
                 )
             )
-            replacement = await runtime.skill.for_scope("project").propose(
+            replacement = await runtime.skill.for_scope(scope_id).propose(
                 ProposeSkillRequest(
                     proposal=_skill_proposal(
                         "Regenerate clients, inspect the diff, run generation checks, and then run contract tests."
@@ -340,15 +755,15 @@ def test_managed_skill_uses_review_gate_and_exact_replacement_lineage() -> None:
                     reason="Usage evidence showed that the generation check must be explicit.",
                 )
             )
-            replacement_approval = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(candidate_id=replacement.candidate_id, expected_version=1)
+            replacement_approval = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(candidate_id=replacement.candidate_id, expected_version=1)
             )
             assert replacement_approval.result_artifact is not None
-            second = await runtime.skill.for_scope("project").get(
+            second = await runtime.skill.for_scope(scope_id).get(
                 GetSkillRequest(artifact=replacement_approval.result_artifact)
             )
-            historical = await runtime.skill.for_scope("project").get(GetSkillRequest(artifact=first.as_ref()))
-            approved_context = await runtime.context.for_scope("project").prepare(
+            historical = await runtime.skill.for_scope(scope_id).get(GetSkillRequest(artifact=first.as_ref()))
+            approved_context = await runtime.context.for_scope(scope_id).prepare(
                 PrepareContextRequest(query="Regenerate clients and run contract tests")
             )
 
@@ -364,30 +779,31 @@ def test_managed_skill_uses_review_gate_and_exact_replacement_lineage() -> None:
 def test_managed_skill_approval_validates_family_lineage() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            source = await runtime.sources.for_scope("project").capture(
+            scope_id = await _create_scope(runtime)
+            source = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="skill-source", content="reviewed Skill source", metadata={})
             )
-            initial = await runtime.skill.for_scope("project").propose(
+            initial = await runtime.skill.for_scope(scope_id).propose(
                 ProposeSkillRequest(proposal=_skill_proposal(), sources=(source.source_ref,))
             )
-            initial_approval = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(candidate_id=initial.candidate_id, expected_version=1)
+            initial_approval = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(candidate_id=initial.candidate_id, expected_version=1)
             )
             assert initial_approval.result_artifact is not None
 
-            unsupported_create = await runtime.skill.for_scope("project").propose(
+            unsupported_create = await runtime.skill.for_scope(scope_id).propose(
                 ProposeSkillRequest(
                     proposal=_skill_proposal("Use another managed Skill as the only evidence."),
                     artifacts=(initial_approval.result_artifact,),
                 )
             )
             with pytest.raises(InvalidCandidateError) as unsupported_error:
-                await runtime.review.for_scope("project").approve(
-                    ApproveArtifactCandidateRequest(candidate_id=unsupported_create.candidate_id, expected_version=1)
+                await runtime.review.for_scope(scope_id).approve(
+                    ApproveCandidateRequest(candidate_id=unsupported_create.candidate_id, expected_version=1)
                 )
             assert unsupported_error.value.field == "artifacts"
 
-            unsupported_replacement = await runtime.skill.for_scope("project").propose(
+            unsupported_replacement = await runtime.skill.for_scope(scope_id).propose(
                 ProposeSkillRequest(
                     proposal=_skill_proposal("Replace without direct usage evidence."),
                     artifacts=(initial_approval.result_artifact,),
@@ -395,8 +811,8 @@ def test_managed_skill_approval_validates_family_lineage() -> None:
                 )
             )
             with pytest.raises(InvalidCandidateError) as replacement_error:
-                await runtime.review.for_scope("project").approve(
-                    ApproveArtifactCandidateRequest(
+                await runtime.review.for_scope(scope_id).approve(
+                    ApproveCandidateRequest(
                         candidate_id=unsupported_replacement.candidate_id,
                         expected_version=1,
                     )
@@ -406,21 +822,23 @@ def test_managed_skill_approval_validates_family_lineage() -> None:
     asyncio.run(scenario())
 
 
-def test_stale_experience_target_keeps_candidate_pending() -> None:
+@pytest.mark.parametrize("rejected", [False, True])
+def test_stale_experience_target_preserves_candidate_decision(rejected: bool) -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            captured = await runtime.sources.for_scope("project").capture(
+            scope_id = await _create_scope(runtime)
+            captured = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-1", content="first result", metadata={})
             )
-            initial = await runtime.experience.for_scope("project").propose(
+            initial = await runtime.experience.for_scope(scope_id).propose(
                 ProposeExperienceRequest(proposal=_proposal(), sources=(captured.source_ref,))
             )
-            approved = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(candidate_id=initial.candidate_id, expected_version=1)
+            approved = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(candidate_id=initial.candidate_id, expected_version=1)
             )
             assert approved.result_artifact is not None
             with pytest.raises(InvalidCandidateError):
-                await runtime.experience.for_scope("project").propose(
+                await runtime.experience.for_scope(scope_id).propose(
                     ProposeExperienceRequest(
                         proposal=_proposal("This revision omits predecessor lineage."),
                         sources=(captured.source_ref,),
@@ -433,23 +851,102 @@ def test_stale_experience_target_keeps_candidate_pending() -> None:
                 artifacts=(approved.result_artifact,),
                 target=approved.result_artifact,
             )
-            winner = await runtime.experience.for_scope("project").propose(replacement_request)
-            stale = await runtime.experience.for_scope("project").propose(replacement_request)
-            winner_result = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(candidate_id=winner.candidate_id, expected_version=1)
+            winner = await runtime.experience.for_scope(scope_id).propose(replacement_request)
+            stale = await runtime.experience.for_scope(scope_id).propose(replacement_request)
+            if rejected:
+                await runtime.review.for_scope(scope_id).reject(
+                    RejectCandidateRequest(
+                        candidate_id=stale.candidate_id, expected_version=1, reason="Do not publish this proposal."
+                    )
+                )
+            winner_result = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(candidate_id=winner.candidate_id, expected_version=1)
             )
 
-            with pytest.raises(ArtifactTargetConflictError):
-                await runtime.review.for_scope("project").approve(
-                    ApproveArtifactCandidateRequest(candidate_id=stale.candidate_id, expected_version=1)
+            with pytest.raises(CandidateTerminalError if rejected else ArtifactTargetConflictError):
+                await runtime.review.for_scope(scope_id).approve(
+                    ApproveCandidateRequest(candidate_id=stale.candidate_id, expected_version=1)
                 )
-            current_stale = await runtime.review.for_scope("project").get(
-                GetArtifactCandidateRequest(candidate_id=stale.candidate_id)
+            current_stale = await runtime.review.for_scope(scope_id).get(
+                GetCandidateRequest(candidate_id=stale.candidate_id)
             )
 
             assert winner_result.result_artifact == approved.result_artifact.model_copy(update={"revision": 2})
-            assert current_stale.status == "pending"
+            assert current_stale.status == ("rejected" if rejected else "pending")
             assert current_stale.version == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("family", ["atomic-memory", "topic-memory"])
+def test_rejected_memory_approval_does_not_request_embeddings(family: str) -> None:
+    class Embedding:
+        profile = EmbeddingProfile(
+            profile_id="review-terminal", model="controlled", dimension=3, distance="l2", normalization="unit"
+        )
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        async def embed(self, texts: tuple[str, ...], /) -> EmbeddingResult:
+            self.requests += 1
+            return EmbeddingResult(vectors=tuple((1.0, 0.0, 0.0) for _ in texts))
+
+    async def scenario() -> None:
+        embedding = Embedding()
+        async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig()), embedding_model=embedding) as contexts:
+            scope = await contexts.scopes.create(
+                ScopeDraft(title="Review", summary="Rejected approval", idempotency_key="rejected")
+            )
+            original = (
+                AtomicMemoryContent(kind="task_record", text="The replacement is pending.")
+                if family == "atomic-memory"
+                else TopicMemoryContent(title="Replacement", summary="Pending", detail="The replacement is pending.")
+            )
+            target = await contexts.records.create_artifact(
+                scope.scope_id, family, ArtifactWrite(content=original.model_dump(mode="json", exclude={"creation"}))
+            )
+            context = await contexts.get(scope.scope_id)
+            source, _ = await context.sources.capture(
+                ContentCapture(source_id="progress", content="The replacement has been issued.", metadata={})
+            )
+            source_ref = context.sources.catalog.as_ref(source)
+            service = contexts.review(scope.scope_id)
+            target_ref = ArtifactRef(family=family, artifact_id=target.artifact_id, revision=target.revision)
+            if isinstance(original, AtomicMemoryContent):
+                candidate = await service.propose_memory_dream(
+                    original.model_copy(update={"text": "The replacement has been issued."}),
+                    sources=(source_ref,),
+                    artifacts=(target_ref,),
+                    target=target_ref,
+                    reason="Correct the pending status.",
+                    candidate_id="rejected-memory",
+                )
+            else:
+                candidate = await service.propose_topic_memory_dream(
+                    original.model_copy(update={"summary": "Issued", "detail": "The replacement has been issued."}),
+                    sources=(source_ref,),
+                    artifacts=(target_ref,),
+                    target=target_ref,
+                    reason="Correct the pending status.",
+                    candidate_id="rejected-memory",
+                )
+            await service.reject(candidate.candidate_id, candidate.version, "The evidence does not support this.")
+            before_requests = embedding.requests
+            for expected_version in (candidate.version, candidate.version + 1):
+                with pytest.raises(CandidateTerminalError) as error:
+                    await service.approve(candidate.candidate_id, expected_version)
+                assert error.value.status == "rejected"
+            assert embedding.requests == before_requests
+            current = await service.get_candidate(candidate.candidate_id)
+            assert current.status == "rejected" and current.result_artifact is None
+
+            async def deny_approval(*_args) -> None:
+                raise PermissionError
+
+            service.authorize_action = deny_approval
+            with pytest.raises(PermissionError):
+                await service.approve(candidate.candidate_id, candidate.version)
 
     asyncio.run(scenario())
 
@@ -458,6 +955,20 @@ def test_failed_candidate_status_update_rolls_back_artifact_commit(monkeypatch: 
     async def scenario() -> None:
         fixed_ids = {"candidate": "cand-fixed", "experience": "exp-fixed"}
         async with SQLiteProfile.open(SQLiteConfig(), tables=BUILTIN_TABLES) as profile:
+            from powercontext.builtin.persistence.tables import SCOPES_TABLE
+
+            async with profile.database.transaction() as connection:
+                await connection.execute(
+                    insert(SCOPES_TABLE).values(
+                        scope_id="project",
+                        title="Project",
+                        summary="Review",
+                        scope_id_search="project",
+                        title_search="project",
+                        summary_search="review",
+                        version=1,
+                    )
+                )
             contexts = RelationalContexts(
                 database=profile.database,
                 id_factory=lambda kind: fixed_ids[kind],

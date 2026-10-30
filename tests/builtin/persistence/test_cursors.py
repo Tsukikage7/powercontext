@@ -18,7 +18,6 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.builtin.persistence import GenerationConflictError
 from powercontext.builtin.persistence.cursors import SourceCursorRepository, StoredSourceCursor
@@ -65,28 +64,11 @@ def test_source_cursor_uses_generation_compare_and_swap() -> None:
 
 def test_source_cursor_initial_creation_is_safe_across_connections(tmp_path: Path) -> None:
     async def scenario() -> None:
-        barrier = asyncio.Barrier(2)
-
-        class SynchronizedRepository(SourceCursorRepository):
-            async def load(
-                self,
-                connection: AsyncConnection,
-                scope_id: str,
-                binding_name: str,
-                /,
-                *,
-                for_update: bool = False,
-            ) -> StoredSourceCursor | None:
-                result = await super().load(connection, scope_id, binding_name, for_update=for_update)
-                if not for_update and result is None:
-                    await barrier.wait()
-                return result
-
         url = f"sqlite+aiosqlite:///{tmp_path / 'cursor-race.db'}"
         config = SQLiteConfig(url=url)
 
         async def create_cursor(profile: SQLiteProfile, sequence: int) -> StoredSourceCursor | GenerationConflictError:
-            repository = SynchronizedRepository()
+            repository = SourceCursorRepository()
             try:
                 async with profile.database.transaction() as connection:
                     return await repository.save(

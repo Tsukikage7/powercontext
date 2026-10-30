@@ -53,17 +53,17 @@ from powercontext.builtin.artifacts.handoff.models import (
     HandoffEvidenceStatus,
     HandoffGenerationEvidence,
     HandoffGenerationRequest,
-    HandoffMemoryCitation,
-    HandoffMemoryEvidence,
     HandoffOmission,
     HandoffResolution,
     HandoffResolutionSelection,
     HandoffResolutionStatus,
+    HandoffRolloverReason,
     HandoffSourceCitation,
     HandoffSourceEvidence,
     HandoffStatement,
     PreparedHandoff,
     PrepareHandoff,
+    PrepareHandoffHint,
 )
 from powercontext.builtin.artifacts.handoff.prompts import (
     HANDOFF_GENERATION_INSTRUCTIONS,
@@ -74,7 +74,10 @@ from powercontext.builtin.artifacts.handoff.protocols import (
     HandoffEvidenceResolver,
     HandoffGenerationPipeline,
 )
-from powercontext.builtin.artifacts.handoff.service import HandoffService
+from powercontext.builtin.artifacts.handoff.service import (
+    HandoffEvidenceAuthorizer,
+    HandoffService,
+)
 
 __all__ = [
     "DEFAULT_HANDOFF_MAX_BYTES",
@@ -98,6 +101,7 @@ __all__ = [
     "HandoffDisposition",
     "HandoffDraft",
     "HandoffError",
+    "HandoffEvidenceAuthorizer",
     "HandoffEvidenceCheck",
     "HandoffEvidenceProjector",
     "HandoffEvidenceResolver",
@@ -112,12 +116,11 @@ __all__ = [
     "HandoffGenerationRequest",
     "HandoffGenerationStatement",
     "HandoffGenerationUnavailableError",
-    "HandoffMemoryCitation",
-    "HandoffMemoryEvidence",
     "HandoffOmission",
     "HandoffResolution",
     "HandoffResolutionSelection",
     "HandoffResolutionStatus",
+    "HandoffRolloverReason",
     "HandoffScopeMismatchError",
     "HandoffService",
     "HandoffSourceCitation",
@@ -127,5 +130,6 @@ __all__ = [
     "InvalidHandoffReferenceError",
     "LLMHandoffGenerationPipeline",
     "PrepareHandoff",
+    "PrepareHandoffHint",
     "PreparedHandoff",
 ]

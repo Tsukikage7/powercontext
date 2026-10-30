@@ -14,14 +14,43 @@
 
 """Immutable artifacts and their read-only catalog contract."""
 
-from powercontext.artifacts.models import Artifact, ArtifactDraft, ArtifactLineage, ArtifactRef
+from powercontext.artifacts.models import (
+    Artifact,
+    ArtifactAddress,
+    ArtifactDraft,
+    ArtifactLineage,
+    ArtifactRef,
+    StableHandle,
+)
 from powercontext.artifacts.protocols import ArtifactCatalog, ArtifactStore
+from powercontext.artifacts.search import (
+    ArtifactSearchContractError,
+    ArtifactSearcher,
+    ArtifactSearchExecutionContext,
+    ArtifactSearchFamilyNotFound,
+    ArtifactSearchMatch,
+    ArtifactSearchOutcome,
+    ArtifactSearchQuery,
+    ArtifactSearchUnsupported,
+    ChannelScore,
+)
 
 __all__ = [
     "Artifact",
+    "ArtifactAddress",
     "ArtifactCatalog",
     "ArtifactDraft",
     "ArtifactLineage",
     "ArtifactRef",
+    "ArtifactSearchContractError",
+    "ArtifactSearchExecutionContext",
+    "ArtifactSearchFamilyNotFound",
+    "ArtifactSearchMatch",
+    "ArtifactSearchOutcome",
+    "ArtifactSearchQuery",
+    "ArtifactSearchUnsupported",
+    "ArtifactSearcher",
     "ArtifactStore",
+    "ChannelScore",
+    "StableHandle",
 ]

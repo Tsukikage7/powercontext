@@ -1,7 +1,7 @@
 {
   "name": "powercontext-dsh",
   "version": "0.0.2",
-  "description": "DeepSeek Harness plugin that connects to a PowerContext Server over HTTP for recall, memory, handoff, experience, and skills.",
+  "description": "DeepSeek Harness plugin that exposes PowerContext through native MCP tools and uses HTTP for host lifecycle hooks.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "lib/index.js",
@@ -31,13 +31,11 @@
     }
   },
   "scripts": {
-    "sync:openapi": "node scripts/sync-openapi.mjs",
-    "gen": "node scripts/gen-operations.mjs",
-    "gen:check": "node scripts/gen-operations.mjs --check",
-    "build": "node scripts/gen-operations.mjs && tsdown && node scripts/normalize-build-output.mjs",
+    "build": "tsdown && node scripts/normalize-build-output.mjs",
     "prepare": "node scripts/prepare.mjs",
     "test": "vitest run --exclude=tests/e2e/**",
     "test:e2e": "vitest run tests/e2e",
+    "test:e2e:runtime": "pnpm --dir tests/runtime test",
     "test:all": "vitest run",
     "pack:release": "pnpm build && node scripts/pack-release.mjs"
   },
@@ -46,10 +44,10 @@
     "@deepseek-ai/dsh-agent": "*",
     "@deepseek-ai/dsh-commands": "*",
     "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-mcp-client": "*",
     "@deepseek-ai/dsh-session": "*",
     "@deepseek-ai/dsh-skill": "*",
     "@deepseek-ai/dsh-system-prompt": "*",
-    "@deepseek-ai/dsh-tools": "*",
     "@deepseek-ai/schemastery": "*"
   },
   "peerDependenciesMeta": {
@@ -65,6 +63,9 @@
     "@deepseek-ai/dsh-llm": {
       "optional": true
     },
+    "@deepseek-ai/dsh-mcp-client": {
+      "optional": true
+    },
     "@deepseek-ai/dsh-session": {
       "optional": true
     },
@@ -72,9 +73,6 @@
       "optional": true
     },
     "@deepseek-ai/dsh-system-prompt": {
-      "optional": true
-    },
-    "@deepseek-ai/dsh-tools": {
       "optional": true
     },
     "@deepseek-ai/schemastery": {
@@ -86,8 +84,7 @@
     "@types/node": "^24.3.0",
     "tsdown": "^0.16.2",
     "typescript": "^5.9.2",
-    "vitest": "^3.2.4",
-    "yaml": "^2.9.0"
+    "vitest": "^3.2.4"
   },
   "engines": {
     "node": ">=20"

@@ -16,15 +16,31 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Generic, TypeVar
+import re
+from collections.abc import Mapping
+from typing import Any, ClassVar, Generic, TypeVar
 
-from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from powercontext.errors import InvalidArtifactReferenceError
-from powercontext.limits import MAX_ARTIFACT_FAMILY_LENGTH, MAX_ARTIFACT_ID_LENGTH
+from powercontext.limits import (
+    MAX_ARTIFACT_FAMILY_LENGTH,
+    MAX_ARTIFACT_HANDLE_KEY_LENGTH,
+    MAX_ARTIFACT_ID_LENGTH,
+    MAX_SCOPE_ID_LENGTH,
+)
 from powercontext.sources.models import SourceRef
 
+_HANDLE_KEY_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
 ContentT = TypeVar("ContentT", covariant=True)
+_LEGACY_MEMORY_FAMILY = "memory"
+
+
+def _reject_legacy_memory_citations(value: Any) -> Any:
+    if isinstance(value, Mapping) and "memory_citations" in value:
+        raise ValueError("memory_citations is no longer supported; cite Atomic Memory revisions in artifacts")  # noqa: TRY003
+    return value
 
 
 class ArtifactRef(BaseModel):
@@ -38,21 +54,98 @@ class ArtifactRef(BaseModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         _validate_reference_part(info.field_name, value)
+        if info.field_name == "family" and value == _LEGACY_MEMORY_FAMILY:
+            # Legacy collections were archived; their entries are cited as Atomic Memory revisions.
+            raise InvalidArtifactReferenceError("family", "legacy Memory collections cannot be referenced")
         maximum = MAX_ARTIFACT_FAMILY_LENGTH if info.field_name == "family" else MAX_ARTIFACT_ID_LENGTH
         if len(value) > maximum:
             raise InvalidArtifactReferenceError(info.field_name, f"must not exceed {maximum} characters")
         return value
 
 
+class StableHandle(BaseModel):
+    """A human-copyable, scope-local handle for an Artifact revision."""
+
+    family: str
+    key: str
+
+    @field_validator("family")
+    @classmethod
+    def validate_family(cls, value: str) -> str:
+        _validate_reference_part("family", value)
+        if len(value) > MAX_ARTIFACT_FAMILY_LENGTH:
+            raise InvalidArtifactReferenceError(
+                "family",
+                f"must not exceed {MAX_ARTIFACT_FAMILY_LENGTH} characters",
+            )
+        return value
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        if len(value) > MAX_ARTIFACT_HANDLE_KEY_LENGTH:
+            raise InvalidArtifactReferenceError(
+                "key",
+                f"must not exceed {MAX_ARTIFACT_HANDLE_KEY_LENGTH} characters",
+            )
+        if _HANDLE_KEY_PATTERN.fullmatch(value) is None:
+            raise InvalidArtifactReferenceError(
+                "key",
+                "must contain lowercase ASCII letters, digits, and single hyphens",
+            )
+        return value
+
+
+class _ArtifactValue(BaseModel):
+    """Shared immutable configuration for artifact-family content values.
+
+    ``strict=True`` is deliberately omitted: Experience values are produced by
+    generators and HTTP mapping through the lenient coercion path today, and
+    tightening them is a behavior change outside this family's contract.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class ArtifactAddress(BaseModel):
+    """A complete address for one exact Artifact revision across Scope boundaries."""
+
+    scope_id: str
+    artifact: ArtifactRef
+
+    @field_validator("scope_id")
+    @classmethod
+    def validate_scope_id(cls, value: str) -> str:
+        _validate_reference_part("scope_id", value)
+        if len(value) > MAX_SCOPE_ID_LENGTH:
+            raise InvalidArtifactReferenceError(
+                "scope_id",
+                f"must not exceed {MAX_SCOPE_ID_LENGTH} characters",
+            )
+        return value
+
+
 class ArtifactLineage(BaseModel):
     """The direct evidence used to produce one artifact revision."""
 
+    _reject_legacy_citations = model_validator(mode="before")(_reject_legacy_memory_citations)
+
     sources: tuple[SourceRef, ...] = ()
     artifacts: tuple[ArtifactRef, ...] = ()
+    publication_source: ArtifactAddress | None = None
+    publication_digest: str | None = None
+
+    @model_validator(mode="after")
+    def require_complete_publication_provenance(self):
+        if (self.publication_source is None) != (self.publication_digest is None):
+            raise ValueError("publication source and digest must be provided together")  # noqa: TRY003
+        return self
 
 
 class ArtifactDraft(BaseModel, Generic[ContentT]):
     """Content and complete evidence supplied for one Artifact write."""
+
+    _reject_legacy_citations = model_validator(mode="before")(_reject_legacy_memory_citations)
 
     family: ClassVar[str] = "artifact"
 

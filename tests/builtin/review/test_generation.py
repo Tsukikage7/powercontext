@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 import pytest
 
@@ -22,18 +23,32 @@ from powercontext.builtin.artifacts.experience import ExperienceContent
 from powercontext.builtin.artifacts.generation import ArtifactGenerationInput
 from powercontext.builtin.artifacts.skill import SkillContent
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
+from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.review import InvalidCandidateError
 from powercontext.builtin.review.generation import GenerationCapabilityUnavailableError
+from powercontext.builtin.review.service import ReviewService
 from powercontext.builtin.runtime import (
-    ApproveArtifactCandidateRequest,
+    ApproveCandidateRequest,
     BuiltinConfig,
+    BuiltinRuntime,
     CaptureSource,
     GenerateExperienceRequest,
     GenerateSkillRequest,
-    ListArtifactCandidatesRequest,
+    ListCandidatesRequest,
+    ProposeExperienceRequest,
     SkillGenerationOrigin,
     open_builtin_runtime,
 )
+from powercontext.builtin.scope import ScopeDraft
+from powercontext.builtin.source_eligibility import SourceNotEligibleError
+
+
+async def _create_scope(runtime: BuiltinRuntime, idempotency_key: str = "project") -> str:
+    assert runtime.scopes is not None
+    scope = await runtime.scopes.create(
+        ScopeDraft(title="Project", summary="Review generation tests", idempotency_key=idempotency_key)
+    )
+    return scope.scope_id
 
 
 def _experience() -> ExperienceContent:
@@ -77,20 +92,72 @@ class _SkillGenerator:
 def test_generation_without_model_fails_before_candidate_persistence() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            captured = await runtime.sources.for_scope("project").capture(
+            scope_id = await _create_scope(runtime)
+            captured = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-1", content="bounded evidence", metadata={})
             )
 
             with pytest.raises(GenerationCapabilityUnavailableError):
-                await runtime.experience.for_scope("project").generate(
+                await runtime.experience.for_scope(scope_id).generate(
                     GenerateExperienceRequest(sources=(captured.source_ref,))
                 )
 
-            inbox = await runtime.review.for_scope("project").list(ListArtifactCandidatesRequest())
+            inbox = await runtime.review.for_scope(scope_id).list(ListCandidatesRequest())
             capabilities = await runtime.capabilities()
             assert inbox.candidates == ()
             assert capabilities.experience_generation is False
             assert capabilities.managed_skill_generation is False
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("generated", [False, True])
+def test_review_adapter_without_commit_hook_preserves_existing_proposal_signature(monkeypatch, generated):
+    class ReviewAdapter:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        async def propose_experience(self, proposal, /, *, sources, artifacts, target, reason):
+            return await self.delegate.propose_experience(
+                proposal, sources=sources, artifacts=artifacts, target=target, reason=reason
+            )
+
+    async def scenario():
+        async with open_builtin_runtime(
+            BuiltinConfig(database=SQLiteConfig()), experience_generator=_ExperienceGenerator(_experience())
+        ) as runtime:
+            scope_id = await _create_scope(runtime)
+            captured = await runtime.sources.for_scope(scope_id).capture(
+                CaptureSource(
+                    source_id="adapter-evidence", content="The adapter supports reviewed proposals.", metadata={}
+                )
+            )
+            review_factory = runtime._review_service
+            generation_factory = runtime._generation_service
+            assert review_factory is not None and generation_factory is not None
+
+            def review_adapter(scope):
+                return cast(ReviewService, ReviewAdapter(review_factory(scope)))
+
+            def generation_adapter(scope):
+                service = generation_factory(scope)
+                service._review = review_adapter(scope)
+                return service
+
+            monkeypatch.setattr(runtime, "_review_service", review_adapter)
+            monkeypatch.setattr(runtime, "_generation_service", generation_adapter)
+            if generated:
+                result = await runtime.experience.for_scope(scope_id).generate(
+                    GenerateExperienceRequest(sources=(captured.source_ref,))
+                )
+                candidate = result.candidate
+            else:
+                candidate = await runtime.experience.for_scope(scope_id).propose(
+                    ProposeExperienceRequest(proposal=_experience(), sources=(captured.source_ref,))
+                )
+            assert candidate is not None
+            assert candidate.sources == (captured.source_ref,)
+            assert candidate.status.value == "pending"
 
     asyncio.run(scenario())
 
@@ -102,11 +169,12 @@ def test_experience_generation_uses_exact_source_and_supports_no_op() -> None:
             BuiltinConfig(database=SQLiteConfig()),
             experience_generator=generator,
         ) as runtime:
-            captured = await runtime.sources.for_scope("project").capture(
+            scope_id = await _create_scope(runtime)
+            captured = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-1", content="contract validation passed", metadata={})
             )
 
-            result = await runtime.experience.for_scope("project").generate(
+            result = await runtime.experience.for_scope(scope_id).generate(
                 GenerateExperienceRequest(
                     sources=(captured.source_ref,),
                     reason="Generate from a selected successful task.",
@@ -123,16 +191,41 @@ def test_experience_generation_uses_exact_source_and_supports_no_op() -> None:
             BuiltinConfig(database=SQLiteConfig()),
             experience_generator=no_op,
         ) as runtime:
-            captured = await runtime.sources.for_scope("project").capture(
+            scope_id = await _create_scope(runtime)
+            captured = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-2", content="nothing reusable", metadata={})
             )
-            result = await runtime.experience.for_scope("project").generate(
+            result = await runtime.experience.for_scope(scope_id).generate(
                 GenerateExperienceRequest(sources=(captured.source_ref,))
             )
-            inbox = await runtime.review.for_scope("project").list(ListArtifactCandidatesRequest())
+            inbox = await runtime.review.for_scope(scope_id).list(ListCandidatesRequest())
 
             assert result.generated is False
             assert inbox.candidates == ()
+
+    asyncio.run(scenario())
+
+
+def test_explicit_generation_rejects_a_lineage_only_source_before_model_use() -> None:
+    async def scenario() -> None:
+        generator = _ExperienceGenerator(_experience())
+        async with open_builtin_runtime(
+            BuiltinConfig(database=SQLiteConfig()),
+            experience_generator=generator,
+        ) as runtime:
+            scope_id = await _create_scope(runtime)
+            created = await runtime.records.for_scope(scope_id).create_artifact(
+                "atomic-memory",
+                ArtifactWrite(content={"kind": "fact", "text": "Direct input."}),
+            )
+
+            with pytest.raises(SourceNotEligibleError) as error:
+                await runtime.experience.for_scope(scope_id).generate(
+                    GenerateExperienceRequest(sources=(created.sources[0],))
+                )
+
+            assert error.value.source == created.sources[0]
+            assert generator.inputs == []
 
     asyncio.run(scenario())
 
@@ -144,25 +237,26 @@ def test_experience_generation_targets_an_exact_approved_revision() -> None:
             BuiltinConfig(database=SQLiteConfig()),
             experience_generator=generator,
         ) as runtime:
-            first_source = await runtime.sources.for_scope("project").capture(
+            scope_id = await _create_scope(runtime)
+            first_source = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-1", content="contract validation passed", metadata={})
             )
-            first_candidate = await runtime.experience.for_scope("project").generate(
+            first_candidate = await runtime.experience.for_scope(scope_id).generate(
                 GenerateExperienceRequest(sources=(first_source.source_ref,))
             )
             assert first_candidate.candidate is not None
-            first_approval = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(
+            first_approval = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(
                     candidate_id=first_candidate.candidate.candidate_id,
                     expected_version=1,
                 )
             )
             assert first_approval.result_artifact is not None
-            later_source = await runtime.sources.for_scope("project").capture(
+            later_source = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-2", content="generation also had to run first", metadata={})
             )
 
-            replacement = await runtime.experience.for_scope("project").generate(
+            replacement = await runtime.experience.for_scope(scope_id).generate(
                 GenerateExperienceRequest(
                     sources=(later_source.source_ref,),
                     artifacts=(first_approval.result_artifact,),
@@ -174,7 +268,7 @@ def test_experience_generation_targets_an_exact_approved_revision() -> None:
             assert replacement.candidate.target == first_approval.result_artifact
             assert generator.inputs[-1].target_evidence_id is not None
             with pytest.raises(InvalidCandidateError):
-                await runtime.experience.for_scope("project").generate(
+                await runtime.experience.for_scope(scope_id).generate(
                     GenerateExperienceRequest(
                         sources=(later_source.source_ref,),
                         target=first_approval.result_artifact,
@@ -194,22 +288,23 @@ def test_managed_skill_generation_enforces_origin_specific_lineage() -> None:
             experience_generator=experience_generator,
             skill_generator=skill_generator,
         ) as runtime:
-            captured = await runtime.sources.for_scope("project").capture(
+            scope_id = await _create_scope(runtime)
+            captured = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-1", content="contract validation passed", metadata={})
             )
-            experience_candidate = await runtime.experience.for_scope("project").generate(
+            experience_candidate = await runtime.experience.for_scope(scope_id).generate(
                 GenerateExperienceRequest(sources=(captured.source_ref,))
             )
             assert experience_candidate.candidate is not None
-            approved = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(
+            approved = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(
                     candidate_id=experience_candidate.candidate.candidate_id,
                     expected_version=1,
                 )
             )
             assert approved.result_artifact is not None
 
-            generated = await runtime.skill.for_scope("project").generate(
+            generated = await runtime.skill.for_scope(scope_id).generate(
                 GenerateSkillRequest(
                     origin=SkillGenerationOrigin.EXPERIENCE,
                     sources=(captured.source_ref,),
@@ -223,17 +318,17 @@ def test_managed_skill_generation_enforces_origin_specific_lineage() -> None:
                 evidence.evidence_id.startswith("artifact:experience/")
                 for evidence in skill_generator.inputs[0].evidence
             )
-            skill_approval = await runtime.review.for_scope("project").approve(
-                ApproveArtifactCandidateRequest(
+            skill_approval = await runtime.review.for_scope(scope_id).approve(
+                ApproveCandidateRequest(
                     candidate_id=generated.candidate.candidate_id,
                     expected_version=1,
                 )
             )
             assert skill_approval.result_artifact is not None
-            usage = await runtime.sources.for_scope("project").capture(
+            usage = await runtime.sources.for_scope(scope_id).capture(
                 CaptureSource(source_id="task-2", content="Skill validation passed.", metadata={})
             )
-            replacement = await runtime.skill.for_scope("project").generate(
+            replacement = await runtime.skill.for_scope(scope_id).generate(
                 GenerateSkillRequest(
                     origin=SkillGenerationOrigin.USAGE,
                     sources=(usage.source_ref,),
@@ -245,7 +340,7 @@ def test_managed_skill_generation_enforces_origin_specific_lineage() -> None:
             assert replacement.candidate.target == skill_approval.result_artifact
 
             with pytest.raises(InvalidCandidateError):
-                await runtime.skill.for_scope("project").generate(
+                await runtime.skill.for_scope(scope_id).generate(
                     GenerateSkillRequest(
                         origin=SkillGenerationOrigin.EXPERIENCE,
                         sources=(captured.source_ref,),

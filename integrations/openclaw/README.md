@@ -1,9 +1,11 @@
 # OpenClaw integration
 
+`community`
+
 `plugins/memory-powercontext` contains the PowerContext memory plugin for
 [OpenClaw](https://github.com/openclaw/openclaw). The plugin registers a `memory` capability backed by a running
 PowerContext Server: bounded recall before each prompt, capture of eligible user prompts as Source evidence, and
-explicit `powercontext_memory_*` tools for durable Memory operations.
+explicit `powercontext_memory_*` tools for durable Memory operations, Work Contracts, and Handoffs.
 
 The plugin talks HTTP only. It never starts or embeds a PowerContext Server, and an unavailable Server never blocks
 normal OpenClaw work.
@@ -42,10 +44,10 @@ powercontext server run
 openclaw
 ```
 
-To use a Server that actually listens on another port, or to change the memory scope during setup:
+To use a Server that actually listens on another port:
 
 ```bash
-powercontext setup openclaw --server-url http://127.0.0.1:9000 --scope-mode project
+powercontext setup openclaw --server-url http://127.0.0.1:9000
 ```
 
 Run `setup openclaw` again to refresh an existing installation.
@@ -57,30 +59,69 @@ Recalled content is labelled as untrusted historical evidence; current system in
 the user's request always take precedence.
 
 Explicit memory reads bypass preparation. Search calls `/v1/memory/search`, limits the query to 8192 characters, and
-clamps the requested result limit to 1–50 (default 10). Get calls `/v1/memory/entries/get` and returns at most 120
-lines and 12,000 characters per read.
+clamps the requested result limit to 1–50 (default 10). Results read `hits[].memory` with its real Atomic
+Artifact reference, content, state, and state version. The host's `score` and `minScore` use the RRF score divided by
+`matched-channel-count / 61`, clamped to 0–1; this is a relative rank measure, not confidence or semantic similarity.
+Response `matched_by` values are `text` and `vector`; the request still uses `fts` or `auto` mode.
+Get reads the exact generic Artifact revision and returns at most 120 lines and 12,000 characters per read.
+Paths encode Atomic references (`{family: "atomic-memory", artifact_id, revision}`, with `state_version` when known);
+any other path is rejected locally before a request is sent.
+
+Store returns real Atomic records and an encoded snapshot path. Revise requires the captured content revision,
+reads the current content ETag, and sends it in `If-Match`; a content conflict requires inspection before retrying.
+Manual content edits use content revision CAS and do not include lifecycle state CAS. The compatibility tool
+`powercontext_memory_retire` performs reversible forgetting with the captured Artifact reference and `state_version`.
 
 Eligible user prompts from direct/private sessions are captured separately as Content Sources with a deterministic
 source id, so repeated captures are idempotent. Group, channel, and incognito sessions are excluded. The plugin never
 synchronizes the complete OpenClaw transcript. Recall, capture, and boundary flushing fail open: an unavailable
 Server, timeout, redirect, or invalid response leaves the prompt unchanged and never blocks ordinary work.
 
+The public `before_compaction` hook provides best-effort checkpointing. Capture and flush use one resolved Scope,
+the deterministic Source ID uses the public `runId` for `agent_end` and a streaming canonical hash of the complete
+JSON-shaped payload for the less frequent `before_compaction` event, and acknowledgement requires a
+valid `current_cursor` at or beyond the captured Source position. Cursor lag and `remaining_work` are retried up to
+`flushMaxCalls` (default `4`, range `1`–`16`) within a one-second boundary budget that starts when the flush is queued, with `timeoutMs` retained as the
+per-request ceiling. Unacknowledged accepted positions remain pending for `session_end`, `gateway_stop`, or Server
+scheduling. Closing work skips ahead of queued pre-compaction work, while queue waiting counts against each event's
+boundary budget. A queued boundary that exhausts its budget emits a content-free `deadline_exceeded` diagnostic and
+retains pending positions. OpenClaw continues compaction after hook failures, so this is not a required checkpoint mode.
+
 The plugin exposes five tools: `powercontext_memory_search`, `powercontext_memory_get`,
 `powercontext_memory_store`, `powercontext_memory_revise`, and `powercontext_memory_retire`. Mutating tools
 (`store`, `revise`, `retire`) are marked side-effecting in the plugin manifest.
 
+It also registers the `/pc` command for WebUI and other OpenClaw command surfaces. `/pc` and `/pc help` show the
+available controls; `/pc status` checks Server readiness and capabilities. The agent tools add a high-level Work
+Contract and Handoff flow: create a contract, prepare the current work boundary, explicitly commit or continue a
+Handoff, acknowledge the receiver checks, and record the Task Outcome. Work Contract and Handoff content remains
+untrusted input or history. Preparing a current-work Handoff records its boundary evidence; committing the Handoff,
+acknowledging receipt, and recording the outcome are explicit durable workflow steps.
+
 ## Memory scope
 
-Scope mode defaults to `agent`, which derives the memory scope from the OpenClaw agent identity. Project scope is used
-only when OpenClaw supplies exactly one trusted project identity for a turn. Set an explicit `--scope-mode` when the
-memory must be shared across agents in the same project or isolated differently.
+The plugin asks the Server to resolve one existing Scope before every operation. Resolution uses an explicit
+`scopeId`, then durable bindings for the OpenClaw session, ordered active projects, and agent identity, followed by
+the Server's default Scope. These host identities are lookup inputs only; the plugin never turns an agent, project,
+path, or session into a Scope ID and never creates a Scope.
+
+To select an existing Scope explicitly for every OpenClaw operation, configure its opaque ID and restart the Gateway:
+
+```bash
+openclaw config set plugins.entries.memory-powercontext.config.scopeId scp_0123456789abcdefghjkmnpqrs
+openclaw gateway restart
+```
+
+Without `scopeId`, provision durable bindings on the Server when the host identity must retain a selection; otherwise
+the ordinary Server default is used. The plugin does not persist bindings because OpenClaw currently exposes no Scope
+selection contract.
 
 ## Connect to an authenticated Server
 
 Start an authenticated Server from a protected environment:
 
 ```bash
-export POWERCONTEXT_SERVER_AUTH_ENABLED=true
+export POWERCONTEXT_SERVER_ACCESS_MODE=enforced
 export POWERCONTEXT_SERVER_AUTH_TOKEN="$POWERCONTEXT_LOCAL_TOKEN"
 powercontext server run
 ```
@@ -100,9 +141,17 @@ chmod 600 ~/.openclaw/.env
 openclaw gateway restart
 ```
 
-Do not put credentials in the endpoint. The current configuration accepts both HTTP and HTTPS URLs; use plain HTTP
-only for a trusted loopback Server and use HTTPS for every remote Server. This is an operator security requirement,
-not a restriction currently enforced by the CLI or plugin.
+Do not put credentials in the endpoint. Remote HTTP is rejected by default. For an explicitly trusted plaintext
+connection, set `POWERCONTEXT_OPENCLAW_ALLOW_INSECURE_HTTP=true` or the plugin setting `allowInsecureHttp: true`.
+The common `POWERCONTEXT_CLIENT_ALLOW_INSECURE_HTTP` flag applies when the host flag is absent; a host flag of
+`false` overrides it. Flags accept only `true/false`, `1/0`, `yes/no`, or `on/off`.
+HTTPS certificate validation remains enabled, and the plugin rejects redirects.
+
+Setup-saved URLs and endpoint-specific consent are read from `~/.config/powercontext/clients.json`
+(override with `POWERCONTEXT_CLIENT_CONFIG_FILE`). `POWERCONTEXT_OPENCLAW_BASE_URL`, then
+`POWERCONTEXT_CLIENT_SERVER_URL`, take precedence over an explicit plugin endpoint and the saved URL.
+Changing the endpoint does not reuse saved or native HTTP consent. Native `allowInsecureHttp: true` must accompany
+the matching `endpoint`; an environment URL override needs its own matching or explicit environment consent.
 
 ## Verify the installation
 
@@ -129,3 +178,10 @@ Run the plugin unit tests and the CLI tests:
 pnpm --dir integrations/openclaw/plugins/memory-powercontext test
 uv run pytest tests/test_openclaw_cli.py
 ```
+
+## Optional workflow Skill
+
+The package includes `powercontext-project-context`, discovered through the plugin manifest's `skills` directory.
+Its English/Chinese description routes Memory and work-transfer requests to local reference files. Read details only
+when needed; ordinary coding requires no Skill detour. The Skill does not enable unavailable tools, Memory inventory,
+candidate Review, or writes outside the host's private-session and permission boundaries.

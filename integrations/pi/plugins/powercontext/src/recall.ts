@@ -17,15 +17,19 @@
 import { captureUserPrompt } from './capture.ts'
 import { combineSignals, createTimeoutSignal, type PowerContextClient } from './client.ts'
 import type { ResolvedConfig } from './config.ts'
-import { validatePreparedContext } from './prepared-context.ts'
+import type { DiagnosticEvent } from './diagnostics.ts'
+import type { PendingFlushResult } from './flush.ts'
+import { boundedRecallQuery, validatePreparedContext } from './prepared-context.ts'
+import { scrubSecrets } from './secrets.ts'
 
 export interface PluginRuntime {
   client: PowerContextClient
   config: ResolvedConfig
   resolveScope: (cwd: string) => Promise<string>
   recordCapture?: (scopeId: string, position: number) => void
-  flushPending?: (signal?: AbortSignal) => Promise<void>
-  diagnostic?: (event: string, error: unknown) => void
+  flushPending?: (lifecycleEvent: string, signal?: AbortSignal) => Promise<PendingFlushResult>
+  diagnostic?: (event: string, error: unknown, extra?: Record<string, unknown>) => void
+  observe?: (event: DiagnosticEvent) => void
 }
 
 export interface BeforeAgentStartInput {
@@ -60,17 +64,37 @@ export async function recallBeforeAgentStart(input: BeforeAgentStartInput): Prom
   const prompt = input.prompt.trim()
   if (!prompt) return undefined
 
+  let scopeId: string
   try {
-    const scopeId = await input.runtime.resolveScope(input.cwd)
+    scopeId = await input.runtime.resolveScope(input.cwd)
+  } catch (error) {
+    try {
+      input.runtime.diagnostic?.('context_prepare', error)
+    } catch {
+      // Diagnostics are best effort and must not affect the turn.
+    }
+    return undefined
+  }
+
+  try {
     const signals = [createTimeoutSignal(input.runtime.config.httpBudgetMs)]
     if (input.signal) signals.push(input.signal)
     const signal = combineSignals(signals)
+    const safePrompt = scrubSecrets(prompt, input.runtime.config.authorization)
+    if (safePrompt !== prompt) {
+      try {
+        input.runtime.observe?.({ event: 'capture_source', outcome: 'skipped', reason: 'sensitive_content' })
+      } catch {
+        // Diagnostic delivery must not change preparation or capture behavior.
+      }
+    }
     let content: string | undefined
     try {
       const response = await input.runtime.client.request('prepare_context', {
         scope_id: scopeId,
-        query: prompt,
+        query: boundedRecallQuery(safePrompt),
         max_bytes: input.runtime.config.maxBytes,
+        ...(input.runtime.config.contextAssembly === undefined ? {} : { assembly: input.runtime.config.contextAssembly }),
       }, signal)
       const prepared = validatePreparedContext(
         response.kind === 'json' ? response.value : undefined,

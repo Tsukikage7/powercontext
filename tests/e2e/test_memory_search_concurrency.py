@@ -25,23 +25,23 @@ from uuid import uuid4
 import pytest
 from pydantic import SecretStr
 
+from powercontext.builtin.artifacts.atomic_memory import AtomicMemoryContent
 from powercontext.builtin.artifacts.memory import (
     EmbeddingProfile,
-    MemoryEntryInput,
-    MemoryHit,
     MemoryRerankDecision,
     MemorySearchMode,
 )
+from powercontext.builtin.artifacts.memory.reranking import MemoryRerankText
 from powercontext.builtin.inference import EmbeddingResult, InferenceUsage
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
+from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.runtime import (
     BuiltinConfig,
-    RememberMemoryRequest,
-    SearchMemoryRequest,
+    RuntimeConfig,
     open_builtin_runtime,
 )
-from powercontext.errors import RevisionConflictError
+from powercontext.builtin.scope import ScopeDraft
 
 DatabaseKind = Literal["sqlite", "oceanbase"]
 TIMEOUT_SECONDS = 15
@@ -53,9 +53,9 @@ PROFILE = EmbeddingProfile(
     normalization="unit",
 )
 EXPECTED_CHANNELS = {
-    "fts": ("fts",),
+    "fts": ("text",),
     "vector": ("vector",),
-    "hybrid": ("fts", "vector"),
+    "hybrid": ("text", "vector"),
 }
 
 
@@ -69,6 +69,7 @@ class _KeywordEmbeddingModel:
 
 class _PausingReranker:
     policy_id = "test.concurrent-memory-search.v1"
+    supports_atomic_memory = True
 
     def __init__(self) -> None:
         self.paused = asyncio.Event()
@@ -77,7 +78,7 @@ class _PausingReranker:
     async def rerank(
         self,
         _query: str,
-        candidates: tuple[MemoryHit, ...],
+        candidates: tuple[MemoryRerankText, ...],
         _limit: int,
         /,
     ) -> MemoryRerankDecision:
@@ -103,13 +104,20 @@ def test_memory_search_stays_consistent_when_append_advances_head_before_index_q
             BuiltinConfig(database=database),
             embedding_model=embedding_model,
         ) as runtime:
-            memory = runtime.memory.for_scope(f"concurrent-memory-search-{uuid4()}")
-            initial = await memory.remember(
-                RememberMemoryRequest(entries=(MemoryEntryInput(kind="fact", text="Stable searchable fact."),))
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(
+                    title="Concurrent Memory search",
+                    summary="Index snapshot consistency",
+                    idempotency_key=f"concurrent-memory-search-{uuid4()}",
+                )
             )
+            assert runtime.atomic_memory is not None
+            memory = runtime.atomic_memory.for_scope(scope.scope_id)
+            initial = await memory.create((AtomicMemoryContent(kind="fact", text="Stable searchable fact."),))
 
             provider: Any = runtime._provider
-            index = provider.index
+            index = provider.atomic_memory.index
             original_search = index.search
             paused = asyncio.Event()
             resume = asyncio.Event()
@@ -128,11 +136,11 @@ def test_memory_search_stays_consistent_when_append_advances_head_before_index_q
 
             index.search = MethodType(pause_first_search, index)
             try:
-                pending = asyncio.create_task(memory.search(SearchMemoryRequest(query="stable searchable", mode=mode)))
-                await asyncio.wait_for(paused.wait(), timeout=TIMEOUT_SECONDS)
-                new_head = await memory.remember(
-                    RememberMemoryRequest(entries=(MemoryEntryInput(kind="fact", text="Unrelated appended fact."),))
+                pending = asyncio.create_task(
+                    memory.search("stable searchable", mode="text" if mode == "fts" else mode)
                 )
+                await asyncio.wait_for(paused.wait(), timeout=TIMEOUT_SECONDS)
+                new_head = await memory.create((AtomicMemoryContent(kind="fact", text="Unrelated appended fact."),))
                 resume.set()
                 result = await asyncio.wait_for(pending, timeout=TIMEOUT_SECONDS)
             finally:
@@ -143,10 +151,10 @@ def test_memory_search_stays_consistent_when_append_advances_head_before_index_q
                     with suppress(asyncio.CancelledError):
                         await pending
 
-            assert result.memory_ref in (initial.memory_ref, new_head.memory_ref)
-            assert result.mode == mode
+            assert new_head.primary.ref.artifact_id != initial.primary.ref.artifact_id
+            assert result.mode == ("text" if mode == "fts" else mode)
             assert tuple(hit.text for hit in result.hits) == ("Stable searchable fact.",)
-            assert result.hits[0].memory_ref == result.memory_ref
+            assert result.hits[0].hit.artifact_ref == initial.primary.ref
             assert result.hits[0].matched_by == EXPECTED_CHANNELS[mode]
 
     asyncio.run(scenario())
@@ -159,18 +167,19 @@ def test_memory_search_keeps_the_completed_revision_snapshot_when_head_advances_
         reranker = _PausingReranker()
         database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'rerank-snapshot.db'}")
         async with open_builtin_runtime(BuiltinConfig(database=database), memory_reranker=reranker) as runtime:
-            memory = runtime.memory.for_scope("rerank-snapshot")
-            initial = await memory.remember(
-                RememberMemoryRequest(entries=(MemoryEntryInput(kind="fact", text="Stable searchable fact."),))
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(
+                    title="Rerank snapshot", summary="Stable revision snapshot", idempotency_key="rerank-snapshot"
+                )
             )
-            pending = asyncio.create_task(
-                memory.search(SearchMemoryRequest(query="stable searchable", mode="fts", limit=1))
-            )
+            assert runtime.atomic_memory is not None
+            memory = runtime.atomic_memory.for_scope(scope.scope_id)
+            initial = await memory.create((AtomicMemoryContent(kind="fact", text="Stable searchable fact."),))
+            pending = asyncio.create_task(memory.search("stable searchable", mode="text", limit=1))
             try:
                 await asyncio.wait_for(reranker.paused.wait(), timeout=TIMEOUT_SECONDS)
-                new_head = await memory.remember(
-                    RememberMemoryRequest(entries=(MemoryEntryInput(kind="fact", text="Unrelated appended fact."),))
-                )
+                new_head = await memory.create((AtomicMemoryContent(kind="fact", text="Unrelated appended fact."),))
                 reranker.resume.set()
                 result = await asyncio.wait_for(pending, timeout=TIMEOUT_SECONDS)
             finally:
@@ -180,47 +189,50 @@ def test_memory_search_keeps_the_completed_revision_snapshot_when_head_advances_
                     with suppress(asyncio.CancelledError):
                         await pending
 
-            assert new_head.memory_ref.revision == initial.memory_ref.revision + 1
-            assert result.memory_ref == initial.memory_ref
+            assert new_head.primary.ref.artifact_id != initial.primary.ref.artifact_id
             assert tuple(hit.text for hit in result.hits) == ("Stable searchable fact.",)
-            assert result.hits[0].memory_ref == initial.memory_ref
+            assert result.hits[0].hit.artifact_ref == initial.primary.ref
             assert result.rerank is not None
 
     asyncio.run(scenario())
 
 
-def test_memory_search_reports_revision_conflict_when_every_attempt_starts_from_a_stale_head() -> None:
+def test_memory_search_keeps_exact_identity_when_an_unrelated_memory_is_added_before_query() -> None:
     async def scenario() -> None:
         async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-            scope_id = "perpetually-stale-search"
-            memory = runtime.memory.for_scope(scope_id)
-            await memory.remember(
-                RememberMemoryRequest(entries=(MemoryEntryInput(kind="fact", text="Stable searchable fact."),))
+            assert runtime.scopes is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(
+                    title="Perpetually stale search",
+                    summary="Revision conflict retry limit",
+                    idempotency_key="perpetually-stale-search",
+                )
             )
+            scope_id = scope.scope_id
+            assert runtime.atomic_memory is not None
+            memory = runtime.atomic_memory.for_scope(scope_id)
+            initial = await memory.create((AtomicMemoryContent(kind="fact", text="Stable searchable fact."),))
 
             provider: Any = runtime._provider
-            context = await provider.get(scope_id)
-            service = context.artifacts.memory
+            service = provider.atomic_memory.index
             original_search = service.search
             update_number = 0
 
             async def advance_head_before_search(_self: Any, *args: Any, **kwargs: Any) -> Any:
                 nonlocal update_number
                 update_number += 1
-                await memory.remember(
-                    RememberMemoryRequest(
-                        entries=(MemoryEntryInput(kind="fact", text=f"Concurrent update {update_number}."),)
-                    )
-                )
+                await memory.create((AtomicMemoryContent(kind="fact", text=f"Concurrent update {update_number}."),))
                 return await original_search(*args, **kwargs)
 
             service.search = MethodType(advance_head_before_search, service)
             try:
-                with pytest.raises(RevisionConflictError):
-                    await asyncio.wait_for(
-                        memory.search(SearchMemoryRequest(query="stable searchable", mode="fts")),
-                        timeout=TIMEOUT_SECONDS,
-                    )
+                result = await asyncio.wait_for(
+                    memory.search("stable searchable", mode="text"),
+                    timeout=TIMEOUT_SECONDS,
+                )
+                assert tuple(hit.hit.artifact_ref for hit in result.hits) == (initial.primary.ref,)
+                assert update_number == 1
+                assert len((await memory.list()).items) == 2
             finally:
                 service.search = original_search
 
@@ -239,3 +251,53 @@ def _database_config(
         return OceanBaseConfig(url=SecretStr(url))
 
     return SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / f'memory-search-{mode}.db'}")
+
+
+@pytest.mark.parametrize("operation", ["create", "create_artifact", "replace", "merge", "restore"])
+def test_explicit_memory_writes_complete_while_generation_capacity_is_occupied(operation: str) -> None:
+    async def scenario() -> None:
+        reranker = _PausingReranker()
+        async with open_builtin_runtime(
+            BuiltinConfig(runtime=RuntimeConfig(generation_concurrency=1)), memory_reranker=reranker
+        ) as runtime:
+            assert runtime.scopes is not None and runtime.atomic_memory is not None
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Explicit writes", summary="Independent of generation", idempotency_key="writes")
+            )
+            memory = runtime.atomic_memory.for_scope(scope.scope_id)
+            records = runtime.records.for_scope(scope.scope_id)
+            initial = await memory.create((
+                AtomicMemoryContent(kind="fact", text="Stable searchable fact."),
+                AtomicMemoryContent(kind="fact", text="Another stable fact."),
+            ))
+            original = initial.records[0]
+            if operation == "restore":
+                await memory.forget(original.ref.artifact_id, expected_revision=1, expected_state_version=0)
+            searching = asyncio.create_task(memory.search("stable", mode="text", limit=1))
+            try:
+                await asyncio.wait_for(reranker.paused.wait(), timeout=TIMEOUT_SECONDS)
+                content = AtomicMemoryContent(kind="fact", text="Explicitly saved fact.")
+                write = ArtifactWrite(content=content.model_dump(mode="json", exclude_none=True))
+                if operation == "create":
+                    pending = memory.create((content,))
+                elif operation == "create_artifact":
+                    pending = records.create_artifact("atomic-memory", write)
+                elif operation == "replace":
+                    pending = records.replace_artifact("atomic-memory", original.ref.artifact_id, '"revision:1"', write)
+                elif operation == "merge":
+                    pending = memory.merge(tuple(item.as_read() for item in initial.records), content)
+                else:
+                    pending = memory.restore(original.ref.artifact_id)
+                await asyncio.wait_for(pending, timeout=2)
+                assert not searching.done()
+                current = (await memory.list()).items
+                assert any(
+                    item.artifact.content.text
+                    == (original.artifact.content.text if operation == "restore" else content.text)
+                    for item in current
+                )
+            finally:
+                reranker.resume.set()
+                await asyncio.wait_for(searching, timeout=TIMEOUT_SECONDS)
+
+    asyncio.run(scenario())

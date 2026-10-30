@@ -17,73 +17,292 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from shutil import which
 from typing import Annotated, Never, TypeAlias
+from uuid import uuid4
 
 import typer
 from pydantic import SecretStr, ValidationError
 
 from powercontext.artifacts import ArtifactRef
+from powercontext.builtin.artifacts.skill import (
+    AgentSkillTarget,
+    SkillContent,
+    capture_skill_archive,
+    materialize_skill_package,
+)
+from powercontext.builtin.artifacts.skill.projection import validate_skill_projection_target
 from powercontext.client.client import PowerContextClient
-from powercontext.client.errors import ClientError
+from powercontext.client.errors import ClientError, ServerResponseError
 from powercontext.client.projections import SkillExportTarget, export_skill
+from powercontext.client.receiver_service import (
+    ReceiverServiceError,
+    ReceiverServiceInstallation,
+    install_systemd_user_service,
+    uninstall_systemd_user_service,
+)
+from powercontext.client.session_import import (
+    SUPPORTED_SESSION_IMPORT_HOSTS,
+    SessionImportError,
+    SessionImportResult,
+)
+from powercontext.client.session_import import (
+    import_sessions as run_session_import,
+)
 from powercontext.client.settings import ClientSettings
+from powercontext.client.skill_receiver import (
+    RECEIVER_VERSION,
+    ReceiverSyncResult,
+    RemoteSkillReceiver,
+    RemoteSkillReceiverConfig,
+    receiver_environment_fingerprint,
+    require_remote_skill_server_url,
+)
 from powercontext.http import (
-    ApproveArtifactCandidateRequest,
-    ArtifactCandidate,
-    ArtifactCandidatePage,
+    AllScopeSelection,
+    ApproveCandidateRequest,
+    ArtifactPage,
     ArtifactReference,
+    Candidate,
     CandidateFamily,
+    CandidateHistory,
+    CandidateKind,
+    CandidatePage,
     CandidateStatus,
     Capabilities,
+    ClearScopeBindingRequest,
+    ClearScopeBindingResponse,
+    ContextReference,
+    CreateDreamRunRequest,
+    CreateRemoteSkillTargetRequest,
+    CreateScopeRequest,
+    DreamOperation,
+    DreamRun,
+    DreamRunPage,
+    DreamStatus,
+    EnrollRemoteSkillTargetRequest,
+    ExactScopeSelection,
+    ExperienceArtifact,
     ExperienceProposal,
     ExternalSkillImportMode,
     ExternalSkillResolution,
+    ExtractionStatus,
     FamilyCount,
     GeneratedCandidateResponse,
     GenerateExperienceRequest,
     GenerateSkillRequest,
-    GetArtifactCandidateRequest,
+    GetCandidateRequest,
+    GetExperienceRequest,
+    GetSkillPackageRequest,
     GetSkillRequest,
     GetStatsRequest,
     HealthResponse,
     ImportExternalSkillRequest,
-    ListArtifactCandidatesRequest,
+    ListArtifactsRequest,
+    ListCandidatesRequest,
+    ListDreamRunsRequest,
     ListExternalSkillsRequest,
     ListExternalSkillsResponse,
+    ListRemoteSkillTargetsRequest,
+    ListRemoteSkillTargetsResponse,
     ModelUsageValue,
+    PublishRemoteSkillRequest,
     ReadinessResponse,
-    RejectArtifactCandidateRequest,
+    RejectCandidateRequest,
+    RemoteAgentKind,
+    RemoteSkillPublication,
+    RemoteSkillTarget,
+    RemoteSkillTargetStatus,
+    RenameRemoteSkillTargetRequest,
     ResolveExternalSkillRequest,
-    ReviseArtifactCandidateRequest,
+    ResolveScopeBindingRequest,
+    ReviseCandidateRequest,
+    RevokeRemoteSkillTargetRequest,
     ScanExternalSkillsRequest,
     ScanExternalSkillsResponse,
+    ScopeBinding,
+    ScopeBindingKey,
+    ScopeDescriptor,
     ScopedStats,
+    ScopeExternalReference,
+    ScopeId,
+    ScopePage,
+    ScopeQueryField,
+    ScopeSelection,
+    SetDefaultScopeRequest,
+    SetScopeBindingRequest,
     SkillArtifact,
     SkillGenerationOrigin,
     SkillProposal,
     SkillValidationItem,
     SourceReference,
     StatsPeriod,
+    SubtreeScopeSelection,
+    UnpublishRemoteSkillRequest,
+    UpdateScopeRequest,
+)
+from powercontext.http._generated.models import (
+    GetTopicMemoryProcessingBlockRequest,
+    RetryTopicMemoryProcessingRequest,
+    RetryTopicMemoryProcessingResponse,
+    TopicMemoryProcessingBlock,
+    TopicMemoryProcessingStatus,
+    TopicMemoryProcessingStatusRequest,
 )
 
 HELP_OPTION_NAMES = ("-h", "--help")
 _ClientResponse: TypeAlias = (
-    ArtifactCandidate
-    | ArtifactCandidatePage
+    Candidate
+    | CandidateHistory
+    | DreamRun
+    | DreamRunPage
+    | CandidatePage
+    | ArtifactPage
     | Capabilities
+    | ExperienceArtifact
     | ExternalSkillResolution
     | GeneratedCandidateResponse
     | HealthResponse
     | ListExternalSkillsResponse
+    | ListRemoteSkillTargetsResponse
     | ReadinessResponse
+    | RemoteSkillPublication
+    | RemoteSkillTarget
     | ScanExternalSkillsResponse
+    | ScopeBinding
+    | ScopeDescriptor
+    | ScopePage
     | SkillArtifact
     | ScopedStats
+    | TopicMemoryProcessingBlock
+    | TopicMemoryProcessingStatus
+    | RetryTopicMemoryProcessingResponse
+    | ClearScopeBindingResponse
 )
 _ClientOperation: TypeAlias = Callable[[PowerContextClient], Awaitable[_ClientResponse]]
+
+dream_app = typer.Typer(
+    name="dream",
+    context_settings={"help_option_names": HELP_OPTION_NAMES},
+    help="Create and inspect asynchronous Artifact Dreams.",
+    no_args_is_help=True,
+)
+
+topic_memory_app = typer.Typer(
+    name="topic-memory",
+    context_settings={"help_option_names": HELP_OPTION_NAMES},
+    help="Inspect and explicitly retry blocked Topic Memory processing.",
+    no_args_is_help=True,
+)
+
+
+@topic_memory_app.command("status")
+def topic_memory_status(
+    context: typer.Context, scope_id: Annotated[str, typer.Option(help="Scope to inspect.")]
+) -> None:
+    asyncio.run(
+        _execute(
+            context,
+            lambda client: client.get_topic_memory_processing_status(
+                TopicMemoryProcessingStatusRequest(scope_id=scope_id)
+            ),
+        )
+    )
+
+
+@topic_memory_app.command("block")
+def topic_memory_block(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Scope containing the block.")],
+    block_id: Annotated[str, typer.Option(help="Exact block ID returned by status.")],
+) -> None:
+    asyncio.run(
+        _execute(
+            context,
+            lambda client: client.get_topic_memory_processing_block(
+                GetTopicMemoryProcessingBlockRequest(scope_id=scope_id, block_id=block_id)
+            ),
+        )
+    )
+
+
+@topic_memory_app.command("retry")
+def topic_memory_retry(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Scope to retry; requires scope.admin.")],
+    block_id: Annotated[str, typer.Option(help="Exact observed block ID; duplicates reuse its acceptance.")],
+) -> None:
+    asyncio.run(
+        _execute(
+            context,
+            lambda client: client.retry_topic_memory_processing(
+                RetryTopicMemoryProcessingRequest(scope_id=scope_id, block_id=block_id)
+            ),
+        )
+    )
+
+
+@dream_app.command("run")
+def run_dream(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Scope containing every selected reference.")],
+    request_file: Annotated[
+        Path,
+        typer.Option(
+            help="JSON CreateDreamRunRequest with exact references and an idempotency_key.",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+) -> None:
+    """Accept one bounded Dream and return its durable run ID."""
+
+    try:
+        request = CreateDreamRunRequest.model_validate_json(request_file.read_text(encoding="utf-8"))
+    except ValidationError as error:
+        _raise_invalid_request("Dream", error)
+    except (OSError, UnicodeError) as error:
+        _raise_bad_parameter("cannot read a UTF-8 Dream request", parameter="--request-file", cause=error)
+    asyncio.run(_execute(context, lambda client: client.create_dream_run(scope_id, request)))
+
+
+@dream_app.command("show")
+def show_dream(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Scope containing the Dream.")],
+    run_id: Annotated[str, typer.Argument(help="Exact Dream run ID.")],
+) -> None:
+    """Read current state, evidence manifest, and candidate reference."""
+
+    asyncio.run(_execute(context, lambda client: client.get_dream_run(scope_id, run_id)))
+
+
+@dream_app.command("list")
+def list_dreams(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Scope whose Dream history is requested.")],
+    status: Annotated[DreamStatus | None, typer.Option()] = None,
+    operation: Annotated[DreamOperation | None, typer.Option()] = None,
+    cursor: Annotated[str | None, typer.Option()] = None,
+    limit: Annotated[int, typer.Option(min=1, max=100)] = 20,
+) -> None:
+    """List a bounded page of Dream history, newest first."""
+
+    request = ListDreamRunsRequest(status=status, operation=operation, cursor=cursor, limit=limit)
+    asyncio.run(_execute(context, lambda client: client.list_dream_runs(scope_id, request)))
+
 
 candidate_app = typer.Typer(
     name="candidate",
@@ -100,7 +319,7 @@ candidate_revise_app = typer.Typer(
 experience_app = typer.Typer(
     name="experience",
     context_settings={"help_option_names": HELP_OPTION_NAMES},
-    help="Generate reviewed Experience Candidates.",
+    help="Read approved Experience and generate reviewed Experience Candidates.",
     no_args_is_help=True,
 )
 skill_app = typer.Typer(
@@ -115,7 +334,226 @@ external_skill_app = typer.Typer(
     help="Discover and exactly resolve Agent-native Skills on the Server host.",
     no_args_is_help=True,
 )
+scope_app = typer.Typer(
+    name="scope",
+    context_settings={"help_option_names": HELP_OPTION_NAMES},
+    help="Create, inspect, and bind isolated Scope boundaries.",
+    no_args_is_help=True,
+)
+scope_binding_app = typer.Typer(
+    name="binding",
+    context_settings={"help_option_names": HELP_OPTION_NAMES},
+    help="Bind external integration identities to one Scope.",
+    no_args_is_help=True,
+)
+scope_app.add_typer(scope_binding_app, name="binding")
 candidate_app.add_typer(candidate_revise_app, name="revise")
+
+_BINDING_KIND_SESSION = "session"
+_BINDING_KIND_WORKSPACE = "workspace"
+_DEFAULT_BINDING_INTEGRATION = "opencode"
+
+
+def _workspace_binding_external_id(cwd: Path, integration: str) -> str:
+    if integration in {"codex", "claude-code"}:
+        # These hosts bind the canonical repository root, including when invoked from a subdirectory.
+        root = cwd
+        executable = which("git")
+        if executable is not None:
+            try:
+                result = subprocess.run(  # noqa: S603 - fixed Git arguments, without a shell.
+                    [executable, "rev-parse", "--show-toplevel"],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                )
+                if result.stdout.strip():
+                    root = Path(result.stdout.strip())
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return hashlib.sha256(os.fsencode(root.resolve(strict=False))).hexdigest()
+    if integration in {"hermes", "kimi-code"}:
+        return hashlib.sha256(os.fsencode(cwd.resolve(strict=False))).hexdigest()
+    if integration in {"opencode", "pi"}:
+        # Node hosts use path.resolve without resolving symlinks.
+        return hashlib.sha256(os.path.abspath(cwd).encode("utf-8")).hexdigest()
+    raise typer.BadParameter(  # noqa: TRY003 - user-facing CLI validation.
+        "Unsupported workspace integration; use an explicit binding key instead.", param_hint="--integration"
+    )
+
+
+def _binding_key(integration: str, kind: str, external_id: str) -> ScopeBindingKey:
+    return ScopeBindingKey(integration=integration, kind=kind, external_id=external_id)
+
+
+def _external_reference(value: str) -> ScopeExternalReference:
+    kind, separator, reference_value = value.partition("=")
+    if not separator or not kind.strip() or not reference_value.strip():
+        raise typer.BadParameter("--external-reference expects kind=value")  # noqa: TRY003
+    return ScopeExternalReference(kind=kind.strip(), value=reference_value.strip())
+
+
+@scope_app.command("create")
+def create_scope(
+    context: typer.Context,
+    title: Annotated[str, typer.Option(help="Human-readable Scope title.")],
+    summary: Annotated[str, typer.Option(help="One-line description of the Scope boundary.")],
+    idempotency_key: Annotated[
+        str | None, typer.Option(help="Stable creation key; repeating it returns the same Scope.")
+    ] = None,
+    parent_scope_id: Annotated[str | None, typer.Option(help="Optional parent Scope ID.")] = None,
+    context_reference: Annotated[list[str] | None, typer.Option(help="Related Scope ID; repeatable.")] = None,
+    external_reference: Annotated[
+        list[str] | None, typer.Option(help="External reference as kind=value; repeatable.")
+    ] = None,
+) -> None:
+    """Create one independent Scope boundary and print its opaque Scope ID."""
+
+    request = CreateScopeRequest(
+        title=title,
+        summary=summary,
+        idempotency_key=idempotency_key if idempotency_key is not None else uuid4().hex,
+        parent_scope_id=parent_scope_id,
+        context_references=[ContextReference(value) for value in context_reference or []],
+        external_references=[_external_reference(value) for value in external_reference or []],
+    )
+    asyncio.run(_execute(context, lambda client: client.create_scope(request)))
+    if not _options(context).json_output:
+        typer.echo("Next: put this ID into the matching client SCOPE_ID environment variable.")
+
+
+@scope_app.command("list")
+def list_scopes(
+    context: typer.Context,
+    query: Annotated[str | None, typer.Option(help="Bounded substring query; requires --query-field.")] = None,
+    query_field: Annotated[
+        ScopeQueryField | None, typer.Option(help="Field matched by --query; requires --query.")
+    ] = None,
+    cursor: Annotated[str | None, typer.Option(help="Opaque cursor from the previous page.")] = None,
+    limit: Annotated[int, typer.Option(min=1, max=100, help="Maximum Scopes to return.")] = 50,
+) -> None:
+    """List a bounded page of Scope descriptors."""
+
+    if (query is None) != (query_field is None):
+        raise typer.BadParameter("--query and --query-field must be supplied together")  # noqa: TRY003
+
+    asyncio.run(
+        _execute(
+            context,
+            lambda client: client.list_scopes(query=query, query_field=query_field, limit=limit, cursor=cursor),
+        )
+    )
+
+
+@scope_app.command("get")
+def get_scope(context: typer.Context, scope_id: Annotated[str, typer.Argument(help="Exact Scope ID.")]) -> None:
+    """Read one exact Scope descriptor."""
+
+    asyncio.run(_execute(context, lambda client: client.get_scope(scope_id)))
+
+
+@scope_app.command("update")
+def update_scope(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Argument(help="Exact Scope ID.")],
+    title: Annotated[str, typer.Option(help="Replacement Scope title.")],
+    summary: Annotated[str, typer.Option(help="Replacement one-line description.")],
+    expected_version: Annotated[int, typer.Option(min=1, help="Current version read from `scope get`.")],
+) -> None:
+    """Update title and summary, preserving relationships behind an explicit optimistic-lock version."""
+
+    async def operation(client: PowerContextClient) -> ScopeDescriptor:
+        current = await client.get_scope(scope_id)
+        request = UpdateScopeRequest(
+            expected_version=expected_version,
+            title=title,
+            summary=summary,
+            parent_scope_id=current.parent_scope_id,
+            context_references=current.context_references,
+            external_references=current.external_references,
+        )
+        return await client.update_scope(scope_id, request)
+
+    asyncio.run(_execute(context, operation))
+
+
+@scope_app.command("default")
+def show_default_scope(context: typer.Context) -> None:
+    """Read the host's default Scope target."""
+
+    asyncio.run(_execute(context, lambda client: client.get_default_scope()))
+
+
+@scope_app.command("set-default")
+def set_default_scope(context: typer.Context, scope_id: Annotated[str, typer.Argument(help="Exact Scope ID.")]) -> None:
+    """Change the host's default Scope target used when no binding matches."""
+
+    request = SetDefaultScopeRequest(scope_id=scope_id)
+    asyncio.run(_execute(context, lambda client: client.set_default_scope(request)))
+
+
+@scope_app.command("resolve")
+def resolve_scope(
+    context: typer.Context,
+    scope_id: Annotated[
+        str | None, typer.Option(help="Explicit Scope ID, mirroring a client SCOPE_ID setting.")
+    ] = None,
+    cwd: Annotated[
+        Path | None, typer.Option(help="Workspace directory for the workspace binding key; defaults to here.")
+    ] = None,
+    session_id: Annotated[str | None, typer.Option(help="Session ID for the session binding key.")] = None,
+    integration: Annotated[str, typer.Option(help="Binding integration name.")] = _DEFAULT_BINDING_INTEGRATION,
+    allow_default: Annotated[
+        bool, typer.Option("--allow-default/--no-allow-default", help="Fall back to the default Scope when unset.")
+    ] = True,
+) -> None:
+    """Resolve a Scope the way an agent plugin does: explicit ID, then bindings, then the default."""
+
+    binding_keys = []
+    if scope_id is None:
+        if session_id is not None and session_id.strip():
+            binding_keys.append(_binding_key(integration, _BINDING_KIND_SESSION, session_id.strip()))
+        workspace = cwd if cwd is not None else Path.cwd()
+        binding_keys.append(
+            _binding_key(integration, _BINDING_KIND_WORKSPACE, _workspace_binding_external_id(workspace, integration))
+        )
+    request = ResolveScopeBindingRequest(
+        explicit_scope_id=scope_id,
+        binding_keys=binding_keys,
+        allow_default=allow_default,
+    )
+    asyncio.run(_execute(context, lambda client: client.resolve_scope_binding(request)))
+
+
+@scope_binding_app.command("set")
+def set_scope_binding(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Argument(help="Exact Scope ID to bind.")],
+    kind: Annotated[str, typer.Option(help="Binding kind, e.g. session or workspace.")],
+    external_id: Annotated[str, typer.Option(help="Integration-specific identity, e.g. a session or path hash.")],
+    integration: Annotated[str, typer.Option(help="Binding integration name.")] = _DEFAULT_BINDING_INTEGRATION,
+) -> None:
+    """Bind one external integration identity to a Scope."""
+
+    request = SetScopeBindingRequest(
+        root=ScopeBinding(key=_binding_key(integration, kind, external_id), scope_id=scope_id)
+    )
+    asyncio.run(_execute(context, lambda client: client.set_scope_binding(request)))
+
+
+@scope_binding_app.command("clear")
+def clear_scope_binding(
+    context: typer.Context,
+    kind: Annotated[str, typer.Option(help="Binding kind, e.g. session or workspace.")],
+    external_id: Annotated[str, typer.Option(help="Integration-specific identity, e.g. a session or path hash.")],
+    integration: Annotated[str, typer.Option(help="Binding integration name.")] = _DEFAULT_BINDING_INTEGRATION,
+) -> None:
+    """Clear one external integration binding."""
+
+    request = ClearScopeBindingRequest(key=_binding_key(integration, kind, external_id))
+    asyncio.run(_execute(context, lambda client: client.clear_scope_binding(request)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +562,7 @@ class _ClientOptions:
     api_token: SecretStr | None
     timeout: float
     json_output: bool
+    allow_insecure_http: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +570,7 @@ class _ClientOverrides:
     server_url: str | None = None
     timeout: float | None = None
     json_output: bool = False
+    allow_insecure_http: bool | None = None
 
 
 def configure_client(
@@ -139,6 +579,7 @@ def configure_client(
     server_url: str | None,
     timeout: float | None,
     json_output: bool,
+    allow_insecure_http: bool | None = None,
 ) -> None:
     """Store lazy Server connection overrides for content commands."""
 
@@ -146,6 +587,7 @@ def configure_client(
         server_url=server_url,
         timeout=timeout,
         json_output=json_output,
+        allow_insecure_http=allow_insecure_http,
     )
 
 
@@ -157,12 +599,23 @@ def capabilities(context: typer.Context) -> None:
 
 def stats(
     context: typer.Context,
-    scope_id: Annotated[str, typer.Option(help="Application scope to inspect.")],
+    scope_id: Annotated[list[str] | None, typer.Option(help="Exact application scope to include.")] = None,
+    root_scope_id: Annotated[str | None, typer.Option(help="Organization subtree root to include.")] = None,
     period: Annotated[StatsPeriod, typer.Option(help="Bounded UTC statistics period.")] = StatsPeriod.FIELD_30D,
 ) -> None:
-    """Show current inventory and bounded usage for one scope."""
+    """Show current inventory and bounded usage for a Scope selection."""
 
-    request = GetStatsRequest(scope_id=scope_id, period=period)
+    if scope_id and root_scope_id is not None:
+        raise typer.BadParameter("--scope-id and --root-scope-id are mutually exclusive")  # noqa: TRY003
+    if root_scope_id is not None:
+        selection = ScopeSelection(root=SubtreeScopeSelection(mode="subtree", root_scope_id=root_scope_id))
+    elif scope_id:
+        selection = ScopeSelection(
+            root=ExactScopeSelection(mode="exact", scope_ids=[ScopeId(value) for value in scope_id])
+        )
+    else:
+        selection = ScopeSelection(root=AllScopeSelection(mode="all"))
+    request = GetStatsRequest(selection=selection, period=period)
     asyncio.run(_execute(context, lambda client: client.get_stats(request)))
 
 
@@ -184,19 +637,21 @@ def list_candidates(
     scope_id: Annotated[str, typer.Option(help="Application scope containing the Review Inbox.")],
     status: Annotated[CandidateStatus, typer.Option(help="Candidate lifecycle state.")] = CandidateStatus.PENDING,
     family: Annotated[CandidateFamily | None, typer.Option(help="Optional Artifact Family filter.")] = None,
+    candidate_kind: Annotated[str | None, typer.Option(help="artifact or tag; omit for both.")] = None,
     cursor: Annotated[str | None, typer.Option(help="Opaque cursor from the previous page.")] = None,
     limit: Annotated[int, typer.Option(min=1, max=100, help="Maximum Candidate heads to return.")] = 50,
 ) -> None:
     """List current Candidate heads; pending is the default Inbox view."""
 
-    request = ListArtifactCandidatesRequest(
+    request = ListCandidatesRequest(
         scope_id=scope_id,
+        candidate_kind=None if candidate_kind is None else CandidateKind(candidate_kind),
         status=status,
         family=family,
         cursor=cursor,
         limit=limit,
     )
-    asyncio.run(_execute(context, lambda client: client.list_artifact_candidates(request)))
+    asyncio.run(_execute(context, lambda client: client.list_candidates(request)))
 
 
 @candidate_app.command("show")
@@ -207,8 +662,8 @@ def show_candidate(
 ) -> None:
     """Show the current exact Candidate version and evidence."""
 
-    request = GetArtifactCandidateRequest(scope_id=scope_id, candidate_id=candidate_id)
-    asyncio.run(_execute(context, lambda client: client.get_artifact_candidate(request)))
+    request = GetCandidateRequest(scope_id=scope_id, candidate_id=candidate_id)
+    asyncio.run(_execute(context, lambda client: client.get_candidate(request)))
 
 
 @candidate_app.command("approve")
@@ -220,12 +675,12 @@ def approve_candidate(
 ) -> None:
     """Approve one exact pending Candidate version."""
 
-    request = ApproveArtifactCandidateRequest(
+    request = ApproveCandidateRequest(
         scope_id=scope_id,
         candidate_id=candidate_id,
         expected_version=expected_version,
     )
-    asyncio.run(_execute(context, lambda client: client.approve_artifact_candidate(request)))
+    asyncio.run(_execute(context, lambda client: client.approve_candidate(request)))
 
 
 @candidate_app.command("reject")
@@ -238,13 +693,42 @@ def reject_candidate(
 ) -> None:
     """Reject one exact pending Candidate version."""
 
-    request = RejectArtifactCandidateRequest(
+    request = RejectCandidateRequest(
         scope_id=scope_id,
         candidate_id=candidate_id,
         expected_version=expected_version,
         reason=reason,
     )
-    asyncio.run(_execute(context, lambda client: client.reject_artifact_candidate(request)))
+    asyncio.run(_execute(context, lambda client: client.reject_candidate(request)))
+
+
+@candidate_revise_app.command("json")
+def revise_candidate_json(
+    context: typer.Context,
+    request_file: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="UTF-8 JSON ReviseCandidateRequest for any supported family.",
+        ),
+    ],
+) -> None:
+    """Revise a complete proposal; the result remains pending human review."""
+    try:
+        request = ReviseCandidateRequest.model_validate_json(request_file.read_text(encoding="utf-8"))
+    except ValidationError as error:
+        _raise_invalid_request("Candidate revision", error)
+    asyncio.run(_execute(context, lambda client: client.revise_candidate(request)))
+
+
+@candidate_app.command("history")
+def candidate_history(
+    context: typer.Context, scope_id: Annotated[str, typer.Option()], candidate_id: Annotated[str, typer.Argument()]
+) -> None:
+    request = GetCandidateRequest(scope_id=scope_id, candidate_id=candidate_id)
+    asyncio.run(_execute(context, lambda client: client.get_candidate_history(request)))
 
 
 @candidate_revise_app.command("experience")
@@ -276,7 +760,7 @@ def revise_experience_candidate(
     try:
         sources, artifacts, target_ref = _evidence_references(source_ref, artifact_ref, target)
         _require_target_family(target_ref, family="experience")
-        request = ReviseArtifactCandidateRequest(
+        request = ReviseCandidateRequest(
             scope_id=scope_id,
             candidate_id=candidate_id,
             expected_version=expected_version,
@@ -293,7 +777,7 @@ def revise_experience_candidate(
         )
     except ValidationError as error:
         _raise_invalid_request("Experience Candidate revision", error)
-    asyncio.run(_execute(context, lambda client: client.revise_artifact_candidate(request)))
+    asyncio.run(_execute(context, lambda client: client.revise_candidate(request)))
 
 
 @candidate_revise_app.command("skill")
@@ -340,7 +824,7 @@ def revise_skill_candidate(
     try:
         sources, artifacts, target_ref = _evidence_references(source_ref, artifact_ref, target)
         _require_target_family(target_ref, family="skill")
-        request = ReviseArtifactCandidateRequest(
+        request = ReviseCandidateRequest(
             scope_id=scope_id,
             candidate_id=candidate_id,
             expected_version=expected_version,
@@ -357,7 +841,7 @@ def revise_skill_candidate(
         )
     except ValidationError as error:
         _raise_invalid_request("managed Skill Candidate revision", error)
-    asyncio.run(_execute(context, lambda client: client.revise_artifact_candidate(request)))
+    asyncio.run(_execute(context, lambda client: client.revise_candidate(request)))
 
 
 @skill_app.command("show")
@@ -374,6 +858,35 @@ def show_skill(
         artifact=ArtifactReference(family="skill", artifact_id=artifact_id, revision=revision),
     )
     asyncio.run(_execute(context, lambda client: client.get_skill(request)))
+
+
+@experience_app.command("list")
+def list_experiences(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Application scope containing approved Experience.")],
+    cursor: Annotated[str | None, typer.Option(help="Opaque cursor from the previous page.")] = None,
+    limit: Annotated[int, typer.Option(min=1, max=100, help="Maximum Experience heads to return.")] = 50,
+) -> None:
+    """List current approved Experience heads."""
+
+    request = ListArtifactsRequest(cursor=cursor, limit=limit)
+    asyncio.run(_execute(context, lambda client: client.list_artifacts(scope_id, "experience", request)))
+
+
+@experience_app.command("show")
+def show_experience(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Application scope containing the approved Experience.")],
+    artifact_id: Annotated[str, typer.Argument(help="Experience Artifact identity.")],
+    revision: Annotated[int, typer.Option(min=1, help="Exact approved Experience Revision.")],
+) -> None:
+    """Read one exact approved Experience Revision."""
+
+    request = GetExperienceRequest(
+        scope_id=scope_id,
+        artifact=ArtifactReference(family="experience", artifact_id=artifact_id, revision=revision),
+    )
+    asyncio.run(_execute(context, lambda client: client.get_experience(request)))
 
 
 @experience_app.command("generate")
@@ -533,22 +1046,772 @@ def export_managed_skill(
     asyncio.run(_export_managed_skill(context, request, target, destination))
 
 
-def _options(context: typer.Context) -> _ClientOptions:
+@skill_app.command("remote-target-create")
+def create_remote_skill_target(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Application scope authorized for the remote target.")],
+    agent_kind: Annotated[RemoteAgentKind, typer.Option(help="Remote Agent integration kind.")],
+    name: Annotated[str, typer.Option(help="Human-readable remote machine name shown to operators.")],
+) -> None:
+    """Create a pending target and print its short-lived enrollment code once."""
+
+    asyncio.run(_create_remote_skill_target(context, scope_id, agent_kind, name))
+
+
+@skill_app.command("remote-status")
+def list_remote_skill_targets(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Application scope containing the remote targets.")],
+    target_id: Annotated[
+        str | None,
+        typer.Option(help="Optional exact target identity; omit to list the scope."),
+    ] = None,
+    limit: Annotated[int, typer.Option(min=1, max=200, help="Maximum targets to return.")] = 100,
+) -> None:
+    """Show remote target enrollment, liveness, desired state, and delivery state."""
+
+    request = ListRemoteSkillTargetsRequest(scope_id=scope_id, target_id=target_id, limit=limit)
+    asyncio.run(_execute(context, lambda client: client.list_remote_skill_targets(request)))
+
+
+@skill_app.command("remote-publish")
+def publish_remote_skill(
+    context: typer.Context,
+    artifact_id: Annotated[str, typer.Argument(help="Approved managed Skill Artifact identity.")],
+    scope_id: Annotated[str, typer.Option(help="Application scope containing the Skill and target.")],
+    target_id: Annotated[str, typer.Option(help="Enrolled remote target identity.")],
+    revision: Annotated[int, typer.Option(min=1, help="Exact approved managed Skill Revision.")],
+    expected_generation: Annotated[
+        int | None,
+        typer.Option(min=0, help="Optional publication CAS generation; resolved automatically when omitted."),
+    ] = None,
+    allow_deprecated: Annotated[
+        bool,
+        typer.Option(help="Explicitly allow publishing a deprecated managed Skill."),
+    ] = False,
+) -> None:
+    """Publish or update one exact Skill Revision for a remote target."""
+
+    asyncio.run(
+        _publish_remote_skill(
+            context,
+            scope_id,
+            target_id,
+            artifact_id,
+            revision,
+            expected_generation,
+            allow_deprecated=allow_deprecated,
+        )
+    )
+
+
+@skill_app.command("remote-unpublish")
+def unpublish_remote_skill(
+    context: typer.Context,
+    artifact_id: Annotated[str, typer.Argument(help="Managed Skill Artifact identity to remove remotely.")],
+    scope_id: Annotated[str, typer.Option(help="Application scope containing the publication.")],
+    target_id: Annotated[str, typer.Option(help="Enrolled remote target identity.")],
+    expected_generation: Annotated[
+        int | None,
+        typer.Option(min=0, help="Optional publication CAS generation; resolved automatically when omitted."),
+    ] = None,
+) -> None:
+    """Request safe removal of one Receiver-managed remote Skill."""
+
+    asyncio.run(_unpublish_remote_skill(context, scope_id, target_id, artifact_id, expected_generation))
+
+
+@skill_app.command("remote-target-revoke")
+def revoke_remote_skill_target(
+    context: typer.Context,
+    target_id: Annotated[str, typer.Argument(help="Remote target identity to revoke.")],
+    scope_id: Annotated[str, typer.Option(help="Application scope containing the remote target.")],
+    expected_generation: Annotated[
+        int | None,
+        typer.Option(min=0, help="Optional target CAS generation; resolved automatically when omitted."),
+    ] = None,
+) -> None:
+    """Revoke a remote Receiver credential while retaining status history."""
+
+    asyncio.run(_revoke_remote_skill_target(context, scope_id, target_id, expected_generation))
+
+
+@skill_app.command("remote-target-rename")
+def rename_remote_skill_target(
+    context: typer.Context,
+    target_id: Annotated[str, typer.Argument(help="Remote target identity to rename.")],
+    name: Annotated[str, typer.Option(help="New human-readable remote machine name.")],
+    scope_id: Annotated[str, typer.Option(help="Application scope containing the remote target.")],
+    expected_generation: Annotated[
+        int | None,
+        typer.Option(min=0, help="Optional target CAS generation; resolved automatically when omitted."),
+    ] = None,
+) -> None:
+    """Rename a remote machine without changing its durable target identity."""
+
+    asyncio.run(_rename_remote_skill_target(context, scope_id, target_id, name, expected_generation))
+
+
+@skill_app.command("remote-enroll")
+def enroll_remote_skill_target(
+    context: typer.Context,
+    workspace: Annotated[Path, typer.Option(help="Local project workspace owned by the Agent Receiver.")] = Path("."),
+    enrollment_code: Annotated[
+        str | None,
+        typer.Option(help="One-time enrollment code; omit to enter it without terminal echo."),
+    ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(help="Credential file to create with owner-only permissions."),
+    ] = None,
+    environment_fingerprint: Annotated[
+        str | None,
+        typer.Option(help="Optional target environment SHA-256 fingerprint."),
+    ] = None,
+    install_service: Annotated[
+        bool,
+        typer.Option("--install-service", help="Install and start a Linux systemd user service after enrollment."),
+    ] = False,
+    watch_interval: Annotated[
+        float,
+        typer.Option(min=1, max=3600, help="Seconds between automatic Pull checks when installing the service."),
+    ] = 5,
+    allow_insecure_http: Annotated[
+        bool,
+        typer.Option(
+            "--allow-insecure-http",
+            help="Allow cleartext remote HTTP on a protected private test network.",
+        ),
+    ] = False,
+) -> None:
+    """Enroll this project Receiver without installing a full PowerContext Server."""
+
+    code = enrollment_code or typer.prompt("Enrollment code", hide_input=True)
+    asyncio.run(
+        _enroll_remote_skill_target(
+            context,
+            workspace,
+            code,
+            config_file,
+            environment_fingerprint,
+            install_service=install_service,
+            watch_interval=watch_interval,
+            allow_insecure_http=allow_insecure_http,
+        )
+    )
+
+
+@skill_app.command("remote-sync")
+def sync_remote_skills(
+    context: typer.Context,
+    config_file: Annotated[
+        Path,
+        typer.Option(help="Owner-only Receiver credential file created by remote-enroll."),
+    ] = Path(".powercontext/remote-skill-target.json"),
+) -> None:
+    """Reconcile and safely install or unpublish latest remote desired state."""
+
+    asyncio.run(_sync_remote_skills(context, config_file))
+
+
+@skill_app.command("remote-watch")
+def watch_remote_skills(
+    context: typer.Context,
+    config_file: Annotated[
+        Path,
+        typer.Option(help="Owner-only Receiver credential file created by remote-enroll."),
+    ] = Path(".powercontext/remote-skill-target.json"),
+    interval: Annotated[
+        float,
+        typer.Option(min=1, max=3600, help="Seconds between successful Pull reconciliations."),
+    ] = 5,
+    max_backoff: Annotated[
+        float,
+        typer.Option(min=1, max=3600, help="Maximum retry delay after incomplete or failed reconciliation."),
+    ] = 60,
+) -> None:
+    """Continuously Pull and apply the latest remote desired state."""
+
+    try:
+        asyncio.run(_watch_remote_skills(context, config_file, interval, max_backoff))
+    except KeyboardInterrupt:
+        typer.echo("Remote Skill watch stopped.")
+
+
+@skill_app.command("remote-service-install")
+def install_remote_skill_service(
+    config_file: Annotated[
+        Path,
+        typer.Option(help="Owner-only Receiver credential file created by remote-enroll."),
+    ] = Path(".powercontext/remote-skill-target.json"),
+    interval: Annotated[
+        float,
+        typer.Option(min=1, max=3600, help="Seconds between automatic Pull reconciliations."),
+    ] = 5,
+) -> None:
+    """Install and start this Receiver as a Linux systemd user service."""
+
+    _install_remote_skill_service(config_file, interval)
+
+
+@skill_app.command("remote-service-uninstall")
+def uninstall_remote_skill_service(
+    config_file: Annotated[
+        Path,
+        typer.Option(help="Receiver credential file identifying the target-scoped user service."),
+    ] = Path(".powercontext/remote-skill-target.json"),
+) -> None:
+    """Stop and remove this Receiver's PowerContext-managed systemd user service."""
+
+    _uninstall_remote_skill_service(config_file)
+
+
+async def _create_remote_skill_target(
+    context: typer.Context,
+    scope_id: str,
+    agent_kind: RemoteAgentKind,
+    name: str,
+) -> None:
+    options = _options(context)
+    token = None if options.api_token is None else options.api_token.get_secret_value()
+    try:
+        async with PowerContextClient(
+            options.server_url, token=token, timeout=options.timeout, allow_insecure_http=options.allow_insecure_http
+        ) as client:
+            enrollment = await client.create_remote_skill_target(
+                CreateRemoteSkillTargetRequest(scope_id=scope_id, agent_kind=agent_kind, display_name=name)
+            )
+    except ClientError as error:
+        typer.echo(_error_message(error), err=True)
+        raise typer.Exit(code=1) from error
+    if options.json_output:
+        typer.echo(enrollment.model_dump_json(indent=2))
+        return
+    typer.echo(f"Machine: {enrollment.target.display_name}")
+    typer.echo(f"Target ID: {enrollment.target.target_id}")
+    typer.echo(f"Expires: {enrollment.enrollment_expires_at.isoformat()}")
+    typer.echo(f"Enrollment code: {enrollment.enrollment_code}")
+    typer.echo("Next: run remote-enroll on the target project using the public HTTPS Server URL.")
+
+
+async def _publish_remote_skill(
+    context: typer.Context,
+    scope_id: str,
+    target_id: str,
+    artifact_id: str,
+    revision: int,
+    expected_generation: int | None,
+    *,
+    allow_deprecated: bool,
+) -> None:
+    async def publish(client: PowerContextClient) -> RemoteSkillPublication:
+        resolved_generation = expected_generation
+        if resolved_generation is None:
+            status = await _remote_target_status(client, scope_id, target_id)
+            current = next(
+                (publication for publication in status.publications if publication.artifact_id == artifact_id),
+                None,
+            )
+            resolved_generation = None if current is None else current.generation
+        return await client.publish_remote_skill(
+            PublishRemoteSkillRequest(
+                scope_id=scope_id,
+                target_id=target_id,
+                artifact=ArtifactReference(family="skill", artifact_id=artifact_id, revision=revision),
+                expected_generation=resolved_generation,
+                allow_deprecated=allow_deprecated,
+            )
+        )
+
+    await _execute(context, publish)
+
+
+async def _unpublish_remote_skill(
+    context: typer.Context,
+    scope_id: str,
+    target_id: str,
+    artifact_id: str,
+    expected_generation: int | None,
+) -> None:
+    async def unpublish(client: PowerContextClient) -> RemoteSkillPublication:
+        resolved_generation = expected_generation
+        if resolved_generation is None:
+            status = await _remote_target_status(client, scope_id, target_id)
+            current = next(
+                (publication for publication in status.publications if publication.artifact_id == artifact_id),
+                None,
+            )
+            if current is None:
+                message = f"remote publication {artifact_id!r} was not found for target {target_id!r}"
+                raise typer.BadParameter(
+                    message,
+                    param_hint="artifact_id",
+                )
+            resolved_generation = current.generation
+        return await client.unpublish_remote_skill(
+            UnpublishRemoteSkillRequest(
+                scope_id=scope_id,
+                target_id=target_id,
+                artifact_id=artifact_id,
+                expected_generation=resolved_generation,
+            )
+        )
+
+    await _execute(context, unpublish)
+
+
+async def _revoke_remote_skill_target(
+    context: typer.Context,
+    scope_id: str,
+    target_id: str,
+    expected_generation: int | None,
+) -> None:
+    async def revoke(client: PowerContextClient) -> RemoteSkillTarget:
+        resolved_generation = expected_generation
+        if resolved_generation is None:
+            status = await _remote_target_status(client, scope_id, target_id)
+            resolved_generation = status.target.generation
+        return await client.revoke_remote_skill_target(
+            RevokeRemoteSkillTargetRequest(
+                scope_id=scope_id,
+                target_id=target_id,
+                expected_generation=resolved_generation,
+            )
+        )
+
+    await _execute(context, revoke)
+
+
+async def _rename_remote_skill_target(
+    context: typer.Context,
+    scope_id: str,
+    target_id: str,
+    name: str,
+    expected_generation: int | None,
+) -> None:
+    async def rename(client: PowerContextClient) -> RemoteSkillTarget:
+        resolved_generation = expected_generation
+        if resolved_generation is None:
+            status = await _remote_target_status(client, scope_id, target_id)
+            resolved_generation = status.target.generation
+        return await client.rename_remote_skill_target(
+            RenameRemoteSkillTargetRequest(
+                scope_id=scope_id,
+                target_id=target_id,
+                display_name=name,
+                expected_generation=resolved_generation,
+            )
+        )
+
+    await _execute(context, rename)
+
+
+async def _remote_target_status(
+    client: PowerContextClient,
+    scope_id: str,
+    target_id: str,
+) -> RemoteSkillTargetStatus:
+    response = await client.list_remote_skill_targets(
+        ListRemoteSkillTargetsRequest(scope_id=scope_id, target_id=target_id, limit=1)
+    )
+    if not response.targets:
+        message = f"remote target {target_id!r} was not found"
+        raise typer.BadParameter(message, param_hint="--target-id")
+    return response.targets[0]
+
+
+async def _enroll_remote_skill_target(
+    context: typer.Context,
+    workspace: Path,
+    enrollment_code: str,
+    config_file: Path | None,
+    environment_fingerprint: str | None,
+    *,
+    install_service: bool,
+    watch_interval: float,
+    allow_insecure_http: bool,
+) -> None:
+    # Enrollment applies its own endpoint-bound consent check below before it
+    # sends an enrollment code or creates a Receiver configuration.
+    options = _options(context, allow_insecure_http=True)
+    try:
+        insecure_http = require_remote_skill_server_url(
+            options.server_url,
+            allow_insecure_http=allow_insecure_http,
+        )
+    except ValueError as error:
+        typer.echo(f"Cannot enroll remote Skill Receiver: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    resolved_workspace, destination = _remote_receiver_paths(workspace, config_file)
+    request = EnrollRemoteSkillTargetRequest(
+        enrollment_code=enrollment_code,
+        installation_id=f"project-{uuid4().hex}",
+        receiver_version=RECEIVER_VERSION,
+        environment_fingerprint=environment_fingerprint,
+        machine_hostname=socket.gethostname(),
+        workspace_name=resolved_workspace.name,
+    )
+    credential_saved = False
+    installation: ReceiverServiceInstallation | None = None
+    reservation: int | None = None
+    try:
+        reservation = _reserve_receiver_config(destination)
+        observed_environment_fingerprints = {
+            agent_kind: receiver_environment_fingerprint(resolved_workspace, agent_kind)
+            for agent_kind in ("codex", "claude_code")
+        }
+        async with PowerContextClient(
+            options.server_url,
+            timeout=options.timeout,
+            allow_insecure_http=insecure_http,
+        ) as client:
+            enrolled = await client.enroll_remote_skill_target(request)
+        observed_environment_fingerprint = observed_environment_fingerprints[enrolled.agent_kind.value]
+        descriptor = reservation
+        reservation = None
+        _write_receiver_config(
+            destination,
+            {
+                "schema": "powercontext.remote-skill-receiver-config.v1",
+                "server_url": options.server_url,
+                "target_id": enrolled.target_id,
+                "credential": enrolled.credential,
+                "agent_kind": enrolled.agent_kind.value,
+                "workspace": str(resolved_workspace),
+                "state_root": None,
+                "receiver_version": RECEIVER_VERSION,
+                "environment_fingerprint": observed_environment_fingerprint,
+                "allow_insecure_http": insecure_http,
+            },
+            descriptor=descriptor,
+        )
+        credential_saved = True
+        if install_service:
+            installation = install_systemd_user_service(
+                destination,
+                _read_receiver_config(destination),
+                interval_seconds=watch_interval,
+            )
+    except ClientError as error:
+        typer.echo(_error_message(error), err=True)
+        raise typer.Exit(code=1) from error
+    except (OSError, ReceiverServiceError, ValueError) as error:
+        if credential_saved:
+            typer.echo(
+                f"Receiver credential was saved at {destination}, but automatic sync could not start: {error}", err=True
+            )
+        else:
+            typer.echo(f"Cannot save Receiver credential: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    finally:
+        if reservation is not None:
+            os.close(reservation)
+            destination.unlink(missing_ok=True)
+    if options.json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "target_id": enrolled.target_id,
+                    "agent_kind": enrolled.agent_kind.value,
+                    "workspace": str(resolved_workspace),
+                    "config_file": str(destination),
+                    "allow_insecure_http": insecure_http,
+                    "service": None
+                    if installation is None
+                    else {"unit_name": installation.unit_name, "unit_path": str(installation.unit_path)},
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    typer.echo(f"Enrolled target {enrolled.target_id} for {enrolled.agent_kind.value}.")
+    typer.echo(f"Credential saved with owner-only permissions at {destination}.")
+    if insecure_http:
+        typer.echo(
+            "WARNING: Receiver credentials and Skill packages will use cleartext HTTP. "
+            "Use this only on a protected private test network.",
+            err=True,
+        )
+    if installation is None:
+        typer.echo(f"Next: cd {resolved_workspace} && powercontext skill remote-service-install")
+    else:
+        typer.echo(f"Automatic remote Skill sync is active in {installation.unit_name}.")
+
+
+def _remote_receiver_paths(workspace: Path, config_file: Path | None) -> tuple[Path, Path]:
+    resolved_workspace = workspace.expanduser().resolve(strict=False)
+    destination = (
+        resolved_workspace / ".powercontext" / "remote-skill-target.json"
+        if config_file is None
+        else config_file.expanduser().resolve(strict=False)
+    )
+    return resolved_workspace, destination
+
+
+async def _sync_remote_skills(context: typer.Context, config_file: Path) -> None:
+    try:
+        config = _read_receiver_config(config_file)
+        async with RemoteSkillReceiver(config) as receiver:
+            result = await receiver.sync()
+    except ClientError as error:
+        typer.echo(_error_message(error), err=True)
+        raise typer.Exit(code=1) from error
+    except (OSError, ValueError, RuntimeError) as error:
+        typer.echo(f"Cannot sync remote Skills: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    json_output = _options(context).json_output
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "requested": result.requested,
+                    "succeeded": result.succeeded,
+                    "failed": result.failed,
+                    "receipt_pending": result.receipt_pending,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    elif result.requested == 0 and result.receipt_pending == 0:
+        typer.echo("Remote Skills are already current; no actions were needed.")
+    else:
+        typer.echo(
+            f"Remote Skill sync: {result.succeeded} succeeded, {result.failed} failed, "
+            f"{result.receipt_pending} Receipts pending ({result.requested} actions)."
+        )
+        if result.succeeded:
+            typer.echo("Changes are discoverable on the next Agent session or discovery cycle.")
+        if result.failed:
+            typer.echo("One or more remote Skill actions failed; inspect remote-status before retrying.", err=True)
+        if result.receipt_pending:
+            typer.echo("Run remote-sync again to finish pending delivery Receipts.", err=True)
+    if result.failed or result.receipt_pending:
+        raise typer.Exit(code=1)
+
+
+async def _watch_remote_skills(
+    context: typer.Context,
+    config_file: Path,
+    interval: float,
+    max_backoff: float,
+) -> None:
+    if max_backoff < interval:
+        typer.echo("Cannot watch remote Skills: --max-backoff must not be shorter than --interval", err=True)
+        raise typer.Exit(code=2)
+    try:
+        config = _read_receiver_config(config_file)
+        typer.echo(f"Watching remote Skills for {config.target_id} every {interval:g} seconds. Press Ctrl+C to stop.")
+        async with RemoteSkillReceiver(config) as receiver:
+            await receiver.watch(
+                interval_seconds=interval,
+                max_backoff_seconds=max_backoff,
+                on_result=_print_receiver_watch_result,
+                on_error=_print_receiver_watch_error,
+            )
+    except ServerResponseError as error:
+        if error.status_code in {401, 403}:
+            typer.echo("Receiver credential was rejected; automatic sync is stopping.", err=True)
+            raise typer.Exit(code=3) from error
+        typer.echo(_error_message(error), err=True)
+        raise typer.Exit(code=1) from error
+    except (OSError, ValueError, RuntimeError) as error:
+        typer.echo(f"Cannot watch remote Skills: {error}", err=True)
+        raise typer.Exit(code=2) from error
+
+
+def _print_receiver_watch_result(result: ReceiverSyncResult) -> None:
+    if result.requested == 0 and result.receipt_pending == 0:
+        return
+    typer.echo(
+        f"Remote Skill sync: {result.succeeded} succeeded, {result.failed} failed, "
+        f"{result.receipt_pending} Receipts pending ({result.requested} actions)."
+    )
+
+
+def _print_receiver_watch_error(error: Exception, retry_delay: float) -> None:
+    typer.echo(f"Remote Skill sync failed; retrying in {retry_delay:g} seconds: {error}", err=True)
+
+
+def _print_session_import_result(result: SessionImportResult, *, dry_run: bool) -> None:
+    action = "Would import" if dry_run else "Imported"
+    typer.echo(
+        f"{action} {result.imported} Codex user prompt(s) from {result.scanned_files} session file(s); "
+        f"{result.skipped} skipped, {result.failed} failed."
+    )
+    if result.failed_files:
+        typer.echo(f"Failed to parse {result.failed_files} session file(s).")
+    for reason, count in sorted(result.skipped_by_reason.items()):
+        typer.echo(f"Skipped {count} prompt(s): {reason}.")
+    for reason, count in sorted(result.failed_by_reason.items()):
+        typer.echo(f"Failed {count} prompt(s): {reason}.")
+    if result.checkpoint_file is not None:
+        typer.echo(f"Checkpoint: {result.checkpoint_file}")
+    if dry_run:
+        typer.echo("Dry run only; no Sources were written.")
+    else:
+        typer.echo("Sources were written only; configured background processing may extract them separately.")
+
+
+def _install_remote_skill_service(config_file: Path, interval: float) -> ReceiverServiceInstallation:
+    try:
+        config = _read_receiver_config(config_file)
+        installation = install_systemd_user_service(config_file, config, interval_seconds=interval)
+    except (OSError, ReceiverServiceError, ValueError) as error:
+        typer.echo(f"Cannot install automatic remote Skill sync: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    typer.echo(f"Automatic remote Skill sync is active in {installation.unit_name}.")
+    typer.echo(f"Unit: {installation.unit_path}")
+    return installation
+
+
+def _uninstall_remote_skill_service(config_file: Path) -> ReceiverServiceInstallation:
+    try:
+        config = _read_receiver_config(config_file)
+        installation = uninstall_systemd_user_service(config.target_id)
+    except (OSError, ReceiverServiceError, ValueError) as error:
+        typer.echo(f"Cannot uninstall automatic remote Skill sync: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    typer.echo(f"Automatic remote Skill sync is stopped for {config.target_id}.")
+    return installation
+
+
+def _reserve_receiver_config(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    return os.open(path, flags, 0o600)
+
+
+def _write_receiver_config(path: Path, value: dict[str, object], *, descriptor: int) -> None:
+    temporary: Path | None = None
+    try:
+        os.close(descriptor)
+        temporary_descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary = Path(temporary_name)
+        with os.fdopen(temporary_descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _read_receiver_config(path: Path) -> RemoteSkillReceiverConfig:
+    resolved = path.expanduser().resolve(strict=True)
+    if os.name != "nt" and resolved.stat().st_mode & 0o077:
+        raise ValueError("Receiver credential file must not be accessible by group or other users")  # noqa: TRY003
+    value = json.loads(resolved.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.pop("schema", None) != "powercontext.remote-skill-receiver-config.v1":
+        raise ValueError("Receiver credential file schema is invalid")  # noqa: TRY003
+    return RemoteSkillReceiverConfig.model_validate(value)
+
+
+def _options(context: typer.Context, *, allow_insecure_http: bool | None = None) -> _ClientOptions:
     overrides = context.meta.get("powercontext.client.overrides", _ClientOverrides())
-    settings = ClientSettings()
+    if allow_insecure_http is None:
+        allow_insecure_http = overrides.allow_insecure_http
+    settings = ClientSettings(
+        **({} if overrides.server_url is None else {"server_url": overrides.server_url}),
+        **({} if allow_insecure_http is None else {"allow_insecure_http": allow_insecure_http}),
+    )
     return _ClientOptions(
-        server_url=settings.server_url if overrides.server_url is None else overrides.server_url,
+        server_url=settings.server_url,
         api_token=settings.api_token,
         timeout=settings.timeout if overrides.timeout is None else overrides.timeout,
         json_output=overrides.json_output,
+        allow_insecure_http=settings.allow_insecure_http,
     )
+
+
+def import_sessions(
+    context: typer.Context,
+    host: Annotated[
+        str,
+        typer.Option(help=f"Agent host to import from. Supported: {', '.join(SUPPORTED_SESSION_IMPORT_HOSTS)}."),
+    ],
+    scope_id: Annotated[
+        str | None,
+        typer.Option(help="Import every discovered prompt into this existing Scope instead of resolving per session."),
+    ] = None,
+    codex_home: Annotated[
+        Path | None,
+        typer.Option(help="Codex home directory to scan. Defaults to CODEX_HOME or ~/.codex."),
+    ] = None,
+    checkpoint_file: Annotated[
+        Path | None,
+        typer.Option(help="Persistent import checkpoint file. Defaults under the Codex home directory."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run/--no-dry-run", help="Inspect importable prompts without writing Sources."),
+    ] = False,
+) -> None:
+    """Import pre-install user prompts from one agent host as ordinary Content Sources."""
+
+    asyncio.run(
+        _import_sessions(
+            context,
+            host=host,
+            scope_id=scope_id,
+            codex_home=codex_home,
+            checkpoint_file=checkpoint_file,
+            dry_run=dry_run,
+        )
+    )
+
+
+async def _import_sessions(
+    context: typer.Context,
+    *,
+    host: str,
+    scope_id: str | None,
+    codex_home: Path | None,
+    checkpoint_file: Path | None,
+    dry_run: bool,
+) -> None:
+    options = _options(context)
+    try:
+        token = None if options.api_token is None else options.api_token.get_secret_value()
+        async with PowerContextClient(
+            options.server_url, token=token, timeout=options.timeout, allow_insecure_http=options.allow_insecure_http
+        ) as client:
+            result = await run_session_import(
+                client,
+                host=host,
+                destination_id=options.server_url,
+                scope_id=scope_id,
+                codex_home=codex_home,
+                checkpoint_file=checkpoint_file,
+                dry_run=dry_run,
+            )
+    except SessionImportError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+    except ClientError as exc:
+        typer.echo(_error_message(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+    if options.json_output:
+        typer.echo(json.dumps(result.as_json(), ensure_ascii=False, indent=2))
+        return
+    _print_session_import_result(result, dry_run=dry_run)
 
 
 async def _execute(context: typer.Context, operation: _ClientOperation) -> None:
     options = _options(context)
     try:
         token = None if options.api_token is None else options.api_token.get_secret_value()
-        async with PowerContextClient(options.server_url, token=token, timeout=options.timeout) as client:
+        async with PowerContextClient(
+            options.server_url, token=token, timeout=options.timeout, allow_insecure_http=options.allow_insecure_http
+        ) as client:
             response = await operation(client)
     except ClientError as exc:
         typer.echo(_error_message(exc), err=True)
@@ -698,18 +1961,57 @@ async def _export_managed_skill(
     options = _options(context)
     try:
         token = None if options.api_token is None else options.api_token.get_secret_value()
-        async with PowerContextClient(options.server_url, token=token, timeout=options.timeout) as client:
+        async with PowerContextClient(
+            options.server_url, token=token, timeout=options.timeout, allow_insecure_http=options.allow_insecure_http
+        ) as client:
             response = await client.get_skill(request)
-        exported = export_skill(
-            ArtifactRef(
-                family=response.artifact.family,
-                artifact_id=response.artifact.artifact_id,
-                revision=response.artifact.revision,
-            ),
-            response.content,
-            target,
-            destination,
-        )
+            if response.content.package is None:
+                exported = export_skill(
+                    ArtifactRef(
+                        family=response.artifact.family,
+                        artifact_id=response.artifact.artifact_id,
+                        revision=response.artifact.revision,
+                    ),
+                    response.content,
+                    target,
+                    destination,
+                )
+            else:
+                download = await client.download_skill_package(
+                    GetSkillPackageRequest(scope_id=request.scope_id, artifact=request.artifact)
+                )
+                try:
+                    archive_bytes = base64.b64decode(download.archive_base64, validate=True)
+                except (binascii.Error, ValueError) as error:
+                    raise ValueError("Server returned an invalid Skill package archive") from error  # noqa: TRY003
+                package = capture_skill_archive(archive_bytes)
+                if package.reference.model_dump(mode="json") != response.content.package.model_dump(mode="json"):
+                    raise ValueError(  # noqa: TRY003, TRY301
+                        "downloaded Skill package does not match the Artifact"
+                    )
+                runtime_content = SkillContent(
+                    name=response.content.name,
+                    description=response.content.description,
+                    instructions=response.content.instructions,
+                    validation=tuple(item.root for item in response.content.validation),
+                    package=package.reference,
+                    license=response.content.license,
+                    compatibility=response.content.compatibility,
+                    metadata=response.content.metadata or {},
+                    allowed_tools=response.content.allowed_tools,
+                )
+                validate_skill_projection_target(
+                    runtime_content,
+                    AgentSkillTarget(
+                        target_id="client",
+                        agent_kind=target.value,
+                        installation_scope="project",
+                        path=destination.parent,
+                        allow_managed_publish=True,
+                    ),
+                )
+                materialize_skill_package(package, destination)
+                exported = destination
     except ClientError as error:
         typer.echo(_error_message(error), err=True)
         raise typer.Exit(code=1) from error
@@ -727,18 +2029,107 @@ def _error_message(error: ClientError) -> str:
     return f"{error} (request ID: {error.request_id})"
 
 
-def _print_human_response(response: _ClientResponse) -> None:
+def _print_dream_response(response: DreamRun | DreamRunPage) -> None:
+    if isinstance(response, DreamRun):
+        outcome = response.error or (None if response.outcome is None else response.outcome.value)
+        typer.echo(f"{response.run_id}: {response.status.value}" + ("" if outcome is None else f" ({outcome})"))
+        if response.candidate is not None:
+            typer.echo(f"Candidate: {response.candidate.candidate_id}@{response.candidate.version}")
+        if response.reason:
+            typer.echo(response.reason)
+        return
+    if isinstance(response, DreamRunPage):
+        for run in response.runs:
+            _print_dream_response(run)
+        if response.next_cursor:
+            typer.echo(f"Next cursor: {response.next_cursor}")
+        return
+
+
+def _print_artifact_page(response: ArtifactPage) -> None:
+    if not response.items:
+        typer.echo("No Experience artifacts found.")
+    for item in response.items:
+        title = "" if item.title is None else f"  {item.title}"
+        typer.echo(f"{item.artifact_id}@{item.revision}{title}")
+        if item.summary:
+            typer.echo(f"  {item.summary}")
+    if response.next_cursor:
+        typer.echo(f"Next cursor: {response.next_cursor}")
+
+
+def _dump_json_response(response: _ClientResponse) -> bool:
+    if not isinstance(
+        response,
+        (
+            Candidate,
+            CandidateHistory,
+            CandidatePage,
+            ExperienceArtifact,
+            ExternalSkillResolution,
+            GeneratedCandidateResponse,
+            ListExternalSkillsResponse,
+            ScanExternalSkillsResponse,
+            SkillArtifact,
+            TopicMemoryProcessingBlock,
+            TopicMemoryProcessingStatus,
+            RetryTopicMemoryProcessingResponse,
+        ),
+    ):
+        return False
+    typer.echo(response.model_dump_json(indent=2))
+    return True
+
+
+def _print_scope_response(response: ScopeDescriptor | ScopePage | ScopeBinding | ClearScopeBindingResponse) -> None:
     match response:
-        case Capabilities():
-            typer.echo(f"Source types: {_items(response.source_types)}")
-            typer.echo(f"Artifact families: {_items(response.artifact_families)}")
-            typer.echo(f"Memory extraction: {'enabled' if response.memory_extraction else 'disabled'}")
-            typer.echo(f"Experience generation: {'enabled' if response.experience_generation else 'disabled'}")
-            typer.echo(f"Managed Skill generation: {'enabled' if response.managed_skill_generation else 'disabled'}")
-            typer.echo(f"External Skill Registry: {'enabled' if response.external_skill_registry else 'disabled'}")
-            typer.echo(f"Handoff generation: {'enabled' if response.handoff_generation else 'disabled'}")
-            typer.echo(f"Search modes: {_items(response.search_modes)}")
-            typer.echo(f"Context versions: {_items(response.context_versions)}")
+        case ScopeDescriptor():
+            _print_scope_descriptor(response)
+        case ScopePage():
+            if not response.items:
+                typer.echo("No Scopes found.")
+                return
+            for item in response.items:
+                _print_scope_descriptor(item)
+            if response.next_cursor is not None:
+                typer.echo(f"Next cursor: {response.next_cursor}")
+        case ScopeBinding():
+            key = response.key
+            typer.echo(f"Binding {key.integration}/{key.kind}/{key.external_id} -> {response.scope_id}")
+        case ClearScopeBindingResponse():
+            typer.echo("Binding cleared." if response.cleared else "Binding was not set.")
+
+
+def _print_scope_descriptor(response: ScopeDescriptor) -> None:
+    typer.echo(f"{response.scope_id}  {response.title} (version {response.version})")
+    if response.parent_scope_id is not None:
+        typer.echo(f"  Parent: {response.parent_scope_id}")
+    for reference in response.context_references:
+        typer.echo(f"  Context reference: {reference.root}")
+    for reference in response.external_references:
+        typer.echo(f"  External reference: {reference.kind}={reference.value}")
+
+
+def _print_human_response(response: _ClientResponse) -> None:
+    if isinstance(response, (DreamRun, DreamRunPage)):
+        _print_dream_response(response)
+        return
+    if isinstance(response, (ScopeDescriptor, ScopePage, ScopeBinding, ClearScopeBindingResponse)):
+        _print_scope_response(response)
+        return
+    if isinstance(response, (ListRemoteSkillTargetsResponse, RemoteSkillPublication, RemoteSkillTarget)):
+        _print_remote_response(response)
+        return
+    if _dump_json_response(response):
+        return
+    if isinstance(response, Capabilities):
+        _print_capabilities(response)
+        return
+    _print_service_response(response)
+
+
+def _print_service_response(response: _ClientResponse) -> None:
+    match response:
         case ReadinessResponse():
             typer.echo(f"Status: {response.status}")
             for name, status in sorted(response.checks.items()):
@@ -747,22 +2138,123 @@ def _print_human_response(response: _ClientResponse) -> None:
             typer.echo(f"Status: {response.status}")
         case ScopedStats():
             _print_stats(response)
-        case (
-            ArtifactCandidate()
-            | ArtifactCandidatePage()
-            | ExternalSkillResolution()
-            | GeneratedCandidateResponse()
-            | ListExternalSkillsResponse()
-            | ScanExternalSkillsResponse()
-        ):
-            typer.echo(response.model_dump_json(indent=2))
-        case SkillArtifact():
-            typer.echo(response.model_dump_json(indent=2))
+        case ArtifactPage():
+            _print_artifact_page(response)
+        case _:
+            return
+
+
+def _print_capabilities(response: Capabilities) -> None:
+    """Print Server capabilities, including extraction facts already in the response."""
+
+    typer.echo(f"Source types: {_items(response.source_types)}")
+    typer.echo(f"Artifact families: {_items(response.artifact_families)}")
+    typer.echo(f"Memory extraction: {'enabled' if response.memory_extraction else 'disabled'}")
+    _print_extraction_diagnostics(response.extraction)
+    typer.echo(f"Experience generation: {'enabled' if response.experience_generation else 'disabled'}")
+    typer.echo(f"Managed Skill generation: {'enabled' if response.managed_skill_generation else 'disabled'}")
+    typer.echo(f"External Skill Registry: {'enabled' if response.external_skill_registry else 'disabled'}")
+    typer.echo(f"Handoff generation: {'enabled' if response.handoff_generation else 'disabled'}")
+    typer.echo(f"Search modes: {_items(response.search_modes)}")
+    typer.echo(f"Context versions: {_items(response.context_versions)}")
+
+
+def _print_extraction_diagnostics(status: ExtractionStatus | None) -> None:
+    """Print extraction configuration, background state, and historical observations.
+
+    A missing status is unavailable. Unknown fields stay unknown. Success and failure
+    records are evidence from the observation window, not a current health verdict.
+    """
+
+    if status is None:
+        typer.echo("Extraction diagnostics: unavailable")
+        return
+    background = status.background
+    role = "absent" if background.role is None else background.role.value
+    if background.automatic_processing_enabled is None:
+        automatic_processing = "unknown"
+    elif background.automatic_processing_enabled:
+        automatic_processing = "enabled"
+    else:
+        automatic_processing = "disabled"
+    observation = status.observation
+    typer.echo(f"Extraction configuration: {status.configuration.value}")
+    typer.echo(
+        "Extraction background: "
+        f"location={background.location.value}, "
+        f"role={role}, "
+        f"state={background.state.value}, "
+        f"automatic processing={automatic_processing}"
+    )
+    typer.echo(f"Extraction observation: {observation.status.value} since {observation.since.isoformat()}")
+    if observation.last_success_at is not None:
+        typer.echo(f"Extraction last success: {observation.last_success_at.isoformat()}")
+    if observation.last_failure is not None:
+        failure = observation.last_failure
+        typer.echo(
+            f"Extraction last failure: {failure.code} at {failure.stage.value}, {failure.occurred_at.isoformat()}"
+        )
+
+
+def _print_remote_response(
+    response: ListRemoteSkillTargetsResponse | RemoteSkillPublication | RemoteSkillTarget,
+) -> None:
+    match response:
+        case ListRemoteSkillTargetsResponse():
+            _print_remote_skill_targets(response)
+        case RemoteSkillPublication():
+            typer.echo(
+                f"Remote publication {response.artifact_id}@{response.desired_revision} -> {response.target_id}: "
+                f"desired={response.desired_state.value}, state={response.state.value}, generation={response.generation}"
+            )
+            typer.echo("The target applies this desired state on its next remote-sync.")
+        case RemoteSkillTarget():
+            typer.echo(
+                f"Remote target {response.display_name} ({response.target_id}): state={response.state.value}, "
+                f"agent={response.agent_kind.value}, generation={response.generation}"
+            )
+
+
+def _print_remote_skill_targets(response: ListRemoteSkillTargetsResponse) -> None:
+    if not response.targets:
+        typer.echo("No remote Skill targets found.")
+        return
+    for index, status in enumerate(response.targets):
+        if index:
+            typer.echo("")
+        target = status.target
+        last_seen = "never" if target.last_seen_at is None else target.last_seen_at.isoformat()
+        installation = "not enrolled" if target.installation_id is None else target.installation_id
+        typer.echo(
+            f"Target {target.display_name} ({target.target_id}): state={target.state.value}, "
+            f"agent={target.agent_kind.value}, "
+            f"generation={target.generation}"
+        )
+        typer.echo(f"  Installation: {installation}; last seen: {last_seen}")
+        environment = " / ".join(value for value in (target.machine_hostname, target.workspace_name) if value)
+        typer.echo(f"  Environment: {environment or 'not reported'}")
+        if not status.publications:
+            typer.echo("  Publications: none")
+            continue
+        typer.echo("  Publications:")
+        for publication in status.publications:
+            if publication.observed_revision is not None:
+                observed = f"revision {publication.observed_revision}"
+            elif publication.state.value == "unpublished":
+                observed = "absent"
+            else:
+                observed = "not reported"
+            error = "" if publication.last_error_code is None else f", error={publication.last_error_code}"
+            typer.echo(
+                f"    {publication.artifact_id}: desired={publication.desired_state.value} "
+                f"revision {publication.desired_revision}, observed={observed}, "
+                f"state={publication.state.value}, generation={publication.generation}{error}"
+            )
 
 
 def _print_stats(response: ScopedStats) -> None:
     inventory = response.inventory
-    typer.echo(f"Scope: {response.scope_id}")
+    typer.echo(f"Selection: {response.selection.root.mode} ({len(response.scope_ids)} Scopes)")
     typer.echo(f"As of: {response.as_of.isoformat()}")
     typer.echo(
         "Sources: "
@@ -779,7 +2271,9 @@ def _print_stats(response: ScopedStats) -> None:
         f"{inventory.candidates.rejected} rejected"
     )
     entries = inventory.memory.entries
-    typer.echo(f"Memory entries: {entries.total} total, {entries.active} active, {entries.inactive} inactive")
+    typer.echo(f"Atomic memories: {entries.total} total, {entries.active} active, {entries.inactive} inactive")
+    if entries.inactive:
+        typer.echo("  Inactive includes forgotten, merged and retired memories.")
     period = response.usage.period
     typer.echo(f"Model usage: {period.start_date} to {period.end_date} ({period.timezone})")
     _print_model_usage("Generation", response.usage.totals.generation)
@@ -833,11 +2327,28 @@ def register_commands(cli: typer.Typer) -> set[str]:
     cli.command()(stats)
     cli.command()(live)
     cli.command()(ready)
+    cli.command("import-sessions")(import_sessions)
+    cli.add_typer(dream_app, name="dream")
+    cli.add_typer(topic_memory_app, name="topic-memory")
     cli.add_typer(candidate_app, name="candidate")
     cli.add_typer(experience_app, name="experience")
     cli.add_typer(skill_app, name="skill")
     cli.add_typer(external_skill_app, name="external-skill")
-    return {"capabilities", "stats", "live", "ready", "candidate", "experience", "skill", "external-skill"}
+    cli.add_typer(scope_app, name="scope")
+    return {
+        "capabilities",
+        "stats",
+        "live",
+        "ready",
+        "import-sessions",
+        "dream",
+        "topic-memory",
+        "candidate",
+        "experience",
+        "skill",
+        "external-skill",
+        "scope",
+    }
 
 
 __all__ = ["configure_client", "register_commands"]

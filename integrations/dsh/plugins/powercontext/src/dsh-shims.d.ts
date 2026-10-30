@@ -29,14 +29,10 @@ declare module '@deepseek-ai/schemastery' {
   export type { Schema }
 }
 
-declare module '@deepseek-ai/dsh-tools' {
-  export function defineTool(definition: Record<string, unknown>): unknown
-}
-
 declare module '@deepseek-ai/dsh-agent' {
   export type PreStepDecision =
     | { kind: 'reject' }
-    | { kind: 'enter'; messages: unknown[] }
+    | { kind: 'enter'; messages: unknown[]; startsRequestSeries?: true }
   export type Agent = {
     session: { header: { id: string; cwd?: string } }
   }
@@ -45,7 +41,10 @@ declare module '@deepseek-ai/dsh-agent' {
 declare module '@deepseek-ai/dsh-llm' {
   export function createUserMessage(input: {
     content: Array<{ type: 'text'; text: string }>
-    source: { kind: 'plugin'; plugin: string }
+    source: {
+      kind: 'plugin'; plugin: string; form: 'snapshot'
+      sections: Array<{ name: string; text: string }>
+    }
   }): unknown
 }
 

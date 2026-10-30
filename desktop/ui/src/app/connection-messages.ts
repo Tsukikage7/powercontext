@@ -1,0 +1,395 @@
+/*
+ * Copyright (c) 2026 OceanBase.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import type { CheckReport, DiscoveryResult } from "../generated/ipc";
+import type { operations } from "../generated/operations";
+import { operationSupported } from "./context";
+
+export const connectionMessages = {
+  zh: {
+    add: "添加连接",
+    savedConnections: "已保存连接",
+    selectHint: "选择配置后，可查看或修改连接信息。",
+    manageNote: "这里管理桌面连接，不修改 Server 的配置。",
+    name: "连接名称",
+    endpoint: "Server 地址",
+    endpointHint: "本机回环地址支持 HTTP，远程连接使用 HTTPS。",
+    authentication: "认证方式",
+    anonymous: "明确使用未认证的本机服务",
+    bearer: "Bearer 凭据",
+    secret: "新的 Bearer 凭据",
+    storage: "凭据保存方式",
+    persistent: "系统凭据存储",
+    session: "仅本次会话",
+    keep: "保留现有凭据",
+    credentialBlock: "访问凭据",
+    credentialNote: "凭据仅用于此连接，不提供明文读取。",
+    changeCredential: "更换凭据",
+    recentCheck: "最近验证",
+    serviceStatus: "服务状态",
+    actualIdentity: "实际身份",
+    ftsCapability: "全文检索",
+    readyOK: "已就绪",
+    available: "可用",
+    removeNote: "移除连接不会停止服务或删除业务数据。",
+    activeBadge: "当前连接",
+    notActiveBadge: "未启用",
+    ca: "显式 CA 证书（PEM，可选）",
+    systemTrust: "留空使用系统证书信任；不支持跳过证书校验。",
+    compatibility: "已验证兼容配置",
+    unselected: "未选择：仅检查连接",
+    availableProfiles: "此 Desktop 构建可用",
+    historicalProfiles: "历史验证记录：此构建不可用",
+    unavailableProfile: "此构建不可用",
+    profileContractMismatch:
+      "该配置的 API 契约与此 Desktop 构建不同。请选择可用配置，保存后重新检查连接。",
+    profileMissing:
+      "此 Desktop 未包含该兼容配置的验证记录。请选择可用配置，保存后重新检查连接。",
+    compatibilityHint:
+      "配置表示已测试的 Server 构建，不证明远端二进制身份。请先核对部署版本。",
+    discovery: "Server 发现",
+    discovery_supported: "发现协议受支持；操作仍需要已验证的兼容配置。",
+    discovery_missing:
+      "Server 未提供发现接口；仅可使用明确选择的旧版兼容配置已验证的操作。",
+    discovery_denied:
+      "Server 拒绝访问发现接口。请核对凭据与访问权限，然后重新检查连接。",
+    discovery_unavailable:
+      "Server 发现暂时不可用。请检查服务和网络，然后重新检查连接；兼容性确认前业务操作不可用。",
+    discovery_invalid:
+      "Server 发现响应无效。请核对 Server 构建，然后重新检查连接。",
+    discovery_incompatible: "Server 发现协议与此 Desktop 构建不兼容。",
+    discovery_product_mismatch: "该地址返回的不是 PowerContext Server。",
+    discovery_schema_version: "发现响应的 major 版本不受支持。",
+    discovery_api_version: "Server API 的 major 版本不受支持。",
+    operation_feature_missing:
+      "Server 未声明此操作所需的功能，请核对受支持的 Server 构建。",
+    operation_feature_version:
+      "此操作所需的功能版本不受支持，请核对 Server 构建。",
+    operation_missing: "Server 未声明支持此操作，其他已验证操作仍可使用。",
+    operation_qualification_required:
+      "所选兼容配置没有此操作的独立验证记录，请核对该操作支持的 Server 构建和兼容配置。",
+    operation_unverified:
+      "此连接的该项操作尚未验证，请核对 Server 支持情况和兼容配置。",
+    save: "保存配置",
+    check: "检查连接",
+    activate: "使用此连接",
+    active: "当前使用",
+    selected: "正在查看",
+    remove: "移除连接",
+    removeConfirm:
+      "只移除此桌面配置和自有凭据，不停止服务或删除业务数据。继续？",
+    cancel: "取消编辑",
+    discard: "丢弃尚未保存的输入？",
+    dirty: "尚未保存；保存后才能检查或使用。",
+    wait: "正在检查…",
+    saving: "正在保存…",
+    activating: "正在启用…",
+    removing: "正在移除…",
+    checkedComplete: "连接检查已完成，请核对下方各项结果。",
+    activationBlocked:
+      "连接尚不满足范围选择条件，请核对下方的兼容性和身份验证结果。",
+    saved: "配置已保存，尚未执行新的连接验证。",
+    not_required: "无需凭据",
+    stored: "已保存到系统凭据库",
+    session_only: "仅本次会话可用",
+    missing: "需要提供凭据",
+    cleanup: "部分旧凭据等待清理，重新启动后会再次尝试。",
+    live: "服务可达性",
+    readiness: "就绪状态",
+    identity: "服务返回的身份",
+    access: "访问控制",
+    capabilities: "服务声明的运行能力（不是授权列表）",
+    checked: "检查时间",
+    verified: "已验证",
+    unverified: "未验证",
+    noIdentity: "已明确使用未认证本机服务；Server 未提供 Principal。",
+    noPermissionClaim: "具体操作仍由 Server 在每次请求时授权。",
+    disconnect: "断开桌面连接",
+    scope: "选择精确范围",
+    scopeQuery: "按范围标题查找",
+    scopeListUnavailable: "范围查找不可用",
+    scopeSelectUnavailable: "范围选择不可用",
+    find: "查找范围",
+    more: "下一页",
+    empty: "本页没有可访问的范围。",
+    emptyScopeHint:
+      "可尝试其他标题、请管理员授予范围访问权限，或选择其他连接。",
+    currentScope: "当前范围",
+    scopeHint: "选择只影响此桌面，不创建范围或修改 Agent 绑定。",
+    noConnection: "连接并明确启用服务后，才能选择范围。",
+    noCompatibility: "请选择已验证的兼容配置并重新检查连接。",
+    compatibility_unverified: "请选择已验证的兼容配置并重新检查连接。",
+    not_connected: "请先启用连接。",
+    scope_required: "请先选择精确范围。",
+    error: "操作未完成，请检查连接或输入。",
+    credential_unavailable: "系统凭据库不可用。可明确选择仅本次会话，或取消。",
+    credential_missing: "请重新提供凭据；仅会话凭据会在退出后失效。",
+    unauthorized: "Server 要求有效凭据。",
+    forbidden: "当前身份无权执行此操作。",
+    authentication_unavailable: "认证服务暂时不可用；不会改用匿名身份重试。",
+    runtime_not_ready: "服务未提供此项运行能力。",
+    tls: "证书或主机名验证失败。",
+    redirect: "服务返回重定向，桌面未跟随。",
+    insecure_transport: "远程连接必须使用 HTTPS。",
+    invalid_endpoint: "地址无效或包含不允许的路径。",
+    invalid_certificate: "CA 证书无效，不能包含私钥。",
+    invalid_credential: "凭据无效；地址或信任变化后需要重新配置。",
+    invalid_input: "请检查输入内容和长度。",
+    duplicate_name: "已存在同名连接。",
+    conflict: "配置已变化，请重新打开后编辑。",
+    profile_corrupt:
+      "本地连接配置损坏，未覆盖原文件。请备份并检查 profiles.json。",
+    storage_error: "无法保存本地配置。",
+    stale_context: "连接或范围已变化，请重新操作。",
+    timeout: "请求超时。",
+    network: "无法连接服务。",
+    server: "服务暂时无法完成请求。",
+    response_too_large: "响应超过桌面允许的大小。",
+    invalid_response: "服务响应不符合已验证契约。",
+    busy: "已有操作正在进行，请稍后再试。",
+    not_found: "目标不存在或不可访问。",
+    cursor_expired: "分页已失效，请从第一页重新查找。",
+  },
+  en: {
+    add: "Add connection",
+    savedConnections: "Saved connections",
+    selectHint: "Select a configuration to view or edit its details.",
+    manageNote:
+      "This page manages Desktop connections; it does not change the Server.",
+    name: "Connection name",
+    endpoint: "Server address",
+    endpointHint:
+      "Loopback addresses allow HTTP; remote connections use HTTPS.",
+    authentication: "Authentication",
+    anonymous: "Explicitly use an unauthenticated loopback server",
+    bearer: "Bearer credential",
+    secret: "New Bearer credential",
+    storage: "Credential storage",
+    persistent: "System credential storage",
+    session: "This session only",
+    keep: "Keep existing credential",
+    credentialBlock: "Access credential",
+    credentialNote:
+      "The credential is used only for this connection and is never displayed.",
+    changeCredential: "Replace credential",
+    recentCheck: "Latest verification",
+    serviceStatus: "Service status",
+    actualIdentity: "Reported identity",
+    ftsCapability: "Full-text search",
+    readyOK: "Ready",
+    available: "Available",
+    removeNote:
+      "Removing a connection does not stop the service or delete business data.",
+    activeBadge: "Active",
+    notActiveBadge: "Inactive",
+    ca: "Explicit CA certificate (PEM, optional)",
+    systemTrust:
+      "Leave blank for system trust. Certificate verification cannot be disabled.",
+    compatibility: "Verified compatibility profile",
+    unselected: "Not selected: connection checks only",
+    availableProfiles: "Available for this Desktop build",
+    historicalProfiles: "Historical records: unavailable for this build",
+    unavailableProfile: "Unavailable for this build",
+    profileContractMismatch:
+      "This profile uses a different API contract from this Desktop build. Select an available profile, save, and check the connection again.",
+    profileMissing:
+      "This Desktop does not include a qualification record for this profile. Select an available profile, save, and check the connection again.",
+    compatibilityHint:
+      "A profile identifies a tested Server build, not the identity of the remote binary. Check your deployment version.",
+    discovery: "Server discovery",
+    discovery_supported:
+      "The discovery contract is supported; operations still require a verified compatibility profile.",
+    discovery_missing:
+      "The Server has no discovery endpoint; only operations verified by an explicitly selected legacy profile can be used.",
+    discovery_denied:
+      "Server discovery access was denied. Check credentials and access permissions, then check this connection again.",
+    discovery_unavailable:
+      "Server discovery is temporarily unavailable. Check the service and network, then check this connection again; business operations remain unavailable until compatibility is verified.",
+    discovery_invalid:
+      "The Server discovery response is invalid. Verify the Server build, then check this connection again.",
+    discovery_incompatible:
+      "Server discovery is incompatible with this Desktop build.",
+    discovery_product_mismatch:
+      "This address did not return a PowerContext Server.",
+    discovery_schema_version:
+      "The discovery response major version is unsupported.",
+    discovery_api_version: "The Server API major version is unsupported.",
+    operation_feature_missing:
+      "The Server does not declare the feature required for this operation. Check the supported Server build.",
+    operation_feature_version:
+      "The feature version required for this operation is unsupported. Check the Server build.",
+    operation_missing:
+      "The Server does not declare support for this operation. Other verified operations remain available.",
+    operation_qualification_required:
+      "The selected profile has no independent qualification for this operation. Check the Server build and profile verified for this operation.",
+    operation_unverified:
+      "This operation is unverified for this connection. Check Server support and the compatibility profile.",
+    save: "Save configuration",
+    check: "Check connection",
+    activate: "Use this connection",
+    active: "Currently active",
+    selected: "Viewing",
+    remove: "Remove connection",
+    removeConfirm:
+      "Remove only this Desktop configuration and its credentials, without stopping the service or deleting business data?",
+    cancel: "Cancel editing",
+    discard: "Discard unsaved input?",
+    dirty: "Unsaved changes: save before checking or activating.",
+    wait: "Checking…",
+    saving: "Saving…",
+    activating: "Activating…",
+    removing: "Removing…",
+    checkedComplete:
+      "Connection check complete. Review the individual results below.",
+    activationBlocked:
+      "The connection is not ready for scope selection. Review compatibility and identity verification below.",
+    saved: "Configuration saved; a new connection check has not run.",
+    not_required: "No credential required",
+    stored: "Stored in the system vault",
+    session_only: "Available for this session only",
+    missing: "Credential required",
+    cleanup: "Some old credentials await cleanup. Restart to try again.",
+    live: "Server reachability",
+    readiness: "Readiness",
+    identity: "Server-reported identity",
+    access: "Access control",
+    capabilities: "Server-declared capabilities (not granted permissions)",
+    checked: "Checked at",
+    verified: "Verified",
+    unverified: "Not verified",
+    noIdentity:
+      "Explicit unauthenticated loopback access; the Server does not provide a Principal.",
+    noPermissionClaim:
+      "The Server authorizes each actual operation independently.",
+    disconnect: "Disconnect Desktop",
+    scope: "Select an exact scope",
+    scopeQuery: "Find scopes by title",
+    scopeListUnavailable: "Scope search is unavailable",
+    scopeSelectUnavailable: "Scope selection is unavailable",
+    find: "Find scopes",
+    more: "Next page",
+    empty: "No accessible scopes on this page.",
+    emptyScopeHint:
+      "Try another title, request Scope access from an administrator, or choose another connection.",
+    currentScope: "Current scope",
+    scopeHint:
+      "Selection affects only Desktop, without creating scopes or changing Agent bindings.",
+    noConnection:
+      "Connect and explicitly activate a server before choosing a scope.",
+    noCompatibility:
+      "Select a verified compatibility profile and check the connection again.",
+    compatibility_unverified:
+      "Select a verified compatibility profile and check the connection again.",
+    not_connected: "Activate a connection first.",
+    scope_required: "Select an exact scope first.",
+    error: "The operation did not complete. Check the connection or input.",
+    credential_unavailable:
+      "The system vault is unavailable. Explicitly choose session-only storage or cancel.",
+    credential_missing:
+      "Provide a credential again. Session-only credentials expire when Desktop exits.",
+    unauthorized: "The Server requires a valid credential.",
+    forbidden: "This identity cannot perform this operation.",
+    authentication_unavailable:
+      "Authentication is temporarily unavailable. No anonymous retry was attempted.",
+    runtime_not_ready: "The Server does not provide this runtime capability.",
+    tls: "Certificate or hostname verification failed.",
+    redirect: "The Server returned a redirect; Desktop did not follow it.",
+    insecure_transport: "Remote connections require HTTPS.",
+    invalid_endpoint: "The address is invalid or contains an unsupported path.",
+    invalid_certificate:
+      "The CA certificate is invalid or contains a private key.",
+    invalid_credential:
+      "Invalid credential. Reconfigure it after address or trust changes.",
+    invalid_input: "Check the input and length limits.",
+    duplicate_name: "A connection with this name already exists.",
+    conflict: "Configuration changed. Reopen it before editing.",
+    profile_corrupt:
+      "Local connection configuration is corrupt and has not been overwritten. Back up and inspect profiles.json.",
+    storage_error: "Unable to save local configuration.",
+    stale_context: "The connection or scope changed. Try the operation again.",
+    timeout: "The request timed out.",
+    network: "Unable to reach the Server.",
+    server: "The Server cannot complete this request right now.",
+    response_too_large: "The response exceeds the Desktop size limit.",
+    invalid_response: "The response does not match the verified contract.",
+    busy: "Another operation is in progress. Try again shortly.",
+    not_found: "The target does not exist or is inaccessible.",
+    cursor_expired: "Pagination expired. Start again from the first page.",
+  },
+};
+export function connectionError(error: unknown, language: "zh" | "en"): string {
+  const text = connectionMessages[language];
+  const code = connectionErrorCode(error);
+  const key = code === "storage" ? "storage_error" : code;
+  return typeof key === "string" && Object.hasOwn(text, key)
+    ? text[key as keyof typeof text]
+    : text.error;
+}
+
+export function discoveryMessage(
+  result: DiscoveryResult,
+  language: "zh" | "en",
+): string {
+  const text = connectionMessages[language];
+  const reason = result.reason;
+  const detail =
+    reason === "product_mismatch" ||
+    reason === "schema_version" ||
+    reason === "api_version"
+      ? text[`discovery_${reason}`]
+      : null;
+  return [
+    text[`discovery_${result.status}`],
+    detail,
+    result.error && connectionError(result.error, language),
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+export function operationRestriction(
+  report: CheckReport | undefined,
+  operation: keyof typeof operations,
+  language: "zh" | "en",
+): string | null {
+  if (operationSupported(report, operation)) return null;
+  const text = connectionMessages[language];
+  const reason = report?.discovery?.operations[operation]?.reason;
+  switch (reason) {
+    case "feature_missing":
+      return text.operation_feature_missing;
+    case "feature_version":
+      return text.operation_feature_version;
+    case "operation_missing":
+      return text.operation_missing;
+    case "qualification_required":
+      return text.operation_qualification_required;
+    default:
+      return report?.discovery && report.discovery.status !== "supported"
+        ? discoveryMessage(report.discovery, language)
+        : text.operation_unverified;
+  }
+}
+
+export function connectionErrorCode(error: unknown): string | null {
+  const code =
+    typeof error === "string"
+      ? error
+      : error && typeof error === "object" && "code" in error
+        ? error.code
+        : null;
+  return typeof code === "string" ? code : null;
+}

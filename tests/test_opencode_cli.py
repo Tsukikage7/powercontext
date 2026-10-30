@@ -14,9 +14,11 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import socket
+import subprocess
 import sys
 import textwrap
 import time
@@ -26,20 +28,26 @@ import pytest
 from typer.testing import CliRunner
 
 from powercontext.cli.app import create_cli
+from powercontext.cli.installation import setup as install_plugin
 from powercontext.cli.system import SetupError, doctor_app, setup_app
+from tests.install_support import configure_opencode
 
 
 def _write_plugin(root: Path, *, built: bool = True) -> Path:
     plugin = root / "integrations" / "opencode" / "plugins" / "powercontext"
-    (plugin / "skills" / "project-context").mkdir(parents=True)
+    (plugin / "skills" / "powercontext-project-context").mkdir(parents=True)
     (plugin / "package.json").write_text('{"name": "powercontext-opencode"}', encoding="utf-8")
-    (plugin / "skills" / "project-context" / "SKILL.md").write_text(
-        "---\nname: project-context\ndescription: test\n---\n",
+    (plugin / "skills" / "powercontext-project-context" / "SKILL.md").write_text(
+        "---\nname: powercontext-project-context\ndescription: test\n---\n",
         encoding="utf-8",
     )
+    references = plugin / "skills" / "powercontext-project-context" / "references"
+    references.mkdir()
+    (references / "memory.md").write_text("Memory procedure", encoding="utf-8")
     if built:
         (plugin / "lib").mkdir()
         (plugin / "lib" / "index.js").write_text("export default {}\n", encoding="utf-8")
+        (plugin / "lib" / "tui.js").write_text("export default {}\n", encoding="utf-8")
     return plugin
 
 
@@ -117,6 +125,9 @@ def _write_probe_server(tmp_path: Path, mode: str) -> tuple[list[str], dict[str,
 
 def _assert_process_stopped(pid_path: Path) -> None:
     pid = int(pid_path.read_text(encoding="utf-8"))
+    if os.name == "nt":
+        _assert_windows_process_stopped(pid)
+        return
     for _ in range(100):
         try:
             os.kill(pid, 0)
@@ -126,12 +137,68 @@ def _assert_process_stopped(pid_path: Path) -> None:
     pytest.fail(f"probe process {pid} is still running")
 
 
-def test_setup_opencode_installs_plugin_and_owned_skill(tmp_path: Path, monkeypatch) -> None:
+def _assert_windows_process_stopped(pid: int) -> None:
+    if sys.platform != "win32":
+        pytest.fail("Windows process handles are only available on Windows")
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    # Query the PID published by the server, which can differ from Popen.pid
+    # when the Windows virtualenv launcher starts another Python process.
+    handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: the process no longer exists.
+            return
+        raise ctypes.WinError(error)
+    try:
+        result = kernel32.WaitForSingleObject(handle, 1000)
+        if result == 0xFFFFFFFF:  # WAIT_FAILED
+            raise ctypes.WinError(ctypes.get_last_error())
+        assert result == 0, f"probe process {pid} is still running"  # WAIT_OBJECT_0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process-handle semantics")
+def test_process_exit_assertion_rejects_a_live_windows_process(tmp_path: Path) -> None:
+    pid_path = tmp_path / "pid"
+    with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"]) as process:
+        pid_path.write_text(str(process.pid), encoding="utf-8")
+        try:
+            # Unlike POSIX, os.kill(pid, 0) can terminate a Windows process.
+            with pytest.raises(AssertionError, match="is still running"):
+                _assert_process_stopped(pid_path)
+            assert process.poll() is None
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
+
+def test_setup_opencode_installs_plugin_and_owned_skill(tmp_path: Path, monkeypatch, installed_agent_checks) -> None:
     import powercontext.cli.opencode as opencode_cli
 
     checkout = tmp_path / "checkout"
     plugin = _write_plugin(checkout)
     config = tmp_path / "config"
+    config.mkdir()
+    stale_tui = config / "plugins" / "powercontext-opencode-tui.js"
+    stale_tui.parent.mkdir()
+    stale_tui.write_text("export default {}\n", encoding="utf-8")
+    (stale_tui.parent / ".powercontext-opencode.json").write_text(
+        json.dumps({"schema": 1, "owner": "powercontext", "integration": "opencode-plugin"}), encoding="utf-8"
+    )
+    (config / "tui.json").write_text(
+        json.dumps({"$schema": "https://opencode.ai/tui.json", "plugin": ["@mem9/opencode", str(stale_tui)]}),
+        encoding="utf-8",
+    )
     monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
     monkeypatch.setattr(opencode_cli, "which", lambda _name: "/usr/bin/opencode")
     monkeypatch.setattr(opencode_cli, "_run_opencode", _fake_opencode(plugin, config))
@@ -145,125 +212,230 @@ def test_setup_opencode_installs_plugin_and_owned_skill(tmp_path: Path, monkeypa
 
     result = CliRunner().invoke(create_cli([setup_app]), ["setup", "opencode", "--source", str(checkout)])
 
-    skill = config / "skills" / "project-context"
+    skill = config / "skills" / "powercontext-project-context"
     assert result.exit_code == 0
-    assert "PowerContext OpenCode setup complete." in result.output
+    assert "opencode: ok" in result.output
     assert (config / "plugins" / "powercontext-opencode.js").is_file()
+    tui_config = json.loads((config / "tui.json").read_text(encoding="utf-8"))
+    assert tui_config["plugin"][0] == "@mem9/opencode"
+    assert not stale_tui.exists()
+    assert str(stale_tui) not in tui_config["plugin"]
+    assert str((plugin / "lib" / "tui.js").resolve()) in tui_config["plugin"]
     assert (skill / "SKILL.md").is_file()
+    assert (skill / "references" / "memory.md").read_text(encoding="utf-8") == "Memory procedure"
     assert json.loads((skill / ".powercontext.json").read_text(encoding="utf-8"))["owner"] == "powercontext"
 
 
-def test_remote_checkout_cache_is_scoped_by_source_and_resolved_commit(tmp_path: Path, monkeypatch) -> None:
+def _patch_opencode_runtime(tmp_path: Path, monkeypatch, plugin: Path, config: Path) -> None:
     import powercontext.cli.opencode as opencode_cli
 
-    commits = iter(["a" * 40, "b" * 40, "a" * 40])
-
-    def clone(_source: str, _ref: str, target: Path) -> None:
-        _write_plugin(target)
-
     monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
-    monkeypatch.setattr(opencode_cli, "clone_github_source", clone)
-    monkeypatch.setattr(opencode_cli, "_checkout_commit", lambda _target: next(commits), raising=False)
-
-    first = opencode_cli._materialize_remote_checkout("owner-a/repo", "master")
-    refreshed = opencode_cli._materialize_remote_checkout("owner-a/repo", "master")
-    other_source = opencode_cli._materialize_remote_checkout("owner-b/repo", "master")
-
-    assert first != refreshed
-    assert first != other_source
-    assert first.name == "a" * 40
-    assert refreshed.name == "b" * 40
-    assert other_source.name == "a" * 40
-    assert opencode_cli.checkout_target("owner-a/repo", "master", "a" * 40) == opencode_cli.checkout_target(
-        "git@github.com:OWNER-A/REPO.git", "master", "a" * 40
+    monkeypatch.setattr(opencode_cli, "which", lambda _name: "/usr/bin/opencode")
+    monkeypatch.setattr(opencode_cli, "_run_opencode", _fake_opencode(plugin, config))
+    monkeypatch.setattr(
+        opencode_cli,
+        "_run_opencode_probe",
+        lambda _command, env: Path(env["POWERCONTEXT_OPENCODE_ACTIVATION_PROBE_PATH"]).write_text(
+            env["POWERCONTEXT_OPENCODE_ACTIVATION_PROBE_NONCE"], encoding="utf-8"
+        ),
     )
 
 
-def test_remote_checkout_refresh_failure_keeps_previous_commit(tmp_path: Path, monkeypatch) -> None:
-    import powercontext.cli.opencode as opencode_cli
-
-    attempts = 0
-
-    def clone(_source: str, _ref: str, target: Path) -> None:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 2:
-            raise SetupError.git_clone_failed()
-        _write_plugin(target)
-
-    monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
-    monkeypatch.setattr(opencode_cli, "clone_github_source", clone)
-    monkeypatch.setattr(opencode_cli, "_checkout_commit", lambda _target: "a" * 40)
-
-    current = opencode_cli._materialize_remote_checkout("owner/repo", "master")
-    with pytest.raises(SetupError):
-        opencode_cli._materialize_remote_checkout("owner/repo", "master")
-
-    assert (current / "integrations" / "opencode" / "plugins" / "powercontext" / "package.json").is_file()
-    assert not list(current.parent.glob(".checkout-*"))
-
-
-def test_opencode_skill_refresh_replaces_only_an_owned_installation(tmp_path: Path) -> None:
-    import powercontext.cli.opencode as opencode_cli
-
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    first.mkdir()
-    second.mkdir()
-    (first / "SKILL.md").write_text("first\n", encoding="utf-8")
-    (second / "SKILL.md").write_text("second\n", encoding="utf-8")
-    target = tmp_path / "config" / "skills" / "project-context"
-
-    opencode_cli._install_skill(first, target)
-    opencode_cli._install_skill(second, target)
-
-    assert (target / "SKILL.md").read_text(encoding="utf-8") == "second\n"
-    assert not list(target.parent.glob(".project-context.*"))
-
-
-def test_interrupted_plugin_install_recovers_on_retry(tmp_path: Path, monkeypatch) -> None:
-    import powercontext.cli.opencode as opencode_cli
-
-    source = tmp_path / "index.js"
-    source.write_text("export default {}\n", encoding="utf-8")
-    target = tmp_path / "config" / "plugins" / "powercontext-opencode.js"
-    manifest = target.parent / ".powercontext-opencode.json"
-    real_replace = os.replace
-    replacements = 0
-
-    def interrupted_replace(first: Path, second: Path) -> None:
-        nonlocal replacements
-        replacements += 1
-        if replacements == 2:
-            raise OSError
-        real_replace(first, second)
-
-    monkeypatch.setattr(opencode_cli.os, "replace", interrupted_replace)
-    with pytest.raises(SetupError):
-        opencode_cli._install_plugin(source, target)
-
-    assert manifest.is_file()
-    assert not target.exists()
-    assert not list(target.parent.glob("*.tmp"))
-
-    monkeypatch.setattr(opencode_cli.os, "replace", real_replace)
-    opencode_cli._install_plugin(source, target)
-
-    assert target.read_text(encoding="utf-8") == "export default {}\n"
-    assert json.loads(manifest.read_text(encoding="utf-8")) == {
-        "schema": 1,
-        "owner": "powercontext",
-        "integration": "opencode-plugin",
-    }
-
-
-def test_setup_opencode_refuses_unowned_skill(tmp_path: Path, monkeypatch) -> None:
+def test_setup_opencode_appends_tui_plugin_to_jsonc_config_with_comments(
+    tmp_path: Path, monkeypatch, installed_agent_checks
+) -> None:
     import powercontext.cli.opencode as opencode_cli
 
     checkout = tmp_path / "checkout"
     plugin = _write_plugin(checkout)
     config = tmp_path / "config"
-    target = config / "skills" / "project-context"
+    config.mkdir()
+    stale_tui = config / "plugins" / "powercontext-opencode-tui.js"
+    stale_tui.parent.mkdir()
+    stale_tui.write_text("export default {}\n", encoding="utf-8")
+    (stale_tui.parent / ".powercontext-opencode.json").write_text(
+        json.dumps({"schema": 1, "owner": "powercontext", "integration": "opencode-plugin"}), encoding="utf-8"
+    )
+    (config / "tui.jsonc").write_text(
+        "// custom theme\n"
+        "{\n"
+        '  "$schema": "https://opencode.ai/tui.json",\n'
+        "  // keep this comment\n"
+        '  "plugin": ["@mem9/opencode", ' + json.dumps(str(stale_tui)) + ",], // trailing comment\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    _patch_opencode_runtime(tmp_path, monkeypatch, plugin, config)
+
+    result = CliRunner().invoke(create_cli([setup_app]), ["setup", "opencode", "--source", str(checkout)])
+
+    assert result.exit_code == 0
+    assert "opencode: ok" in result.output
+    assert (config / "plugins" / "powercontext-opencode.js").is_file()
+    assert not stale_tui.exists()
+    original = (config / "tui.jsonc").read_text(encoding="utf-8")
+    assert "// custom theme" in original
+    assert "// keep this comment" in original
+    assert "// trailing comment" in original
+    tui_config = json.loads(opencode_cli._strip_jsonc(original))
+    assert tui_config["plugin"][0] == "@mem9/opencode"
+    assert str((plugin / "lib" / "tui.js").resolve()) in tui_config["plugin"]
+    assert str(stale_tui) not in tui_config["plugin"]
+
+
+def test_setup_opencode_replaces_stale_checkout_tui_entries(
+    tmp_path: Path, monkeypatch, installed_agent_checks
+) -> None:
+    checkout = tmp_path / "checkout"
+    plugin = _write_plugin(checkout)
+    config = tmp_path / "config"
+    config.mkdir()
+    stale = (
+        tmp_path
+        / "data"
+        / "checkouts"
+        / "opencode"
+        / ("a" * 16)
+        / ("b" * 16)
+        / ("c" * 40)
+        / "integrations"
+        / "opencode"
+        / "plugins"
+        / "powercontext"
+        / "lib"
+        / "tui.js"
+    )
+    (config / "tui.json").write_text(
+        json.dumps({"$schema": "https://opencode.ai/tui.json", "plugin": ["@mem9/opencode", str(stale)]}),
+        encoding="utf-8",
+    )
+    _patch_opencode_runtime(tmp_path, monkeypatch, plugin, config)
+
+    result = CliRunner().invoke(create_cli([setup_app]), ["setup", "opencode", "--source", str(checkout)])
+
+    assert result.exit_code == 0
+    tui_config = json.loads((config / "tui.json").read_text(encoding="utf-8"))
+    assert tui_config["plugin"][0] == "@mem9/opencode"
+    assert str(stale) not in tui_config["plugin"]
+    assert str((plugin / "lib" / "tui.js").resolve()) in tui_config["plugin"]
+
+
+def test_setup_opencode_preserves_malformed_tui_entries(tmp_path: Path, monkeypatch, installed_agent_checks) -> None:
+    checkout = tmp_path / "checkout"
+    plugin = _write_plugin(checkout)
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "tui.json").write_text(
+        json.dumps({"$schema": "https://opencode.ai/tui.json", "plugin": ["http://[::1", "@mem9/opencode"]}),
+        encoding="utf-8",
+    )
+    _patch_opencode_runtime(tmp_path, monkeypatch, plugin, config)
+
+    result = CliRunner().invoke(create_cli([setup_app]), ["setup", "opencode", "--source", str(checkout)])
+
+    assert result.exit_code == 0
+    tui_config = json.loads((config / "tui.json").read_text(encoding="utf-8"))
+    assert tui_config["plugin"][0] == "http://[::1"
+    assert tui_config["plugin"][1] == "@mem9/opencode"
+    assert str((plugin / "lib" / "tui.js").resolve()) in tui_config["plugin"]
+
+
+def test_setup_opencode_keeps_tui_config_bytes_when_no_entry_changes(
+    tmp_path: Path, monkeypatch, installed_agent_checks
+) -> None:
+    checkout = tmp_path / "checkout"
+    plugin = _write_plugin(checkout)
+    config = tmp_path / "config"
+    config.mkdir()
+    _patch_opencode_runtime(tmp_path, monkeypatch, plugin, config)
+    command = ["setup", "opencode", "--source", str(checkout)]
+
+    first = CliRunner().invoke(create_cli([setup_app]), command)
+    before = (config / "tui.json").read_bytes()
+    second = CliRunner().invoke(create_cli([setup_app]), command)
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert (config / "tui.json").read_bytes() == before
+
+
+def test_setup_opencode_keeps_previous_install_when_tui_config_is_invalid(
+    tmp_path: Path, monkeypatch, installed_agent_checks
+) -> None:
+    checkout = tmp_path / "checkout"
+    plugin = _write_plugin(checkout)
+    config = tmp_path / "config"
+    config.mkdir()
+    plugins_dir = config / "plugins"
+    plugins_dir.mkdir()
+    previous_plugin = plugins_dir / "powercontext-opencode.js"
+    previous_plugin.write_text("export default {previous}\n", encoding="utf-8")
+    (plugins_dir / ".powercontext-opencode.json").write_text(
+        json.dumps({"schema": 1, "owner": "powercontext", "integration": "opencode-plugin"}), encoding="utf-8"
+    )
+    (config / "tui.json").write_text("{ not json", encoding="utf-8")
+    _patch_opencode_runtime(tmp_path, monkeypatch, plugin, config)
+
+    result = CliRunner().invoke(create_cli([setup_app]), ["setup", "opencode", "--source", str(checkout)])
+
+    assert result.exit_code == 1
+    assert "TUI config" in result.output
+    assert previous_plugin.read_text(encoding="utf-8") == "export default {previous}\n"
+    assert not (config / "skills" / "project-context").exists()
+
+
+def test_opencode_skill_refresh_replaces_only_an_owned_installation(tmp_path: Path, monkeypatch) -> None:
+    from powercontext.cli.guidance import END, RESOURCE_MANIFEST, START
+
+    first, second = _write_plugin(tmp_path / "first"), _write_plugin(tmp_path / "second")
+    for package, value in ((first, "first"), (second, "second")):
+        skill = package / "skills/powercontext-project-context"
+        (skill / "SKILL.md").write_text(f"{START}\n{value}\n{END}\n", encoding="utf-8")
+        (skill / "references/memory.md").unlink()
+        (skill / RESOURCE_MANIFEST).write_text(
+            json.dumps({"schema_version": 1, "resources": ["SKILL.md"]}), encoding="utf-8"
+        )
+    config = tmp_path / "config"
+    configure_opencode(monkeypatch, config)
+    install_plugin("opencode", source=str(first))
+    install_plugin("opencode", source=str(second))
+    target = config / "skills/powercontext-project-context"
+    assert (target / "SKILL.md").read_text(encoding="utf-8") == f"{START}\nsecond\n{END}\n"
+    assert not list(target.parent.glob(".powercontext-project-context.*"))
+
+
+def test_interrupted_plugin_install_recovers_on_retry(tmp_path: Path, monkeypatch) -> None:
+    package = _write_plugin(tmp_path / "source")
+    config = tmp_path / "config"
+    configure_opencode(monkeypatch, config)
+    target = config / "plugins/powercontext-opencode.js"
+    manifest = target.parent / ".powercontext-opencode.json"
+    real_replace = os.replace
+
+    def interrupted_replace(first, second):
+        if Path(second) == target:
+            raise OSError("publication failed")  # noqa: TRY003
+        return real_replace(first, second)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "replace", interrupted_replace)
+        with pytest.raises(SetupError):
+            install_plugin("opencode", source=str(package))
+    assert not target.exists()
+    assert not manifest.exists()
+    assert not list(config.rglob("*.tmp"))
+    install_plugin("opencode", source=str(package))
+    assert target.read_bytes() == (package / "lib/index.js").read_bytes()
+    assert json.loads(manifest.read_text()) == {"schema": 1, "owner": "powercontext", "integration": "opencode-plugin"}
+
+
+def test_setup_opencode_refuses_unowned_skill(tmp_path: Path, monkeypatch, installed_agent_checks) -> None:
+    import powercontext.cli.opencode as opencode_cli
+
+    checkout = tmp_path / "checkout"
+    plugin = _write_plugin(checkout)
+    config = tmp_path / "config"
+    target = config / "skills" / "powercontext-project-context"
     target.mkdir(parents=True)
     (target / "SKILL.md").write_text("user-owned\n", encoding="utf-8")
     monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
@@ -277,34 +449,6 @@ def test_setup_opencode_refuses_unowned_skill(tmp_path: Path, monkeypatch) -> No
     assert (target / "SKILL.md").read_text(encoding="utf-8") == "user-owned\n"
     assert not (config / "plugins" / "powercontext-opencode.js").exists()
     assert not (config / "plugins" / ".powercontext-opencode.json").exists()
-
-
-def test_activation_probe_uses_headless_server_without_model(tmp_path: Path, monkeypatch) -> None:
-    import powercontext.cli.opencode as opencode_cli
-
-    plugin = _write_plugin(tmp_path / "checkout")
-    config = tmp_path / "config"
-    observed: list[list[str]] = []
-
-    monkeypatch.setattr(opencode_cli, "which", lambda _name: "/usr/bin/opencode")
-    monkeypatch.setattr(opencode_cli, "_run_opencode", _fake_opencode(plugin, config))
-
-    def probe(command: list[str], env: dict[str, str]) -> None:
-        observed.append(command)
-        Path(env["POWERCONTEXT_OPENCODE_ACTIVATION_PROBE_PATH"]).write_text(
-            env["POWERCONTEXT_OPENCODE_ACTIVATION_PROBE_NONCE"], encoding="utf-8"
-        )
-
-    monkeypatch.setattr(opencode_cli, "_run_opencode_probe", probe)
-
-    output, activated = opencode_cli._probe_plugin_activation()
-
-    assert json.loads(output)["plugin"]
-    assert activated
-    assert len(observed) == 1
-    assert observed[0][:5] == ["/usr/bin/opencode", "serve", "--hostname", "127.0.0.1", "--port"]
-    assert int(observed[0][5]) > 0
-    assert "--model" not in observed[0]
 
 
 def test_run_opencode_probe_executes_request_waits_for_nonce_and_stops_process(tmp_path: Path) -> None:
@@ -333,7 +477,8 @@ def test_run_opencode_probe_times_out_and_stops_process(tmp_path: Path, monkeypa
     import powercontext.cli.opencode as opencode_cli
 
     command, env, _marker, pid_path = _write_probe_server(tmp_path, "timeout")
-    monkeypatch.setattr(opencode_cli, "_ACTIVATION_PROBE_TIMEOUT", 0.2)
+    # Give the Python child time to publish its PID before testing timeout cleanup.
+    monkeypatch.setattr(opencode_cli, "_ACTIVATION_PROBE_TIMEOUT", 2.0)
 
     with pytest.raises(SetupError, match="Cannot run"):
         opencode_cli._run_opencode_probe(command, env)
@@ -341,7 +486,7 @@ def test_run_opencode_probe_times_out_and_stops_process(tmp_path: Path, monkeypa
     _assert_process_stopped(pid_path)
 
 
-def test_setup_opencode_requires_built_bundle(tmp_path: Path, monkeypatch) -> None:
+def test_setup_opencode_requires_built_bundle(tmp_path: Path, monkeypatch, installed_agent_checks) -> None:
     import powercontext.cli.opencode as opencode_cli
 
     checkout = tmp_path / "checkout"
@@ -356,7 +501,7 @@ def test_setup_opencode_requires_built_bundle(tmp_path: Path, monkeypatch) -> No
     assert "lib/index.js" in result.output
 
 
-def test_setup_opencode_rejects_unsupported_version(tmp_path: Path, monkeypatch) -> None:
+def test_setup_opencode_rejects_unsupported_version(tmp_path: Path, monkeypatch, installed_agent_checks) -> None:
     import powercontext.cli.opencode as opencode_cli
 
     checkout = tmp_path / "checkout"
@@ -371,16 +516,25 @@ def test_setup_opencode_rejects_unsupported_version(tmp_path: Path, monkeypatch)
     assert "requires OpenCode v1.18.21" in result.output
 
 
-def test_doctor_opencode_reports_plugin_and_skill(tmp_path: Path, monkeypatch) -> None:
+def test_doctor_opencode_reports_plugin_when_another_plugin_writes_to_stdout(
+    tmp_path: Path, monkeypatch, server_checks
+) -> None:
     import powercontext.cli.opencode as opencode_cli
 
     plugin = _write_plugin(tmp_path / "checkout")
     config = tmp_path / "config"
-    skill = config / "skills" / "project-context"
-    opencode_cli._install_plugin(plugin / "lib" / "index.js", config / "plugins" / "powercontext-opencode.js")
-    opencode_cli._install_skill(plugin / "skills" / "project-context", skill)
+    configure_opencode(monkeypatch, config)
+    install_plugin("opencode", source=str(plugin))
     monkeypatch.setattr(opencode_cli, "which", lambda _name: "/usr/bin/opencode")
-    monkeypatch.setattr(opencode_cli, "_run_opencode", _fake_opencode(plugin, config))
+    fake_opencode = _fake_opencode(plugin, config)
+
+    def noisy(*arguments: str, env: dict[str, str] | None = None) -> str:
+        output = fake_opencode(*arguments, env=env)
+        if arguments == ("debug", "config"):
+            return f"[another-plugin] initialized\n{output}"
+        return output
+
+    monkeypatch.setattr(opencode_cli, "_run_opencode", noisy)
     monkeypatch.setattr(
         opencode_cli,
         "_run_opencode_probe",
@@ -392,18 +546,18 @@ def test_doctor_opencode_reports_plugin_and_skill(tmp_path: Path, monkeypatch) -
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "opencode", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.output)["hosts"]["opencode"]
     assert payload["checks"]["plugin"]["status"] == "ok"
     assert payload["checks"]["skill"]["status"] == "ok"
 
 
-def test_doctor_opencode_rejects_configured_but_inactive_plugin(tmp_path: Path, monkeypatch) -> None:
+def test_doctor_opencode_rejects_configured_but_inactive_plugin(tmp_path: Path, monkeypatch, server_checks) -> None:
     import powercontext.cli.opencode as opencode_cli
 
-    plugin = _write_plugin(tmp_path / "checkout")
+    plugin = _write_plugin(tmp_path / "checkout with spaces")
     config = tmp_path / "config"
-    skill = config / "skills" / "project-context"
-    opencode_cli._install_skill(plugin / "skills" / "project-context", skill)
+    configure_opencode(monkeypatch, config)
+    install_plugin("opencode", source=str(plugin))
     monkeypatch.setattr(opencode_cli, "which", lambda _name: "/usr/bin/opencode")
 
     def inactive(*arguments: str, env: dict[str, str] | None = None) -> str:
@@ -422,6 +576,6 @@ def test_doctor_opencode_rejects_configured_but_inactive_plugin(tmp_path: Path, 
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "opencode", "--json"])
 
     assert result.exit_code == 1
-    payload = json.loads(result.output)
+    payload = json.loads(result.output)["hosts"]["opencode"]
     assert payload["checks"]["plugin"]["status"] == "failed"
     assert "did not activate" in payload["checks"]["plugin"]["detail"]

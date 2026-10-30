@@ -16,38 +16,43 @@
 
 
 import { describe, expect, it } from "vitest";
-import { resolvePowerContextConfig, resolvePowerContextScope } from "./config.js";
+import { resolvePowerContextConfig } from "./config.js";
 import type { PowerContextClient } from "./http.js";
 import { PowerContextMemoryManager } from "./manager.js";
-import { encodeCitation, type MemoryCitation } from "./types.js";
+import { encodeCitation, type AtomicMemoryInput } from "./types.js";
 
-const citation: MemoryCitation = {
-  memory_ref: { family: "memory", artifact_id: "artifact-1", revision: 1 },
-  entry_id: "entry-1",
-  entry_version_id: "version-1",
+const reference: AtomicMemoryInput = {
+  artifact: { family: "atomic-memory", artifact_id: "artifact-1", revision: 1 },
+  state_version: 0,
 };
 
 describe("PowerContext memory manager", () => {
   it("keeps memory_get excerpts within the OpenClaw default budget", async () => {
     const client = {
-      async post() {
+      async post(path: string) {
+        if (path === "/v1/scope-bindings/resolve") {
+          return { scope_id: "scp_default" };
+        }
+        throw new Error(`unexpected POST ${path}`);
+      },
+      async get() {
         return {
-          citation,
-          version: 1,
-          kind: "fact",
-          text: Array.from({ length: 130 }, (_, index) => `line-${index + 1}`).join("\n"),
-          state: "active",
+          family: "atomic-memory",
+          artifact_id: "artifact-1",
+          revision: 1,
+          scope_id: "scp_default",
+          content: { kind: "fact", text: Array.from({ length: 130 }, (_, index) => `line-${index + 1}`).join("\n") },
         };
       },
     } as unknown as PowerContextClient;
     const manager = new PowerContextMemoryManager(
       "main",
-      () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       client,
       () => true,
     );
 
-    const result = await manager.readFile({ relPath: encodeCitation(citation) });
+    const result = await manager.readFile({ relPath: encodeCitation(reference) });
 
     expect(result.lines).toBe(120);
     expect(result.truncated).toBe(true);
@@ -56,40 +61,45 @@ describe("PowerContext memory manager", () => {
     expect(result.text).not.toContain("line-121");
   });
 
-  it("reads citations in the current project scope rather than a cached search scope", async () => {
-    const postBodies: Array<Record<string, unknown>> = [];
+  it("reads Atomic references in the resolved request Scope rather than a cached search Scope", async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
     const client = {
       async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-        postBodies.push(body);
+        requests.push({ path, body });
+        if (path === "/v1/scope-bindings/resolve") {
+          return { scope_id: "scp_search" } as T;
+        }
         if (path === "/v1/memory/search") {
           return {
-            memory: citation.memory_ref,
             mode: "fts",
-            hits: [{ citation, text: "remembered fact", score: 1, matched_by: ["fts"] }],
+            hits: [{ memory: {
+              artifact: { family: "atomic-memory", artifact_id: "artifact-1", revision: 1 },
+              state: "active", state_version: 0, merged_into_id: null, kind: "fact", text: "remembered fact",
+            }, score: 1 / 61, matched_by: ["text"] }],
           } as T;
         }
-        return { citation, version: 1, kind: "fact", text: "remembered fact", state: "active" } as T;
+        throw new Error(`unexpected POST ${path}`);
+      },
+      async get<T>(path: string): Promise<T> {
+        requests.push({ path, body: {} });
+        return { family: "atomic-memory", artifact_id: "artifact-1", revision: 1,
+          scope_id: "scp_current", content: { kind: "fact", text: "remembered fact" } } as T;
       },
     } as unknown as PowerContextClient;
-    const config = resolvePowerContextConfig(undefined, {
-      endpoint: "http://powercontext.test",
-      scopeMode: "project",
-    });
+    const config = resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" });
     const manager = new PowerContextMemoryManager("main", () => config, client, () => true);
-    const projectA = ["/workspace/project-a"];
-    const projectB = ["/workspace/project-b"];
 
     const [result] = await manager.search("fact", {
       sessionKey: "agent:main:telegram:direct:user-1",
-      activeProjectKeys: projectA,
+      activeProjectKeys: ["/workspace/project-a"],
     });
     await manager.readFile({
       relPath: result.path,
-      scopeId: resolvePowerContextScope("main", config, projectB),
+      scopeId: "scp_current",
     });
 
-    expect(postBodies.at(-1)).toMatchObject({
-      scope_id: resolvePowerContextScope("main", config, projectB),
+    expect(requests.at(-1)).toMatchObject({
+      path: "/v1/scopes/scp_current/artifacts/atomic-memory/artifact-1/revisions/1",
     });
   });
 });

@@ -1,24 +1,24 @@
 ---
-template: benchmark.html
-page_type: benchmark
-title: 评估测试
-description: PowerContext 在长程对话记忆与真实仓库软件工程评测中的表现。
-hide:
-  - navigation
-  - toc
+title: 基准测试
+description: 查看 PowerContext 的长期事实记忆、隐含认知约束记忆，以及上下文辅助代码任务的评测结果。
 benchmark:
   hero:
-    label: 评估测试证据
+    label: 产品评测
     title:
-      - 上下文压力测试
-    lead: 两项公开评测，分别检验长程记忆与真实仓库软件工程，并给出可核对的结果。
+      - 衡量上下文
+      - 带来的改变。
+    lead: LoCoMo 衡量长期对话的事实回忆；LoCoMo Plus 检验系统能否记住并运用隐含约束；SWE-bench Pro 衡量项目上下文能否帮助 Codex 解决更多代码仓库问题。
     actions_label: 跳转到具体评测
     actions:
-      - label: 查看 LoCoMo
+      - label: LoCoMo 结果
         target: locomo
-      - label: 查看 SWE-bench
+      - label: LoCoMo Plus 结果
+        target: locomo-plus
+      - label: SWE-bench Pro 结果
         target: swe-bench
-    visual_label: LoCoMo 与 SWE-bench Pro 评测的关键结果
+      - label: 方法与来源
+        target: methods
+    visual_label: LoCoMo 准确率与搜索 p95 延迟散点图
     results:
       - name: LoCoMo
         value: 90.78
@@ -35,22 +35,27 @@ benchmark:
         accessible: 任务解决率 86.73%
         metric: 开启 PowerContext 后的任务解决率
   orientation:
-    title: 两项评测，两个问题。
-    lead: Agent 先要找回发生过什么，再要把上下文用于真实工作。两项评测分别检验这两层能力。
+    title: 三项评测，三个问题。
+    lead: 从事实回忆、隐含约束到真实任务，分别检验上下文的不同作用。
     tests:
       - name: LoCoMo
         question: 系统能记住一段长期对话吗？
         answer: 评测直接回忆、时间推理、多步推理，以及结合对话证据的开放域回答。
         target: locomo
         link: 查看记忆评测
+      - name: LoCoMo Plus
+        question: 系统能在新问题中运用早先的隐含约束吗？
+        answer: 检验因果、状态、目标与价值约束在长对话中的保留和应用。
+        target: locomo-plus
+        link: 查看认知记忆评测
       - name: SWE-bench Pro
         question: Agent 能把上下文变成可用补丁吗？
         answer: 给 Codex 一个真实仓库和 Issue，再用可执行测试评判最终补丁。
         target: swe-bench
         link: 查看编码评测
   locomo:
-    title: LoCoMo 检验长程记忆。
-    lead: 公开数据集包含跨多个 Session 的长对话。PowerContext 在可回答问题集上接受评测，相关事实可能相隔很多轮对话。
+    title: LoCoMo：找回正确上下文
+    lead: LoCoMo 根据跨 Session 的长对话提问。PowerContext 需要先找到相关对话依据，再生成答案。本次结果覆盖类别 1 至 4，共 1,540 道计分题。
     facts:
       - label: 长对话
         value: "10"
@@ -72,8 +77,8 @@ benchmark:
       - name: 开放域问答
         count: "96"
         description: 结合对话证据与通用知识回答。
-    results_title: 同一次评测，三种上下文方式。
-    results_lead: 切换指标，对比 PowerContext、PowerMem，以及把完整对话直接放入 Prompt 的方式。
+    results_title: 准确率与检索开销
+    results_lead: 我们报告 PowerContext、PowerMem 和完整上下文 Prompt 的回答准确率、搜索 p95 延迟与回答 Token。
     tabs_label: LoCoMo 结果指标
     metrics:
       - id: accuracy
@@ -86,12 +91,15 @@ benchmark:
           - name: PowerContext
             display: 90.78%
             scale: 90.78
+            value: 90.78
           - name: PowerMem
             display: 87.79%
             scale: 87.79
+            value: 87.79
           - name: 完整上下文
             display: 52.9%
             scale: 52.9
+            value: 52.9
       - id: latency
         label: 搜索 p95
         callout: 12.4 倍
@@ -102,12 +110,15 @@ benchmark:
           - name: PowerContext
             display: 1.38 秒
             scale: 8.06
+            value: 1.38
           - name: PowerMem
             display: 1.44 秒
             scale: 8.41
+            value: 1.44
           - name: 完整上下文
             display: 17.12 秒
             scale: 100
+            value: 17.12
       - id: tokens
         label: 回答 Token
         callout: 减少 93.7%
@@ -118,17 +129,49 @@ benchmark:
           - name: PowerContext
             display: 约 1.65k
             scale: 6.35
+            value: 1650
           - name: PowerMem
             display: 约 0.9k
             scale: 3.46
+            value: 900
           - name: 完整上下文
             display: 26k
             scale: 100
+            value: 26000
     scope_title: 结果覆盖范围
     scope: 90.78% 来自类别 1-4 的 1,540 个问题，其中答对 1,398 个。该结果不代表 LoCoMo 的事件总结或多模态对话生成任务。
+  locomo_plus:
+    title: LoCoMo Plus：运用隐含的记忆约束
+    lead: 当新问题与早先线索并不相似，系统仍需要记住并运用用户的状态、目标、价值取向与因果背景。这里对比三个模型下，原生 PowerContext 与接入 Jev 候选筛选后的测试得分。
+    results_title: 项目方提供的得分：同模型，Jev 接入前后
+    provenance_note: 这六组分数由项目方提供，对应的运行清单、汇总、协议与模型/Judge 配置、运行哈希及原始输出尚未公开供复核。可复现说明针对评测工具，不代表这些具体分数已公开验证。
+    table_label: 三个模型下原生 PowerContext 与 PowerContext 加 Jev 的得分对比
+    best_label: 本组最高得分
+    gain_label: 最大得分差
+    points_label: 个百分点
+    columns:
+      model: 抽取与回答模型
+      baseline: 原生 PowerContext
+      jev: PowerContext + Jev
+      gain: 得分差
+    rows:
+      - model: GPT-4o-mini
+        baseline: 40.855
+        jev: 49.78
+      - model: Qwen3.7-plus
+        baseline: 60.37
+        jev: 68.947
+      - model: GPT-4o
+        baseline: 65.082
+        jev: 69.28
+    model_note: 每行模型同时用于 Memory 抽取与回答；Jev 用于检索后的候选筛选，不替换抽取或回答模型。
+    embedding_label: 向量模型
+    embedding_model: qwen3.7-text-embedding
+    embedding_dimensions: 1024 维
   swe:
-    title: 上下文能改善补丁结果吗？
-    lead: 每个任务都从真实代码库与 Issue 开始。Codex 修改仓库，再由任务自带的正式测试判断补丁是否解决问题。
+    title: SWE-bench Pro：把上下文转化为可用补丁
+    lead: 为了衡量 PowerContext 对结果的影响，我们用同一套 Codex 配置在 public v2 的 731 个任务上完成两次运行。两组仅改变是否启用 PowerContext。
+    task_count: 731
     method:
       - title: 相同任务集
         description: OFF 与 ON 都运行 public v2 的 731 个仓库问题。
@@ -150,21 +193,21 @@ benchmark:
     delta: "+32"
     delta_label: 个任务被额外解决
     delta_accessible: 开启 PowerContext 后多解决 32 个任务
-    caption: 在这次配对运行中，PowerContext ON 将任务解决率提高了 4.38 个百分点。
-    scope_title: 如何理解这组结果
-    scope: 这是 PowerContext 在固定 SWE-bench Pro public v2 数据集上的配对评测，不是官方排行榜提交。Agent 运行存在随机性，因此数字描述的是本次运行，而不是对所有运行的普遍保证。
+    caption: ON 运行解决 634 个任务，OFF 运行解决 602 个，相差 32 个任务，即 4.38 个百分点。
+    scope_title: 结果范围
+    scope: 这是一组固定任务集上的配对运行，不是 SWE-bench Pro 官方提交。Agent 运行存在随机性，因此分数只描述这两次运行。
   leaderboards:
-    title: 公开分数 PK 榜。
-    lead: 把 PowerContext 放进公开视野，同时把每个分数背后的评测装置讲清楚。
+    title: 与公开结果对照
+    lead: 汇集 LoCoMo、LoCoMo Plus 的公开评测结果，以及 SWE-bench Pro 官方 Public 榜单。各条目附有评测配置与来源链接。
     tabs_label: 选择评测榜单
-    updated: 数据核验于 2026 年 8 月 31 日
+    updated: LoCoMo / SWE-bench Pro：2026 年 8 月 31 日核验
     source_label: 查看来源
     locomo:
       id: locomo-rankings
-      tab: LoCoMo 公开声明
+      tab: LoCoMo
       count: 15 个系统
-      title: 完整 1,540 题 LoCoMo 分数
-      lead: 只收录明确披露完整 1,540 题范围的结果，同时保留 Reader、Judge 和答案判定策略的差异。
+      title: 已报告的 LoCoMo 分数
+      lead: 所选系统均报告了全部 1,540 个问题的分数，但 Reader、Judge 与答案匹配方式仍有差异。
       table_label: 15 个完成 1,540 题评测的 LoCoMo 公开分数索引
       columns:
         rank: 名次
@@ -172,8 +215,8 @@ benchmark:
         score: 分数
         protocol: 公开评测口径
         evidence: 证据类型
-      note_title: 统一题目范围，保留评测装置差异
-      note: 每一行都明确报告了全部 1,540 道计分题，未披露题目数或题目数不同的结果均已排除。其余结果仍使用不同的 Reader、Judge 和答案判定策略，因此这是公开证据索引，不是 LoCoMo 官方排行榜。
+      note_title: 对比限制
+      note: 每项引用结果都报告了全部 1,540 道计分题，但 Reader、Judge 与答案判定策略并未统一，因此这不是 LoCoMo 官方排行榜。
       rows:
         - rank: 1
           name: Zep
@@ -266,27 +309,80 @@ benchmark:
           protocol: 1,540 题；共享宽松评测工具
           evidence: 第三方实测
           source: https://github.com/buildingjoshbetter/TrueMemory/blob/main/benchmarks/locomo/BENCHMARK_RESULTS.md
+    locomo_plus:
+      tab: LoCoMo Plus
+      title: 公开 Cognitive 成绩
+      count: 8 个公开条目
+      updated: 2026 年 10 月 7 日核验
+      table_label: LoCoMo Plus Cognitive 公开得分与评测配置
+      score_label: Cognitive 得分
+      spotlight:
+        title: PowerContext · GPT-4o
+        model: GPT-4o
+        link_label: 查看三个模型完整对比
+      rows:
+        - name: T-Mem
+          score: 74.81%
+          evidence: T-Mem 论文 · 表 3
+          protocol: Cognitive；GPT-4.1-mini 构建；GPT-4o 回答；Gemini-2.5-Flash Judge
+          source: https://arxiv.org/html/2606.15405v1#S3.T3
+        - name: HyperMem
+          score: 48.63%
+          evidence: T-Mem 论文 · 表 3
+          protocol: Cognitive；T-Mem 论文中的基线实验
+          source: https://arxiv.org/html/2606.15405v1#S3.T3
+        - name: MemOS
+          score: 32.67%
+          evidence: T-Mem 论文 · 表 3
+          protocol: Cognitive；T-Mem 论文中的基线实验
+          source: https://arxiv.org/html/2606.15405v1#S3.T3
+        - name: Gemini-2.5-Pro
+          score: 26.06%
+          evidence: LoCoMo Plus 论文 · 表 1
+          protocol: Cognitive；完整上下文；Gemini-2.5-Flash Judge
+          source: https://aclanthology.org/2026.acl-long.1150.pdf#page=6
+        - name: GPT-4o
+          score: 21.05%
+          evidence: LoCoMo Plus 论文 · 表 1
+          protocol: Cognitive；完整上下文；Gemini-2.5-Flash Judge
+          source: https://aclanthology.org/2026.acl-long.1150.pdf#page=6
+        - name: A-Mem
+          score: 17.20%
+          evidence: LoCoMo Plus 论文 · 表 1
+          protocol: Cognitive；GPT-4o 回答；Gemini-2.5-Flash Judge
+          source: https://aclanthology.org/2026.acl-long.1150.pdf#page=6
+        - name: Mem0
+          score: 15.80%
+          evidence: LoCoMo Plus 论文 · 表 1
+          protocol: Cognitive；GPT-4o 回答；Gemini-2.5-Flash Judge
+          source: https://aclanthology.org/2026.acl-long.1150.pdf#page=6
+        - name: SeCom
+          score: 14.90%
+          evidence: LoCoMo Plus 论文 · 表 1
+          protocol: Cognitive；GPT-4o 回答；Gemini-2.5-Flash Judge
+          source: https://aclanthology.org/2026.acl-long.1150.pdf#page=6
     swe:
       id: swe-rankings
-      tab: SWE-bench Pro 官方榜
+      tab: SWE-bench Pro
       count: 25 个官方条目
-      title: 官方 Public 榜全部条目
-      lead: Scale 当前只公开 25 个模型实测，不是 30 个记忆产品。下表保留官方 Rank (UB)、解决率、置信区间和工具标记。
+      title: SWE-bench Pro Public 官方榜
+      lead: 图中展示五个官方条目及其置信区间。PowerContext 使用不同的运行协议，因此单独列出。
       table_label: 包含 25 个条目的 SWE-bench Pro 官方 Public 排行榜
       source: https://labs.scale.com/leaderboard/swe_bench_pro_public
-      note_title: 为什么 PowerContext 没有被插入官方名次
-      note: Scale 将 Rank (UB) 定义为：下置信界高于该结果上置信界的模型数量再加 1；星号表示 mini-swe-agent。PowerContext 是在同一 731 题 Public 集上完成的另一组 Codex 配对 A/B。86.73% 不是官方提交，不能直接插入此榜排名。
+      note_title: PowerContext 不是官方条目
+      note: Scale 使用置信区间对正式提交进行排名。PowerContext 在相同的 731 个 Public 任务上运行了另一组 Codex 配对测试。86.73% 不是官方提交，因此这里不为它分配名次。
       spotlight:
         label: PowerContext 配对实测
         value: 86.73%
         detail: PowerContext ON 解决 634 / 731 题
-        status: 不同协议，未进入官方排名
+        status: 不是官方排行榜条目
       columns:
-        rank: 官方名次
+        rank: 排名上界（Rank UB）
         system: 模型
         score: 解决率
         provider: 提供方
         harness: 评测工具
+      rank_note: 排名上界根据置信区间计算；区间重叠时会出现并列和跳号。
       harness_default: Scale 实测
       harness_star: mini-swe-agent
       rows:
@@ -441,32 +537,42 @@ benchmark:
         locomo: Judge 判定的答案准确率
         swe: 正式可执行测试是否通过
   sources:
-    title: 证据与评测方法
-    lead: 从原始论文、数据集、评测工具与 PowerContext 发布结果核对页面中的结论。
-    items:
-      - type: 论文
-        label: Evaluating Very Long-Term Conversational Memory of LLM Agents
-        href: https://aclanthology.org/2024.acl-long.747/
-        description: 定义 LoCoMo 与长程记忆任务的 ACL 2024 论文。
-      - type: 数据集
-        label: snap-research/locomo
-        href: https://github.com/snap-research/locomo
-        description: 包含十段长对话与标注的公开数据集。
-      - type: 评估测试
-        label: scaleapi/SWE-bench_Pro-os
-        href: https://github.com/scaleapi/SWE-bench_Pro-os
-        description: 公开评估测试仓库与正式评测路径。
-      - type: 评测工具
-        label: PowerContext evaluation console
-        href: https://github.com/oceanbase/powercontext/tree/master/evaluation
-        description: 固定数据集、OFF 与 ON 分组、隔离 Runner 和报告约束。
-      - type: 结果
-        label: PowerContext 已发布的评估测试数据
-        href: https://github.com/oceanbase/powercontext#benchmarks
-        description: 本页面使用的当前项目 README 数据。
+    title: 评测方法与来源
+    lead: 三项评测的方法依据与评测工具；模型、评分规则与数据范围必须一并阅读。
+    groups:
+      - id: locomo
+        title: LoCoMo
+        items:
+          - type: 论文与任务定义
+            label: Evaluating Very Long-Term Conversational Memory of LLM Agents
+            href: https://aclanthology.org/2024.acl-long.747/
+          - type: 数据集
+            label: snap-research/locomo
+            href: https://github.com/snap-research/locomo
+      - id: locomo-plus
+        title: LoCoMo Plus
+        items:
+          - type: 论文与任务定义
+            label: Beyond-Factual Cognitive Memory Evaluation Framework
+            href: https://arxiv.org/abs/2602.10715
+          - type: 固定版本数据与官方评测器
+            label: xjtuleeyf/Locomo-Plus · 059f4e3
+            href: https://github.com/xjtuleeyf/Locomo-Plus/tree/059f4e3d38f7f1f96765e8e2cb7de3097551bffb
+          - type: PowerContext 评测工具与评分说明
+            label: benchmark/locomo_plus · 87fceeb7
+            href: https://github.com/oceanbase/powercontext/tree/87fceeb7bbc703b6d2efa2003277e40b0fc2262b/benchmark/locomo_plus
+      - id: swe
+        title: SWE-bench Pro
+        items:
+          - type: 任务集与评测规范
+            label: scaleapi/SWE-bench_Pro-os
+            href: https://github.com/scaleapi/SWE-bench_Pro-os
+          - type: 本次运行配置
+            label: PowerContext evaluation console
+            href: https://github.com/oceanbase/powercontext/tree/master/evaluation
   cta:
-    title: 查看分数背后的系统。
-    lead: PowerContext 完全开源，可直接检查实现、评测工具与核心契约。
-    label: 前往 GitHub
+    title: 把 PowerContext 接入工作流
+    lead: 可以从受支持的 Agent 开始，也可以通过 HTTP API 接入自己的应用。仓库包含运行时、集成和评测工具。
+    label: 打开 GitHub 仓库
     href: https://github.com/oceanbase/powercontext
 ---

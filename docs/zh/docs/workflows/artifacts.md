@@ -1,0 +1,74 @@
+---
+title: 管理 Artifact
+description: 读取当前与历史版本，并按 Artifact 家族选择修改方式。
+---
+
+# 管理 Artifact
+
+Artifact 保存有版本的结果。Atomic Memory、Topic Memory、Experience、Skill、Handoff、Profile 和 Prompt 各自有不同的写入规则；
+共用 REST 外层结构不意味着可以互换这些工作流。
+
+## 创建和替换
+
+管理 Artifact 主要使用以下两个写接口。两者都会生成不可变 Revision，并返回新的 head 和 `ETag`：
+
+| 操作 | 路由 | 语义 |
+| --- | --- | --- |
+| Create | `POST /v1/scopes/{scope_id}/artifacts` | 按请求体中的 `family` 和 `content` 创建 Artifact 及 Revision 1。除 Handoff 外由服务端生成 `artifact_id`。 |
+| Replace | `PUT /v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}` | 完整替换指定 Artifact，生成下一条 Revision。必须使用当前 head 的 `If-Match`。 |
+
+请求体是按 `family` 判别的联合类型，不能把一个家族的内容提交给另一个家族。Atomic Memory 提交完整
+`kind`、`text` 正文；旧 `family=memory` 集合 Create/Replace 返回 `422 legacy_memory_operation_unsupported`。Handoff 是 Scope 内的单例：已存在时 Create 返回 `409`，应改用
+Replace。缺少 `If-Match` 返回 `428`，ETag 过期返回 `412`；接口不支持自动合并。
+
+## 查看当前内容和历史
+
+使用 [API 契约](../develop/http-api.md)中的 Scope 路由：
+
+| 操作 | 路由 |
+| --- | --- |
+| 列举一个家族 | `GET /v1/scopes/{scope_id}/artifacts/{family}` |
+| 读取当前 head | `GET /v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}` |
+| 列举版本 | `GET /v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}/revisions` |
+| 读取精确证据 | `GET /v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}/revisions/{revision}` |
+
+引用结果或向另一个 Agent 交付时，保留家族、Artifact ID 和精确 Revision。
+当前 head 可以前进，历史 Revision 保持不变。
+
+## 使用 Stable Handle 命名精确 Revision
+
+Stable Handle 为一个精确的 Artifact Revision 提供人类可读、Scope 内有效的名称。通过
+`PUT /v1/scopes/{scope_id}/artifact-handles/{family}/{key}` 创建绑定，并通过同一路由的 `GET` 解析绑定。
+
+绑定是永久的。`(scope_id, family, key)` 一旦提交，就不能更新、释放或删除。重复提交完全相同的绑定是幂等操作；
+将同一个 key 绑定到另一个 Artifact Revision 会返回 `409 Conflict`。绑定前应确认 family、Artifact ID、Revision
+和 key；如果错误绑定了某个 key，应改用新的 key。
+
+Artifact 的 `sources` 会保留每个来源的 `source_type` 和 `source_id`，包括 `note` 等动态注册的类型。
+读取列表、详情和历史版本时，应将 `source_type` 作为开放的 Source 名称处理。
+Source ID 会保留采集时接受的 Unicode 字符和内部空格，例如 `用户偏好` 和 `release notes`。
+Python Client 将该字段表示为字符串，请直接使用，不再访问枚举的 `.value`。
+
+完整的请求字段、响应模型和可调试的接口示例请参阅[完整 HTTP API 参考](/api/)。
+接口鉴权、并发控制和常用调用流程见 [HTTP API 使用说明](../develop/http-api.md)。
+Topic Memory 也使用上述通用接口：创建和整体替换提交完整的 `title`、`summary` 和 `detail`，内容不经过语义生成。
+它的专用搜索和范围化读取见[使用 Topic Memory](topic-memory.md)。
+
+## 检索相关的当前 head
+
+使用 `POST /v1/scopes/{scope_id}/artifacts/{family}/search` 在一个 Scope 内按相关性检索。
+内置入口支持 Experience、托管 Skill、Topic Memory 和 Atomic Memory，返回完整内容及精确 Revision；可选评分属于本次搜索响应。
+Family 支持范围、准入、阈值和故障行为见[检索 Artifact](search-artifacts.md)，Topic 和 Atomic 的 RRF 控制参数见[融合算法与参数](search-fusion.md)。
+
+## 按对应工作流修改
+
+- [Atomic Memory](atomic-memory.md)：创建、修订、遗忘、合并与恢复独立记忆。
+- [Topic Memory](topic-memory.md)：直接提交完整主题内容，或按精确 Revision 读取主题。
+- [Experience 与 Skill](experience-and-skill-lifecycle.md)：发布或导出前检查并批准 Candidate。
+- [Handoff](handoff-with-codex.md)：检查并提交当前工作边界。
+- [Prompt](manage-prompts.md)：在一个 Scope 内自定义操作提示词。
+- [标签](manage-artifact-tags.md)：组织逻辑 Artifact；旧 Memory entry target 可映射到迁移后的 Artifact。
+
+直接通过 REST 替换内容时，先读取当前 `ETag`，再通过 `If-Match` 发送。
+缺少前置条件返回 `428`，head 已过期返回 `412`。重新读取并协调内容后再重试。
+Candidate 审核使用独立的 `expected_version` 契约。两类操作都会检查所选目标的访问权限。

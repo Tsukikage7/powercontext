@@ -17,24 +17,65 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pydantic import BaseModel
 
-from powercontext import ArtifactNotFoundError, SourceConflictError
-from powercontext.builtin.artifacts.memory import MemoryCandidateRequest, MemoryEntryInput
+from powercontext import (
+    AdapterSourceDefinition,
+    Source,
+    SourceConflictError,
+    SourceDefinitionRegistry,
+    SourceMaterialization,
+)
+from powercontext.builtin.artifacts.atomic_memory.extraction import (
+    AtomicMemoryCandidate,
+    AtomicMemoryExtractionInput,
+    AtomicMemoryExtractionOutput,
+)
+from powercontext.builtin.inference import GenerationResult
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
+from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
-from powercontext.builtin.sources import ContentCapture, ContentSource, SourceCursor
+from powercontext.builtin.sources import BUILTIN_SOURCE_REGISTRY, ContentCapture, SourceCursor
+from tests.e2e.dream_support import atomic_memory_pipeline, memory_source_text
+
+
+class CustomCapture(BaseModel):
+    source_id: str
+    value: str
+
+
+class CustomSource(Source):
+    value: str
+
+
+class CustomSourceAdapter:
+    input_class = CustomCapture
+    name = "test-custom"
+    source_class = CustomSource
+
+    async def resolve(self, value: CustomCapture, /) -> CustomSource:
+        return CustomSource(
+            name=value.source_id,
+            materialization=SourceMaterialization.CAPTURED,
+            value=value.value,
+        )
+
+    async def read(self, source: CustomSource, /) -> str:
+        return source.value
 
 
 class EchoCandidatePipeline:
-    async def extract(self, request: MemoryCandidateRequest, /) -> tuple[MemoryEntryInput, ...]:
-        return tuple(
-            MemoryEntryInput(
-                kind="fact",
-                text=source.content,
-                sources=(source,),
+    async def generate(self, request: AtomicMemoryExtractionInput, /) -> GenerationResult[AtomicMemoryExtractionOutput]:
+        return GenerationResult(
+            output=AtomicMemoryExtractionOutput(
+                candidates=tuple(
+                    AtomicMemoryCandidate(
+                        kind="fact", text=text, evidence_ids=(source.evidence_id,), description="Fixture memory summary"
+                    )
+                    for source in request.evidence
+                    if (text := memory_source_text(source)) is not None
+                )
             )
-            for source in request.sources
-            if isinstance(source, ContentSource)
         )
 
 
@@ -44,14 +85,61 @@ class BlockingCandidatePipeline(EchoCandidatePipeline):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def extract(self, request: MemoryCandidateRequest, /) -> tuple[MemoryEntryInput, ...]:
+    async def generate(self, request: AtomicMemoryExtractionInput, /) -> GenerationResult[AtomicMemoryExtractionOutput]:
         self.started.set()
         await self.release.wait()
-        return await super().extract(request)
+        return await super().generate(request)
 
 
 class StateSaveFailure(RuntimeError):
     pass
+
+
+def test_provider_uses_one_injected_source_registry_for_routing_and_persistence() -> None:
+    async def scenario() -> None:
+        registry = SourceDefinitionRegistry((
+            *BUILTIN_SOURCE_REGISTRY.definitions,
+            AdapterSourceDefinition(CustomSourceAdapter()),
+        ))
+        async with open_builtin_contexts(
+            BuiltinConfig(database=SQLiteConfig()),
+            source_registry=registry,
+        ) as contexts:
+            context = await contexts.get("project")
+            source = await context.sources.resolve(CustomCapture(source_id="custom-1", value="typed value"))
+            stored = await context.sources.add(source)
+
+            assert isinstance(stored, CustomSource)
+            assert await context.sources.read(stored) == "typed value"
+            assert await context.sources.list() == (stored,)
+
+    asyncio.run(scenario())
+
+
+def test_lineage_only_source_remains_readable_but_is_skipped_by_memory_flush() -> None:
+    async def scenario() -> None:
+        async with open_builtin_contexts(
+            BuiltinConfig(database=SQLiteConfig()),
+            candidate_pipeline=atomic_memory_pipeline(EchoCandidatePipeline()),
+        ) as contexts:
+            context = await contexts.get("project")
+            created = await contexts.records.create_artifact(
+                "project",
+                "atomic-memory",
+                ArtifactWrite(
+                    content={"kind": "fact", "text": "Directly managed.", "description": "Fixture memory summary"}
+                ),
+            )
+            async with contexts.database.transaction() as connection:
+                stored = await contexts.repositories.sources.get(connection, "project", created.sources[0])
+
+            assert await context.sources.get(stored.value) == stored.value
+            flushed = await context.triggers.flush(limit=10)
+            assert flushed.source_count == 0
+            assert flushed.current_cursor == stored.journal_position
+            assert flushed.memory_ref is None
+
+    asyncio.run(scenario())
 
 
 def test_provider_translates_repository_source_identity_conflicts() -> None:
@@ -75,7 +163,7 @@ def test_source_window_artifact_and_cursor_are_one_transaction(
         pipeline = EchoCandidatePipeline()
         async with open_builtin_contexts(
             BuiltinConfig(database=SQLiteConfig()),
-            candidate_pipeline=pipeline,
+            candidate_pipeline=atomic_memory_pipeline(pipeline),
         ) as contexts:
             context = await contexts.get("project")
             await context.sources.capture(
@@ -92,16 +180,16 @@ def test_source_window_artifact_and_cursor_are_one_transaction(
                 await context.triggers.flush(limit=10)
 
             assert await context.triggers.cursor() == SourceCursor()
-            with pytest.raises(ArtifactNotFoundError):
-                await context.artifacts.memory.head("memory")
+            assert (await contexts.atomic_memory.for_scope("project").list()).items == ()
 
             monkeypatch.setattr(contexts.repositories.cursors, "save", original_save)
             result = await context.triggers.flush(limit=10)
             assert result.previous_cursor == 0
             assert result.current_cursor == 1
             assert result.source_count == 1
-            assert result.memory_ref is not None
-            assert result.memory_ref.revision == 1
+            assert result.memory_ref is None
+            memories = (await contexts.atomic_memory.for_scope("project").list()).items
+            assert len(memories) == 1 and memories[0].ref.revision == 1
             assert await context.triggers.cursor() == SourceCursor(sequence=1)
 
     asyncio.run(scenario())
@@ -112,7 +200,7 @@ def test_concurrent_capture_and_flush_preserve_monotonic_idempotent_behavior() -
         pipeline = EchoCandidatePipeline()
         async with open_builtin_contexts(
             BuiltinConfig(database=SQLiteConfig()),
-            candidate_pipeline=pipeline,
+            candidate_pipeline=atomic_memory_pipeline(pipeline),
         ) as contexts:
             context = await contexts.get("project")
 
@@ -130,9 +218,9 @@ def test_concurrent_capture_and_flush_preserve_monotonic_idempotent_behavior() -
             )
             assert sorted((first.source_count, second.source_count)) == [0, 12]
             assert await context.triggers.cursor() == SourceCursor(sequence=12)
-            memory = await context.artifacts.memory.head("memory")
-            assert memory.revision == 1
-            assert len(await context.artifacts.memory.entries(memory)) == 12
+            memories = (await contexts.atomic_memory.for_scope("project").list()).items
+            assert len(memories) == 12
+            assert all(memory.ref.revision == 1 for memory in memories)
 
     asyncio.run(scenario())
 
@@ -142,7 +230,7 @@ def test_candidate_inference_does_not_hold_the_database_transaction() -> None:
         pipeline = BlockingCandidatePipeline()
         async with open_builtin_contexts(
             BuiltinConfig(database=SQLiteConfig()),
-            candidate_pipeline=pipeline,
+            candidate_pipeline=atomic_memory_pipeline(pipeline),
         ) as contexts:
             context = await contexts.get("project")
             await context.sources.capture(ContentCapture(source_id="turn-1", content="first"))

@@ -18,15 +18,14 @@ import math
 
 import pytest
 
-from powercontext.builtin.artifacts.memory import MemoryChange, MemoryContent, MemoryManifest, MemoryManifestEntry
 from powercontext.builtin.artifacts.memory.canonical import (
     canonical_json,
     embedding_content_hash,
     entry_content_bytes,
     entry_content_hash,
-    memory_content_hash,
     normalize_embedding,
     normalize_kind,
+    normalize_query,
     normalize_reason,
     normalize_text,
     validate_embedding,
@@ -80,40 +79,6 @@ def test_entry_hash_covers_kind_text_and_both_evidence_sets() -> None:
     ).startswith(b'{"artifact_refs"')
 
 
-def test_memory_hash_covers_complete_manifest_and_change_summary() -> None:
-    entry = MemoryManifestEntry(
-        entry_id="entry-a",
-        entry_version_id="version-a1",
-        entry_content_hash="a" * 64,
-        state="active",
-    )
-    initial = MemoryContent(
-        manifest=MemoryManifest(entries=(entry,)),
-        changes=(
-            MemoryChange(
-                op="add",
-                entry_id="entry-a",
-                from_entry_version_id=None,
-                to_entry_version_id="version-a1",
-            ),
-        ),
-    )
-    restored = MemoryContent(
-        manifest=MemoryManifest(entries=(entry,)),
-        changes=(
-            MemoryChange(
-                op="reactivate",
-                entry_id="entry-a",
-                from_entry_version_id=None,
-                to_entry_version_id="version-a1",
-            ),
-        ),
-    )
-
-    assert memory_content_hash(initial) != memory_content_hash(restored)
-    assert len(memory_content_hash(initial)) == 64
-
-
 def test_limits_are_measured_after_normalization() -> None:
     assert normalize_text("  durable  ") == "durable"
     assert normalize_kind("  integration-kind  ") == "integration-kind"
@@ -129,6 +94,15 @@ def test_limits_are_measured_after_normalization() -> None:
         validate_identifier("记忆")
     with pytest.raises(ValueError, match="128"):
         validate_identifier("x" * 129)
+
+
+def test_retrieval_query_is_not_held_to_the_entry_body_byte_bound() -> None:
+    """The storage byte bound belongs to durable entry bodies, not transient queries."""
+
+    assert normalize_query("  quarterly review  ") == "quarterly review"
+    assert normalize_query("界" * 2731) == "界" * 2731
+    with pytest.raises(ValueError, match="non-empty"):
+        normalize_query("   ")
 
 
 def test_embedding_validation_rejects_wrong_or_non_finite_vectors() -> None:

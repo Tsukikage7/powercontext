@@ -1,5 +1,7 @@
 # PowerContext for LangChain
 
+`community`
+
 `powercontext-langchain` connects a LangChain `create_agent` application to a separately running PowerContext Server.
 It provides `PowerContextMiddleware`, which recalls bounded context before each model call and can capture the completed
 user/assistant turn as Source evidence after a successful agent run.
@@ -39,9 +41,12 @@ agent = create_agent(
 
 result = await agent.ainvoke(
     {"messages": [{"role": "user", "content": "How should we deploy this service?"}]},
-    context=PowerContextScope(scope_id="git:github.com/acme/api"),
+    context=PowerContextScope(scope_id="scp_01H..."),
 )
 ```
+
+If `scope_id` is omitted, the middleware uses the Server's default Scope. An explicit value must name an existing
+Server Scope. The adapter does not derive Scope IDs from the repository, working directory, Agent, or prompt.
 
 The middleware changes only the current model request, so recalled context never enters agent state or a checkpointer.
 Automatic capture is disabled by default. Enable it only when the application's transcript policy permits durable
@@ -49,3 +54,10 @@ storage of user and model content: `PowerContextMiddleware(auto_capture=True)`.
 
 Configuration uses `POWERCONTEXT_LANGCHAIN_BASE_URL`, `POWERCONTEXT_LANGCHAIN_TOKEN`,
 `POWERCONTEXT_LANGCHAIN_SCOPE_ID`, `POWERCONTEXT_LANGCHAIN_TIMEOUT`, and `POWERCONTEXT_LANGCHAIN_MAX_BYTES`.
+
+Non-loopback HTTP requires explicit consent: set `POWERCONTEXT_LANGCHAIN_ALLOW_INSECURE_HTTP=true` or
+`allow_insecure_http=True` on `PowerContextLangChainSettings` or `PowerContextScope`. HTTPS certificate validation
+remains enabled. Transport settings resolve from explicit values, host environment, common
+`POWERCONTEXT_CLIENT_SERVER_URL` / `POWERCONTEXT_CLIENT_ALLOW_INSECURE_HTTP`, then the `langchain` entry in
+`~/.config/powercontext/clients.json` (overridden by `POWERCONTEXT_CLIENT_CONFIG_FILE`). A host value of `false`
+overrides common `true`. Saved consent applies only to its saved Server URL; changing a run's URL does not reuse it.

@@ -18,6 +18,8 @@ import asyncio
 import json
 import logging
 import sqlite3
+from collections import Counter
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -26,12 +28,19 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from powercontext import PowerContext
+from powercontext.builtin.artifacts.atomic_memory.extraction import AtomicMemoryExtractionOutput
+from powercontext.builtin.inference import GenerationResult
+from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import (
+    BuiltinConfig,
     BuiltinRuntime,
+    CaptureSource,
     ExperienceIncubationResult,
     MemoryFlushResult,
     RuntimeCapabilities,
+    open_builtin_runtime,
 )
+from powercontext.builtin.runtime.application import ScheduledSourceProcessor
 from powercontext.builtin.runtime.scheduler import (
     EXPERIENCE_INCUBATION_JOB_ID,
     SOURCE_WINDOW_JOB_ID,
@@ -39,8 +48,12 @@ from powercontext.builtin.runtime.scheduler import (
     SchedulerStateError,
     scheduler_database_path,
 )
+from powercontext.builtin.scope import ScopeDescriptor, ScopeDraft
 from powercontext.builtin.sources import SourceCursor
+from powercontext.server.context import bind_request_id, current_request_id, reset_request_id
+from powercontext.server.logging import OperationalContextFilter
 from powercontext.server.tracing import ServerTracing
+from tests.e2e.dream_support import atomic_memory_pipeline
 
 
 class _Provider:
@@ -52,13 +65,18 @@ class _Provider:
         return self.context
 
 
+class _Scopes:
+    async def get(self, scope_id: str, /) -> ScopeDescriptor:
+        return ScopeDescriptor(scope_id=scope_id, title="Scheduled", summary="Scheduled scope", version=1)
+
+
 class _ScheduledTriggers:
     def __init__(self, *, source_count: int = 0) -> None:
         self.dispatched = asyncio.Event()
         self.source_count = source_count
 
-    async def flush(self, *, limit: int) -> MemoryFlushResult:
-        del limit
+    async def flush(self, *, limit: int, atomic_context=None) -> MemoryFlushResult:
+        del limit, atomic_context
         self.dispatched.set()
         return MemoryFlushResult(
             previous_cursor=0,
@@ -73,8 +91,8 @@ class _ScheduledTriggers:
 
 
 class _FailingTriggers:
-    async def flush(self, *, limit: int) -> MemoryFlushResult:
-        del limit
+    async def flush(self, *, limit: int, atomic_context=None) -> MemoryFlushResult:
+        del limit, atomic_context
         raise RuntimeError("flush failed")  # noqa: TRY003
 
     async def cursor(self) -> SourceCursor:
@@ -85,8 +103,8 @@ class _BlockingTriggers:
     def __init__(self) -> None:
         self.entered = asyncio.Event()
 
-    async def flush(self, *, limit: int) -> MemoryFlushResult:
-        del limit
+    async def flush(self, *, limit: int, atomic_context=None) -> MemoryFlushResult:
+        del limit, atomic_context
         self.entered.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
@@ -157,6 +175,7 @@ def _runtime(
         provider=_Provider(PowerContext(sources=object(), artifacts=object(), triggers=triggers)),  # type: ignore[arg-type]
         capabilities=RuntimeCapabilities(memory_extraction=True, memory_search_modes=("fts",)),
         scope_ids=scope_ids,
+        scope_application=_Scopes(),  # ty: ignore[invalid-argument-type]
         experience_incubator=experience_incubator,
         tracing=tracing,
     )
@@ -302,13 +321,46 @@ async def _private_scope_ids() -> tuple[str, ...]:
     return ("project:private-scheduled-scope",)
 
 
-def test_scheduled_processor_records_root_and_flush_spans() -> None:
+class _MemoryExtractor:
+    def __init__(self, *, fail=False):
+        self.fail = fail
+
+    async def generate(self, request):
+        if self.fail:
+            raise RuntimeError("flush failed")  # noqa: TRY003 - injected generation failure
+        return GenerationResult(output=AtomicMemoryExtractionOutput())
+
+
+@asynccontextmanager
+async def _memory_runtime(tmp_path, tracing, *, source_count=0, fail=False):
+    async with open_builtin_runtime(
+        BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'tracing.db'}")),
+        candidate_pipeline=atomic_memory_pipeline(_MemoryExtractor(fail=fail)),
+        tracing=tracing,
+    ) as runtime:
+        assert runtime.scopes is not None
+        scope = await runtime.scopes.create(
+            ScopeDraft(title="Private scheduled scope", summary="Scheduled processor trace", idempotency_key="trace")
+        )
+        for position in range(source_count):
+            await runtime.sources.for_scope(scope.scope_id).capture(
+                CaptureSource(source_id=str(position), content=f"Fact {position}", metadata={})
+            )
+
+        async def scope_ids():
+            return (scope.scope_id,)
+
+        runtime.processor = ScheduledSourceProcessor(runtime, scope_ids)
+        yield runtime
+
+
+def test_scheduled_processor_records_root_and_flush_spans(tmp_path) -> None:
     tracing, exporter = _tracing()
 
     async def scenario() -> None:
-        runtime = _runtime(_ScheduledTriggers(), tracing=tracing, scope_ids=_private_scope_ids)
-        assert runtime.processor is not None
-        await runtime.processor.run()
+        async with _memory_runtime(tmp_path, tracing) as runtime:
+            assert runtime.processor is not None
+            await runtime.processor.run()
 
     asyncio.run(scenario())
 
@@ -329,13 +381,13 @@ def test_scheduled_processor_records_root_and_flush_spans() -> None:
     assert "project:private-scheduled-scope" not in _scope_id_leak(exporter.get_finished_spans())
 
 
-def test_scheduled_processor_records_success_outcome() -> None:
+def test_scheduled_processor_records_success_outcome(tmp_path) -> None:
     tracing, exporter = _tracing()
 
     async def scenario() -> None:
-        runtime = _runtime(_ScheduledTriggers(source_count=3), tracing=tracing)
-        assert runtime.processor is not None
-        await runtime.processor.run()
+        async with _memory_runtime(tmp_path, tracing, source_count=3) as runtime:
+            assert runtime.processor is not None
+            await runtime.processor.run()
 
     asyncio.run(scenario())
 
@@ -348,13 +400,13 @@ def test_scheduled_processor_records_success_outcome() -> None:
     assert flush.attributes["powercontext.memory.flush.source_count"] == 3
 
 
-def test_scheduled_processor_records_failure_and_swallows_error() -> None:
+def test_scheduled_processor_records_failure_and_swallows_error(tmp_path) -> None:
     tracing, exporter = _tracing()
 
     async def scenario() -> None:
-        runtime = _runtime(_FailingTriggers(), tracing=tracing)
-        assert runtime.processor is not None
-        await runtime.processor.run()
+        async with _memory_runtime(tmp_path, tracing, source_count=1, fail=True) as runtime:
+            assert runtime.processor is not None
+            await runtime.processor.run()
 
     asyncio.run(scenario())
 
@@ -494,3 +546,50 @@ def test_scheduler_requires_file_storage_and_one_live_owner(tmp_path) -> None:
         await second.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("family", ["memory", "experience"])
+def test_scheduler_activation_drops_finished_startup_request(tmp_path, caplog, family) -> None:
+    context_filter = OperationalContextFilter()
+    caplog.handler.addFilter(context_filter)
+    caplog.set_level(logging.INFO, logger="powercontext.builtin.runtime.application")
+
+    async def scenario() -> None:
+        tracing, exporter = _tracing()
+        triggers = _ScheduledTriggers(source_count=1)
+        incubation = _ScheduledExperience()
+        runtime = _runtime(triggers, experience_incubator=incubation, tracing=tracing)
+        token = bind_request_id("finished-startup-request")
+        try:
+            runtime.start_scheduler(
+                tmp_path / "request-context.db",
+                0.02 if family == "memory" else None,
+                experience_schedule_seconds=0.02 if family == "experience" else None,
+            )
+        finally:
+            reset_request_id(token)
+        assert current_request_id() is None
+        try:
+            dispatched = triggers.dispatched if family == "memory" else incubation.dispatched
+            # Exercise multiple activations without assuming how many run before shutdown.
+            for _ in range(2):
+                await asyncio.wait_for(dispatched.wait(), timeout=3)
+                dispatched.clear()
+        finally:
+            await runtime.close()
+
+        records = [r for r in caplog.records if getattr(r, "event", None) == "background.operation.completed"]
+        assert records
+        assert all(r.outcome == "success" for r in records)
+        assert all(r.request_id is None for r in records)
+        roots = [s for s in exporter.get_finished_spans() if s.name.startswith("scheduled.")]
+        assert len(roots) >= 2 and all(s.parent is None for s in roots)
+        assert len({s.context.trace_id for s in roots}) == len(roots)
+        assert Counter((r.trace_id, r.span_id) for r in records) == Counter(
+            (format(s.context.trace_id, "032x"), format(s.context.span_id, "016x")) for s in roots
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        caplog.handler.removeFilter(context_filter)

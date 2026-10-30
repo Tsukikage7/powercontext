@@ -24,6 +24,8 @@ class InvalidRuntimeRequestError(PowerContextError, ValueError):
         self.code = code
         messages = {
             "since-revision": "since_revision is newer than the current Memory Revision",
+            "working-note-expiry-timezone": "expires_at must include a time zone",
+            "working-note-expiry-past": "expires_at must be in the future",
         }
         super().__init__(messages.get(code, f"invalid Runtime request: {code}"))
 
@@ -36,4 +38,15 @@ class PreparedContextInvariantError(PowerContextError, RuntimeError):
         super().__init__(f"Prepared Context invariant failed: {code}")
 
 
-__all__ = ["InvalidRuntimeRequestError"]
+class TopicMemoryProcessingUnavailableError(PowerContextError, RuntimeError):
+    """Raised when this deployment cannot process Topic Memory flushes."""
+
+    def __init__(self) -> None:
+        super().__init__("Topic Memory processing is not configured")
+
+
+__all__ = [
+    "InvalidRuntimeRequestError",
+    "PreparedContextInvariantError",
+    "TopicMemoryProcessingUnavailableError",
+]

@@ -23,7 +23,12 @@ from powercontext.builtin.artifacts.memory.models import (
     MemoryHit,
     MemoryMatchedBy,
 )
-from powercontext.builtin.artifacts.search import admits_fts_text
+from powercontext.builtin.artifacts.search import (
+    AdmissionFloor,
+    RecallChannelWeights,
+    admits_fts_text,
+    unit_l2_cosine_similarity,
+)
 
 _RRF_CONSTANT = 60
 _MIN_SEMANTIC_SIMILARITY = 0.3
@@ -34,26 +39,30 @@ _HitIdentity = tuple[str, int, str, str]
 def admit_fts_candidates(
     query: str,
     candidates: Sequence[MemoryChannelHit],
+    *,
+    admission: AdmissionFloor | None = None,
 ) -> tuple[MemoryChannelHit, ...]:
-    """Keep lexical candidates with enough distinct query-term evidence."""
+    """Keep lexical candidates with enough distinct query-term evidence.
 
-    return tuple(candidate for candidate in candidates if admits_fts_text(query, candidate.text))
+    ``admission=None`` reproduces today's behaviour bit for bit.
+    """
+
+    return tuple(candidate for candidate in candidates if admits_fts_text(query, candidate.text, floor=admission))
 
 
 def admit_vector_candidates(
     candidates: Sequence[MemoryChannelHit],
+    *,
+    admission: AdmissionFloor | None = None,
 ) -> tuple[MemoryChannelHit, ...]:
     """Keep unit-vector L2 candidates meeting the semantic similarity baseline."""
 
+    baseline = _MIN_SEMANTIC_SIMILARITY if admission is None else admission.min_semantic_similarity
     return tuple(
         candidate
         for candidate in candidates
-        if candidate.distance is not None and _unit_l2_cosine_similarity(candidate.distance) >= _MIN_SEMANTIC_SIMILARITY
+        if candidate.distance is not None and unit_l2_cosine_similarity(candidate.distance) >= baseline
     )
-
-
-def _unit_l2_cosine_similarity(distance: float) -> float:
-    return max(-1.0, min(1.0, 1.0 - distance**2 / 2.0))
 
 
 def fuse_rankings(
@@ -61,8 +70,13 @@ def fuse_rankings(
     fts: Sequence[MemoryChannelHit],
     vector: Sequence[MemoryChannelHit],
     limit: int,
+    channel_weights: RecallChannelWeights | None = None,
 ) -> tuple[MemoryHit, ...]:
-    """Fuse ordered channel candidates with reciprocal rank fusion."""
+    """Fuse ordered channel candidates with reciprocal rank fusion.
+
+    ``channel_weights=None`` is the historical unweighted behavior used by the
+    single-channel modes. A caller supplies weights only for hybrid search.
+    """
 
     if limit < 1:
         raise ValueError("memory search limit must be positive")  # noqa: TRY003
@@ -70,8 +84,16 @@ def fuse_rankings(
     candidates: dict[_HitIdentity, MemoryChannelHit] = {}
     scores: dict[_HitIdentity, float] = {}
     channels: dict[_HitIdentity, set[MemoryMatchedBy]] = {}
+    relevance: dict[_HitIdentity, float] = {}
 
+    weights: dict[MemoryMatchedBy, float] = {
+        "fts": 1.0 if channel_weights is None else channel_weights.fts,
+        "vector": 1.0 if channel_weights is None else channel_weights.vector,
+    }
     for channel, ranking in (("fts", fts), ("vector", vector)):
+        weight = weights[channel]
+        if weight == 0.0:
+            continue
         seen: set[_HitIdentity] = set()
         for rank, candidate in enumerate(ranking, start=1):
             identity = _identity(candidate)
@@ -79,8 +101,11 @@ def fuse_rankings(
                 continue
             seen.add(identity)
             candidates.setdefault(identity, candidate)
-            scores[identity] = scores.get(identity, 0.0) + 1.0 / (_RRF_CONSTANT + rank)
+            scores[identity] = scores.get(identity, 0.0) + weight / (_RRF_CONSTANT + rank)
             channels.setdefault(identity, set()).add(channel)
+            if channel == "vector" and candidate.distance is not None:
+                similarity = unit_l2_cosine_similarity(candidate.distance)
+                relevance[identity] = max(relevance.get(identity, -1.0), similarity)
 
     ordered = sorted(
         candidates,
@@ -99,6 +124,8 @@ def fuse_rankings(
             text=candidates[identity].text,
             score=scores[identity],
             matched_by=tuple(channel for channel in ("fts", "vector") if channel in channels[identity]),
+            score_upper_bound=sum(weights[channel] for channel in channels[identity]) / (_RRF_CONSTANT + 1),
+            relevance=relevance.get(identity),
         )
         for identity in ordered
     )

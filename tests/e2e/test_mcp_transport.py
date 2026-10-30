@@ -16,8 +16,10 @@ import asyncio
 from pathlib import Path
 
 import httpx
+import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from mcp.types import TextContent
 
 from powercontext.builtin.artifacts.handoff import (
     HandoffDraft,
@@ -38,6 +40,56 @@ class DeterministicHandoffPipeline:
             disposition="continuable",
             next_action=HandoffStatement(text="Pass the inspected Handoff to the next task.", citations=citations),
         )
+
+
+@pytest.mark.parametrize("report_format", ["json", "markdown"])
+def test_mcp_handoff_report_preserves_both_http_formats(tmp_path: Path, report_format: str) -> None:
+    app = create_server_app(
+        settings=ServerSettings(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'reports.db'}"))
+    )
+
+    def create_http_client(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+        **_: object,
+    ) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+            follow_redirects=True,
+        )
+
+    async def exercise_report() -> None:
+        transport = StreamableHttpTransport("http://testserver/mcp/", httpx_client_factory=create_http_client)
+        async with app.router.lifespan_context(app), create_http_client() as http, Client(transport) as client:
+            created = await client.call_tool(
+                "create_scope",
+                {"title": "Report formats", "summary": "Report transport acceptance", "idempotency_key": "reports"},
+            )
+            assert created.structured_content is not None
+            scope_id = created.structured_content["scope_id"]
+            payload = {"selection": {"mode": "exact", "scope_ids": [scope_id]}, "format": report_format}
+
+            response = await http.post("/v1/handoff-reports/get", json=payload)
+            response.raise_for_status()
+            result = await client.call_tool("get_handoff_report", payload)
+            assert not result.is_error
+            if report_format == "markdown":
+                assert response.headers["content-type"].startswith("text/markdown")
+                assert result.content
+                assert isinstance(result.content[0], TextContent)
+                assert "Report formats" in result.content[0].text
+                assert "Report formats" in response.text
+            else:
+                assert response.headers["content-type"].startswith("application/json")
+                assert result.structured_content is not None
+                assert result.structured_content.keys() == response.json().keys()
+
+    asyncio.run(exercise_report())
 
 
 def test_mcp_projects_curated_tools_at_the_configured_server_path(tmp_path: Path) -> None:
@@ -77,19 +129,56 @@ def test_mcp_projects_curated_tools_at_the_configured_server_path(tmp_path: Path
             include_inactive = projected_tools["list_memory_entries"].inputSchema["properties"]["include_inactive"]
             assert include_inactive["type"] == "boolean"
             assert include_inactive["default"] is False
+            created_scope = await client.call_tool(
+                "create_scope",
+                {
+                    "title": "MCP feature",
+                    "summary": "Scope resource path acceptance",
+                    "idempotency_key": "mcp-feature",
+                },
+            )
+            scope = created_scope.structured_content or {}
+            fetched_scope = await client.call_tool("get_scope", {"scope_id": scope["scope_id"]})
+            assert fetched_scope.structured_content == scope
+
             empty_list = await client.call_tool(
                 "list_memory_entries",
                 {
-                    "scope_id": "project:empty",
+                    "scope_id": scope["scope_id"],
                     "include_inactive": True,
                 },
             )
-            assert empty_list.structured_content == {"memory": None, "entries": []}
+            assert empty_list.structured_content == {"entries": [], "next_cursor": None}
+
+            assert "get_memory_capacity" not in projected_tools
+            assert "revise_memory_entry" not in projected_tools
+            assert "retire_memory_entry" not in projected_tools
+            written = await client.call_tool(
+                "remember_memory", {"scope_id": scope["scope_id"], "kind": "fact", "text": "Inspect capacity via MCP."}
+            )
+            before = await client.call_tool("list_memory_entries", {"scope_id": scope["scope_id"]})
+            assert written.structured_content is not None
+            assert len(written.structured_content["records"]) == 1
+            http_capacity = await http_client.post("/v1/memory/capacity", json={"scope_id": scope["scope_id"]})
+            assert http_capacity.status_code == 422
+            assert http_capacity.json()["error"]["code"] == "legacy_memory_operation_unsupported"
+            after = await client.call_tool("list_memory_entries", {"scope_id": scope["scope_id"]})
+            assert after.structured_content == before.structured_content
+
+            created_review_scope = await client.call_tool(
+                "create_scope",
+                {
+                    "title": "MCP review",
+                    "summary": "Candidate review tool acceptance.",
+                    "idempotency_key": "mcp-review",
+                },
+            )
+            review_scope_id = (created_review_scope.structured_content or {})["scope_id"]
 
             captured_response = await http_client.post(
                 "/v1/sources/content",
                 json={
-                    "scope_id": "project:review",
+                    "scope_id": review_scope_id,
                     "source_id": "task-1",
                     "content": "api-generate and contract-test passed",
                 },
@@ -98,7 +187,7 @@ def test_mcp_projects_curated_tools_at_the_configured_server_path(tmp_path: Path
             candidate_response = await http_client.post(
                 "/v1/experience/propose",
                 json={
-                    "scope_id": "project:review",
+                    "scope_id": review_scope_id,
                     "proposal": {
                         "situation": "The public OpenAPI contract changes.",
                         "action": "Regenerate the Client and run contract tests.",
@@ -113,9 +202,9 @@ def test_mcp_projects_curated_tools_at_the_configured_server_path(tmp_path: Path
             candidate = candidate_response.json()
 
             approved = await client.call_tool(
-                "approve_artifact_candidate",
+                "approve_candidate",
                 {
-                    "scope_id": "project:review",
+                    "scope_id": review_scope_id,
                     "candidate_id": candidate["candidate_id"],
                     "expected_version": candidate["version"],
                 },
@@ -127,30 +216,63 @@ def test_mcp_projects_curated_tools_at_the_configured_server_path(tmp_path: Path
     tools = asyncio.run(exercise_tools())
 
     assert tools == {
+        "generate_experience",
+        "get_experience",
+        "propose_experience",
+        "generate_skill",
+        "get_skill",
+        "propose_skill",
+        "list_managed_skills",
+        "scan_external_skills",
+        "list_external_skills",
+        "resolve_external_skill",
+        "import_external_skill",
         "acknowledge_handoff",
         "activate_handoff",
-        "approve_artifact_candidate",
+        "approve_candidate",
         "capture_content_source",
+        "capture_working_note",
+        "clear_scope_binding",
         "commit_handoff",
         "continue_handoff",
+        "prepare_handoff_hint",
+        "create_scope",
         "create_work_contract",
         "finalize_handoff",
-        "get_artifact_candidate",
+        "get_artifact",
+        "get_candidate",
+        "get_candidate_history",
+        "get_artifact_revision",
+        "get_atomic_memory_state",
         "get_handoff_report",
-        "get_handoff_report_workspace",
+        "get_scope",
         "get_memory_entry",
+        "get_recall_manifest",
+        "get_topic_memory",
         "handoff_current_work",
-        "list_artifact_candidates",
-        "list_handoff_report_known_scopes",
+        "create_dream_run",
+        "get_dream_run",
+        "list_dream_runs",
+        "list_candidates",
+        "list_atomic_memories",
         "list_memory_entries",
+        "list_scopes",
+        "merge_atomic_memories",
+        "change_atomic_memory_lifecycle",
+        "preview_atomic_memory_restoration",
+        "publish_artifact",
+        "query_code",
         "record_task_outcome",
-        "reject_artifact_candidate",
+        "resolve_scope_binding",
+        "reject_candidate",
         "remember_memory",
-        "retire_memory_entry",
-        "revise_artifact_candidate",
-        "revise_memory_entry",
+        "replace_artifact",
+        "restore_atomic_memory",
+        "revise_candidate",
+        "search_atomic_memory",
         "search_memory",
-        "select_handoff_workstream",
+        "search_topic_memory",
+        "set_scope_binding",
     }
 
 
@@ -184,10 +306,19 @@ def test_mcp_handoff_tools_share_one_source_to_artifact_lifecycle(tmp_path: Path
             httpx_client_factory=create_http_client,
         )
         async with app.router.lifespan_context(app), Client(transport) as client:
+            created_scope = await client.call_tool(
+                "create_scope",
+                {
+                    "title": "MCP Handoff",
+                    "summary": "Source-to-artifact Handoff lifecycle acceptance.",
+                    "idempotency_key": "mcp-handoff",
+                },
+            )
+            scope_id = (created_scope.structured_content or {})["scope_id"]
             captured_result = await client.call_tool(
                 "capture_content_source",
                 {
-                    "scope_id": "project:handoff",
+                    "scope_id": scope_id,
                     "source_id": "turn-1",
                     "content": "MCP must expose the same explicit lifecycle as the SDK.",
                 },
@@ -196,7 +327,7 @@ def test_mcp_handoff_tools_share_one_source_to_artifact_lifecycle(tmp_path: Path
             activation_result = await client.call_tool(
                 "activate_handoff",
                 {
-                    "scope_id": "project:handoff",
+                    "scope_id": scope_id,
                     "boundary_source": captured["source"],
                     "objective": "Transfer the MCP integration state.",
                 },
@@ -207,7 +338,7 @@ def test_mcp_handoff_tools_share_one_source_to_artifact_lifecycle(tmp_path: Path
             prepared_result = await client.call_tool(
                 "finalize_handoff",
                 {
-                    "scope_id": "project:handoff",
+                    "scope_id": scope_id,
                     "draft": draft,
                 },
             )
@@ -215,7 +346,7 @@ def test_mcp_handoff_tools_share_one_source_to_artifact_lifecycle(tmp_path: Path
             temporary_result = await client.call_tool(
                 "continue_handoff",
                 {
-                    "scope_id": "project:handoff",
+                    "scope_id": scope_id,
                     "selection": "prepared",
                     "prepared": prepared,
                 },
@@ -223,14 +354,14 @@ def test_mcp_handoff_tools_share_one_source_to_artifact_lifecycle(tmp_path: Path
             committed_result = await client.call_tool(
                 "commit_handoff",
                 {
-                    "scope_id": "project:handoff",
+                    "scope_id": scope_id,
                     "handoff": prepared,
                 },
             )
             latest_result = await client.call_tool(
                 "continue_handoff",
                 {
-                    "scope_id": "project:handoff",
+                    "scope_id": scope_id,
                     "selection": "latest",
                 },
             )

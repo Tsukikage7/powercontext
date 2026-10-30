@@ -1,0 +1,100 @@
+---
+title: 连接远程 Server
+description: 配置客户端地址，并在需要时明确允许非环回明文 HTTP。
+---
+
+# 连接远程 Server
+
+远程部署推荐使用 HTTPS。IPv4/IPv6 环回 HTTP（包括 `localhost`）默认可用；PowerContext 自己发起的其他 HTTP
+连接需要显式同意。内网 IP、VPN 地址仍是非环回地址，处于内网不等于 HTTP 已加密。
+
+## 使用引导安装
+
+PowerContext 工具与插件应使用同一份 source/ref。在运行 Agent 的机器上执行：
+
+```bash
+powercontext setup claude-code --source oceanbase/powercontext --ref master \
+  --server-url http://192.0.2.10:8000
+```
+
+交互终端中，setup 会说明明文风险并询问是否允许，直接回车代表拒绝。地址也可以来自该 Agent 的 URL 环境变量或
+`POWERCONTEXT_CLIENT_SERVER_URL`，setup 会先解析实际地址再判断是否需要确认。
+
+`--json` 或非交互终端不会提问。自动安装必须显式给出选择：
+
+```bash
+powercontext setup claude-code --server-url http://192.0.2.10:8000 --allow-insecure-http --json
+```
+
+`claude-code` 可替换为 `codex`、`dsh`、`openclaw`、`opencode`、`pi`、`hermes` 或 `workbuddy`。
+`setup codex dsh` 和 `config agent codex dsh` 也支持这两个选项，分别用于多 Agent 安装和已安装连接配置。
+拒绝或未提供同意时，在安装操作前退出。风险警告写入 stderr，不污染 stdout 的 JSON。
+安装成功后保存地址及同意状态，新会话无需重复手贴这两项配置；鉴权凭据仍需单独配置。
+
+## 配置与优先级
+
+配置文件为 `~/.config/powercontext/clients.json`，可用 `POWERCONTEXT_CLIENT_CONFIG_FILE` 指定其他位置。
+格式包含 `version: 1` 与 `hosts` 映射，每个 Agent 只保存 `server_url` 和 `allow_insecure_http`，不保存 Token。
+持久化同意绑定地址；切换到其他地址时，不会自动继承原地址的同意。
+
+setup 的优先级为：显式命令行选项 > Agent 环境变量 > 通用环境变量 > 已保存配置。
+运行时还可能读取宿主原生配置，具体 URL 来源以对应接入文档为准。显式 false 可以覆盖继承的 true。
+布尔环境变量支持 `true/false`、`1/0`、`yes/no`、`on/off`，无效值不会被当成允许。
+
+| 接入端 | 明文 HTTP 同意环境变量 |
+| --- | --- |
+| 所有 PowerContext 客户端 | `POWERCONTEXT_CLIENT_ALLOW_INSECURE_HTTP` |
+| Codex | `POWERCONTEXT_CODEX_ALLOW_INSECURE_HTTP` |
+| Claude Code | `POWERCONTEXT_CLAUDE_ALLOW_INSECURE_HTTP` |
+| DSH、Pi、OpenCode | `POWERCONTEXT_DSH_ALLOW_INSECURE_HTTP`、`POWERCONTEXT_PI_ALLOW_INSECURE_HTTP`、`POWERCONTEXT_OPENCODE_ALLOW_INSECURE_HTTP` |
+| OpenClaw、Hermes、WorkBuddy | `POWERCONTEXT_OPENCLAW_ALLOW_INSECURE_HTTP`、`POWERCONTEXT_HERMES_ALLOW_INSECURE_HTTP`、`POWERCONTEXT_WORKBUDDY_ALLOW_INSECURE_HTTP` |
+
+通用内容 CLI 的选项放在子命令前：
+
+```bash
+powercontext --server-url http://192.0.2.10:8000 --allow-insecure-http ready
+powercontext doctor --server-url http://192.0.2.10:8000 --allow-insecure-http
+powercontext doctor claude-code --json
+```
+
+doctor 对已同意的明文连接报告 `degraded`，退出码非零，保留风险提示。这条警告本身不表示安装失败或连接不通。
+
+## MCP、Hook 与升级边界
+
+Codex、Claude Code、WorkBuddy 的 setup 会同时配置原生 MCP 地址与 Hook 地址。
+Codex Hook 特意读取已安装插件中的 `.mcp.json`，插件升级覆盖该文件后需重新运行 setup。
+只修改 Hook 的 URL 环境变量，不能视为宿主原生 MCP 的地址也已修改。
+
+DSH setup 保留已有的界面、模型及其他无关 `cordis.patch.yml` 自定义配置。它使用已安装 DSH 的原生解析和合成接口，
+检查 PowerContext 的 `baseUrl` 与 `allowInsecureHttp`，并在安装前用实际待安装 bundle 检查原生安装器最终会启用的
+完整 bundle 组合，包括旧版 DSH 会重新启用的已安装但未启用的依赖。检查保留原有 bundle 顺序，遵循所选 CLI 的启用规则。
+配置一致时允许安装；会覆盖所选地址或 HTTP 同意状态的设置，需要先对齐或移除。
+检查不会改写用户 patch、启动插件或执行 `!!js`。动态 PowerContext 连接字段、被禁用或不唯一的插件条目，
+以及无法读取的 bundle 会明确报错。PowerContext 自身不兼容会阻止安装；如果所选 DSH 会跳过不兼容的第三方 bundle，
+setup 会告警并同样排除其 patch。用户明确授权的版本豁免仍保留这些 patch，其连接覆盖也会继续检查。
+其他插件的动态配置不会因此阻止安装。
+
+安装后，setup 会再次读取实际已启用的配置，验证通过才保存连接设置或凭据。若结果无法验证或与所选连接配置冲突，
+setup 会失败并保留原有连接设置；请在重启前检查已改动的 DSH profile。这项读回检查不会回滚原生包安装。
+独立 doctor 只检查当前已启用的 bundle。
+
+配置检查需要 Node.js，以及提供原生配置合成接口的 npm/pnpm DSH 安装。
+这些接口从所选 DSH 安装的 `@deepseek-ai/dsh-app-boot` 加载，该包由 DSH 自己声明依赖；PowerContext 不会向插件中
+安装另一份解析器来替代宿主。包或必需接口缺失时，会在安装前提示升级或重新安装 DSH。
+Profile 和凭据使用同一个 `DSH_HOME`；未设置、空值或纯空格均使用 `~/.dsh`。
+独立 CLI 只能观察所选配置文件和自身环境，无法观察运行中 DSH 会话额外的 `--patch` 参数或环境；请在该会话内运行 `/pc doctor`。
+对无法解析的原生配置组合（包括其他宿主未支持的 JSON5/include），doctor 会报告未知/失败，不会假定连接安全。
+
+MiniMax 和通用 Agent Plugin 由宿主负责 MCP 传输，没有单独的 PowerContext HTTP Client 或 setup 子命令；
+本选项不能绕过宿主自己的限制。LangChain、LangGraph、Pydantic AI 及 Bub 评测适配器支持客户端显式同意，
+但不会因此增加 Agent 安装器。
+
+## 安全边界
+
+该选项只允许明文 HTTP，不会关闭 HTTPS 证书校验，不会配置 Token、修改 Server 监听地址、开启 Dashboard，
+也不会绕过宿主 MCP 安全策略。传输中的 Token 与对话内容可能被读取或篡改；IP 白名单不是传输加密。
+
+远程访问仍应启用 Server 鉴权。Server 的监听安全检查与 Receiver 注册检查是独立机制，客户端选项不能代替它们。
+
+另一种方式是在 Agent 所在机器运行 `ssh -N -L 18000:127.0.0.1:8000 your-server`，再配置
+`http://127.0.0.1:18000`，无需允许非环回明文 HTTP。参见[部署 Server](deploy-server.md)。

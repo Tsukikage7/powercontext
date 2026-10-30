@@ -1,0 +1,91 @@
+{
+  "contractSha256": "fd8f5dcf8dfb1a02c186623c08c3c62217ecdbc21a80cd5d9c329f3497b85f7d",
+  "operations": {
+    "get_liveness": {
+      "method": "GET",
+      "path": "/health/live"
+    },
+    "get_readiness": {
+      "method": "GET",
+      "path": "/health/ready"
+    },
+    "get_server_info": {
+      "method": "GET",
+      "path": "/v1/server-info"
+    },
+    "get_capabilities": {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    "list_scopes": {
+      "method": "GET",
+      "path": "/v1/scopes"
+    },
+    "get_scope": {
+      "method": "GET",
+      "path": "/v1/scopes/{scope_id}"
+    },
+    "get_default_scope": {
+      "method": "GET",
+      "path": "/v1/scopes/default"
+    },
+    "remember_memory": {
+      "method": "POST",
+      "path": "/v1/memory/remember"
+    },
+    "search_memory": {
+      "method": "POST",
+      "path": "/v1/memory/search"
+    },
+    "get_artifact_revision": {
+      "method": "GET",
+      "path": "/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}/revisions/{revision}"
+    },
+    "get_access_principal": {
+      "method": "GET",
+      "path": "/v1/access/me"
+    }
+  },
+  "discovery": {
+    "apiMajor": 1,
+    "features": {
+      "access.principal": {
+        "major": 1,
+        "minor": 0
+      },
+      "scope.selection": {
+        "major": 1,
+        "minor": 0
+      },
+      "memory.explicit": {
+        "major": 1,
+        "minor": 0
+      }
+    },
+    "operationFeatures": {
+      "get_liveness": [],
+      "get_readiness": [],
+      "get_server_info": [],
+      "get_capabilities": [],
+      "list_scopes": [
+        "scope.selection"
+      ],
+      "get_scope": [
+        "scope.selection"
+      ],
+      "get_default_scope": [
+        "scope.selection"
+      ],
+      "remember_memory": [
+        "memory.explicit"
+      ],
+      "search_memory": [
+        "memory.explicit"
+      ],
+      "get_artifact_revision": [],
+      "get_access_principal": [
+        "access.principal"
+      ]
+    }
+  }
+}

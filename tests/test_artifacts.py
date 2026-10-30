@@ -28,8 +28,10 @@ from powercontext.artifacts import (
     ArtifactLineage,
     ArtifactRef,
     ArtifactStore,
+    StableHandle,
 )
 from powercontext.context import Artifacts
+from powercontext.limits import MAX_ARTIFACT_HANDLE_KEY_LENGTH
 from powercontext.sources import SourceRef
 
 
@@ -70,12 +72,13 @@ def test_artifact_is_a_fixed_family_snapshot_with_direct_lineage() -> None:
         ("", "artifact", 1, "family"),
         (" family", "artifact", 1, "family"),
         ("x" * 129, "artifact", 1, "family"),
-        ("memory", "", 1, "artifact_id"),
-        ("memory", " artifact", 1, "artifact_id"),
-        ("memory", "x" * 129, 1, "artifact_id"),
-        ("memory", "artifact", 0, "revision"),
-        ("memory", "artifact", -1, "revision"),
-        ("memory", "artifact", True, "revision"),
+        ("memory", "artifact", 1, "family"),
+        ("atomic-memory", "", 1, "artifact_id"),
+        ("atomic-memory", " artifact", 1, "artifact_id"),
+        ("atomic-memory", "x" * 129, 1, "artifact_id"),
+        ("atomic-memory", "artifact", 0, "revision"),
+        ("atomic-memory", "artifact", -1, "revision"),
+        ("atomic-memory", "artifact", True, "revision"),
     ],
 )
 def test_artifact_reference_rejects_invalid_identity(
@@ -87,6 +90,27 @@ def test_artifact_reference_rejects_invalid_identity(
     with pytest.raises(ValidationError) as error:
         ArtifactRef(family=family, artifact_id=artifact_id, revision=revision)
     assert error.value.errors()[0]["loc"][0] == field
+
+
+@pytest.mark.parametrize("key", ["a", "payment-retry-policy", "policy2", "a" * MAX_ARTIFACT_HANDLE_KEY_LENGTH])
+def test_stable_handle_accepts_canonical_keys(key: str) -> None:
+    assert StableHandle(family="profile", key=key).key == key
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["", "Payment-Retry-Policy", "payment_retry_policy", "-policy", "policy-", "policy--retry", "policy key"],
+)
+def test_stable_handle_rejects_noncanonical_keys(key: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        StableHandle(family="profile", key=key)
+    assert error.value.errors()[0]["loc"] == ("key",)
+
+
+def test_stable_handle_rejects_keys_over_the_length_limit() -> None:
+    with pytest.raises(ValidationError) as error:
+        StableHandle(family="profile", key="a" * (MAX_ARTIFACT_HANDLE_KEY_LENGTH + 1))
+    assert error.value.errors()[0]["loc"] == ("key",)
 
 
 @pytest.mark.parametrize(

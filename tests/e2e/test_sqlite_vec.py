@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import asyncio
 
-from powercontext.builtin.artifacts.memory import (
-    EmbeddingProfile,
-    MemoryEntryInput,
-)
+import pytest
+from sqlalchemy import func, select, update
+
+from powercontext.builtin.artifacts.memory import EmbeddingProfile
 from powercontext.builtin.inference import EmbeddingResult
+from powercontext.builtin.persistence.atomic_memory_index import AtomicMemoryIndexError
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
 
@@ -43,6 +44,9 @@ class _KeywordEmbeddingModel:
                 return (1.0, 0.0, 0.0)
             if "gamma" in normalized:
                 return (0.0, 0.0, 1.0)
+            if "delta" in normalized:
+                # Close to gamma, but never an exact match.
+                return (0.0, 0.1, 1.0)
             return (0.0, 1.0, 0.0)
 
         vectors = tuple(vector(text) for text in texts)
@@ -53,32 +57,130 @@ def test_sqlite_vec_supports_vector_and_hybrid_search(tmp_path) -> None:
     async def scenario() -> None:
         model = _KeywordEmbeddingModel()
         config = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}")
-        async with open_builtin_contexts(
-            BuiltinConfig(database=config),
-            embedding_model=model,
-        ) as contexts:
-            memory_service = (await contexts.get("project")).artifacts.memory
-            memory = await memory_service.remember(
-                memory=None,
-                entries=(
-                    MemoryEntryInput(kind="fact", text="Alpha semantic record."),
-                    MemoryEntryInput(kind="fact", text="Beta semantic record."),
+        async with open_builtin_contexts(BuiltinConfig(database=config), embedding_model=model) as contexts:
+            await contexts.get("project")
+            memory = contexts.atomic_memory.for_scope("project")
+            await contexts.records.create_atomic_memories(
+                "project",
+                (
+                    {"kind": "fact", "text": "Alpha semantic record."},
+                    {"kind": "fact", "text": "Beta semantic record."},
                 ),
-                mode="append",
             )
-            assert memory is not None
-            revised = await memory_service.remember(
-                memory=memory,
-                entries=(MemoryEntryInput(kind="fact", text="Gamma semantic record."),),
-                mode="append",
+            await contexts.records.create_atomic_memories(
+                "project", ({"kind": "fact", "text": "Gamma semantic record."},)
             )
-            assert revised is not None
-            vector = await memory_service.search("alpha", memories=(revised,), mode="vector")
-            hybrid = await memory_service.search("alpha", memories=(revised,), mode="hybrid")
-            gamma = await memory_service.search("gamma", memories=(revised,), mode="vector")
-
+            vector = await memory.search("alpha", mode="vector")
+            hybrid = await memory.search("alpha", mode="hybrid")
+            gamma = await memory.search("gamma", mode="vector")
             assert vector.hits[0].text == "Alpha semantic record."
-            assert hybrid.hits[0].matched_by == ("fts", "vector")
+            assert hybrid.hits[0].matched_by == ("text", "vector")
             assert gamma.hits[0].text == "Gamma semantic record."
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing-vector", "wrong-content-hash", "wrong-embedding-hash", "wrong-revision"],
+)
+def test_sqlite_vector_completeness_rejects_corrupt_projection(tmp_path, corruption: str) -> None:
+    async def scenario() -> None:
+        config = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / f'{corruption}.db'}")
+        async with open_builtin_contexts(
+            BuiltinConfig(database=config), embedding_model=_KeywordEmbeddingModel()
+        ) as contexts:
+            await contexts.get("project")
+            memory = contexts.atomic_memory.for_scope("project")
+            (created,) = await contexts.records.create_atomic_memories(
+                "project", ({"kind": "fact", "text": "Alpha semantic record."},)
+            )
+            table = contexts.atomic_memory.index.table
+            async with contexts.database.transaction() as connection:
+                values = (
+                    {"embedding": None, "profile_fingerprint": None, "embedding_input_hash": None}
+                    if corruption == "missing-vector"
+                    else {"content_hash": "0" * 64}
+                    if corruption == "wrong-content-hash"
+                    else {"embedding_input_hash": "0" * 64}
+                    if corruption == "wrong-embedding-hash"
+                    else {"revision": created.revision + 1}
+                )
+                await connection.execute(update(table).values(**values))
+            if corruption == "missing-vector":
+                assert not (await memory.search("alpha", mode="vector")).hits
+            else:
+                with pytest.raises(AtomicMemoryIndexError):
+                    await memory.search("alpha", mode="vector")
+        if corruption == "missing-vector":
+            with pytest.raises(AtomicMemoryIndexError, match="rebuild-projection"):
+                async with open_builtin_contexts(
+                    BuiltinConfig(database=config), embedding_model=_KeywordEmbeddingModel()
+                ):
+                    pass
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_vec_keeps_one_embedding_per_live_artifact_across_creates_and_revisions(tmp_path) -> None:
+    from powercontext.builtin.records import ArtifactWrite
+
+    async def scenario() -> None:
+        config = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}")
+        async with open_builtin_contexts(
+            BuiltinConfig(database=config), embedding_model=_KeywordEmbeddingModel()
+        ) as contexts:
+            await contexts.get("project")
+            (initial,) = await contexts.records.create_atomic_memories(
+                "project", ({"kind": "fact", "text": "Gamma semantic record."},)
+            )
+            for step in range(4):
+                await contexts.records.create_atomic_memories(
+                    "project", ({"kind": "fact", "text": f"Alpha record {step}."},)
+                )
+            await contexts.records.replace_artifact(
+                "project",
+                "atomic-memory",
+                initial.artifact_id,
+                '"revision:1"',
+                ArtifactWrite(content={"kind": "fact", "text": "Gamma revised semantic record."}),
+            )
+            table = contexts.atomic_memory.index.table
+            async with contexts.database.transaction() as connection:
+                metadata = await connection.scalar(select(func.count()).select_from(table))
+                vectors = await connection.scalar(select(func.count(table.c.embedding)))
+                assert (metadata, vectors) == (5, 5)
+                rows = (await connection.execute(select(table))).mappings().all()
+                assert all(len(row["embedding"]) == PROFILE.dimension * 4 for row in rows)
+                assert {row["artifact_id"]: row["revision"] for row in rows}[initial.artifact_id] == 2
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_vec_search_is_unaffected_by_writes_in_other_scopes(tmp_path) -> None:
+    async def scenario() -> None:
+        config = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'memory.db'}")
+        async with open_builtin_contexts(
+            BuiltinConfig(database=config), embedding_model=_KeywordEmbeddingModel()
+        ) as contexts:
+            await contexts.get("quiet")
+            await contexts.get("busy")
+            quiet = contexts.atomic_memory.for_scope("quiet")
+            await contexts.records.create_atomic_memories(
+                "quiet", ({"kind": "fact", "text": "Delta semantic record."},)
+            )
+            await contexts.records.create_atomic_memories(
+                "busy",
+                (
+                    {"kind": "fact", "text": "Gamma one."},
+                    {"kind": "fact", "text": "Gamma two."},
+                ),
+            )
+            for step in range(4):
+                await contexts.records.create_atomic_memories(
+                    "busy", ({"kind": "fact", "text": f"Alpha record {step}."},)
+                )
+            result = await quiet.search("gamma", mode="vector")
+            assert [hit.text for hit in result.hits] == ["Delta semantic record."]
 
     asyncio.run(scenario())

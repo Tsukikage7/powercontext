@@ -19,16 +19,17 @@ import asyncio
 import pytest
 from sqlalchemy import insert
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.artifacts import ArtifactRef
-from powercontext.builtin.persistence.artifacts import ArtifactRepository
+from powercontext.builtin.artifacts.topic_memory import TopicMemory, TopicMemoryContent, TopicMemoryDraft
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
 )
+from powercontext.builtin.runtime.relational import RelationalContexts
 from powercontext.errors import RevisionConflictError
-from powercontext.sources import SourceMaterialization, SourceRef
+from powercontext.sources import SourceDefinitionRegistry, SourceMaterialization, SourceRef
 from tests.builtin.persistence.contract import (
+    SOURCE_ADAPTERS,
     Handoff,
     HandoffContent,
     HandoffDraft,
@@ -98,6 +99,96 @@ def test_two_artifact_families_share_revisions_and_ordered_direct_lineage() -> N
     asyncio.run(scenario())
 
 
+def test_bulk_create_preserves_existing_artifact_lineage() -> None:
+    async def scenario() -> None:
+        async with repository_profile() as (profile, repositories), profile.database.transaction() as connection:
+            source = await repositories.sources.add(
+                connection,
+                "scope-a",
+                NoteSource(name="note-bulk", materialization=SourceMaterialization.CAPTURED, body="Evidence"),
+            )
+            report = await repositories.artifacts.create(
+                connection,
+                "scope-a",
+                "report-existing",
+                ReportDraft(content=ReportContent(status="green")),
+            )
+            items = []
+            for index in range(2):
+                artifact_id = f"handoff-bulk-{index}"
+                draft = HandoffDraft(
+                    content=HandoffContent(summary=f"Ready {index}"),
+                    sources=(source.ref,),
+                    artifacts=(report.as_ref(),),
+                )
+                items.append((artifact_id, draft, None))
+            created = await repositories.artifacts.create_many(connection, "scope-a", items)
+            loaded = await repositories.artifacts.get_many(
+                connection, "scope-a", tuple(artifact.as_ref() for artifact in created)
+            )
+            assert all(artifact.lineage.sources == (source.ref,) for artifact in loaded)
+            assert all(artifact.lineage.artifacts == (report.as_ref(),) for artifact in loaded)
+
+    asyncio.run(scenario())
+
+
+def test_relational_contexts_persist_topic_memory_revisions_and_exact_lineage() -> None:
+    async def scenario() -> None:
+        async with repository_profile() as (profile, repositories):
+            contexts = RelationalContexts(
+                database=profile.database,
+                source_registry=SourceDefinitionRegistry.from_adapters(SOURCE_ADAPTERS),
+            )
+            source = NoteSource(
+                name="note-1",
+                materialization=SourceMaterialization.CAPTURED,
+                body="Supervisor recovery evidence",
+            )
+            async with profile.database.transaction() as connection:
+                stored_source = await repositories.sources.add(connection, "scope-a", source)
+                original = await contexts.repositories.artifacts.create(
+                    connection,
+                    "scope-a",
+                    "topic-1",
+                    TopicMemoryDraft(
+                        content=TopicMemoryContent(
+                            title="Supervisor recovery",
+                            summary="The new leader resumes persisted pending work.",
+                            detail="The lease generation fences stale workers.",
+                        ),
+                        sources=(stored_source.ref,),
+                    ),
+                )
+                revised = await contexts.repositories.artifacts.revise(
+                    connection,
+                    "scope-a",
+                    original,
+                    TopicMemoryDraft(
+                        content=TopicMemoryContent(
+                            title="Supervisor recovery",
+                            summary="The new leader restores each binding's deadline.",
+                            detail="Persisted completion time prevents an early automatic wave.",
+                        ),
+                        sources=(stored_source.ref,),
+                        artifacts=(original.as_ref(),),
+                    ),
+                )
+
+                assert type(original) is TopicMemory
+                assert type(revised) is TopicMemory
+                assert revised.revision == 2
+                assert revised.lineage.sources == (stored_source.ref,)
+                assert revised.lineage.artifacts == (original.as_ref(),)
+                assert await contexts.repositories.artifacts.revisions(
+                    connection,
+                    "scope-a",
+                    "topic-memory",
+                    "topic-1",
+                ) == (original, revised)
+
+    asyncio.run(scenario())
+
+
 def test_stale_artifact_revision_fails_optimistic_head_cas() -> None:
     async def scenario() -> None:
         async with (
@@ -126,46 +217,6 @@ def test_stale_artifact_revision_fails_optimistic_head_cas() -> None:
 
             assert error.value.artifact == original
             assert error.value.current == current
-
-    asyncio.run(scenario())
-
-
-def test_lifecycle_committed_after_the_head_read_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def scenario() -> None:
-        async with (
-            repository_profile() as (profile, repositories),
-            profile.database.transaction() as connection,
-        ):
-            winner = await repositories.artifacts.create(
-                connection,
-                "scope-a",
-                "handoff-1",
-                HandoffDraft(content=HandoffContent(summary="winner")),
-            )
-            committed_head = ArtifactRepository._find_head
-            reads = 0
-
-            async def stale_first_read(
-                repository: ArtifactRepository,
-                connection: AsyncConnection,
-                scope_id: str,
-                family: str,
-                artifact_id: str,
-            ) -> int | None:
-                nonlocal reads
-                reads += 1
-                # The first read models the window before the winner committed.
-                if reads == 1:
-                    return None
-                return await committed_head(repository, connection, scope_id, family, artifact_id)
-
-            monkeypatch.setattr(ArtifactRepository, "_find_head", stale_first_read)
-            draft = HandoffDraft(content=HandoffContent(summary="loser"))
-            with pytest.raises(RevisionConflictError) as error:
-                await repositories.artifacts.create(connection, "scope-a", "handoff-1", draft)
-
-            assert error.value.artifact == draft
-            assert error.value.current == winner
 
     asyncio.run(scenario())
 

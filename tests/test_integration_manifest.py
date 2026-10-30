@@ -1,0 +1,592 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import json
+import shutil
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+import yaml
+from integration_manifest import (
+    DOCUMENTATION_PATHS,
+    MANIFEST_PATH,
+    IntegrationAvailability,
+    IntegrationKind,
+    IntegrationManifest,
+    evidence_path_errors,
+    integration_directory_errors,
+    load_integration_manifest,
+    release_tag_errors,
+    render_integration_capability_reference,
+    tool_surface_errors,
+)
+from pydantic import ValidationError
+
+
+def test_manifest_matches_setup_catalog_evidence_and_actual_tool_surfaces() -> None:
+    manifest = load_integration_manifest()
+
+    agent_hosts = {integration.id for integration in manifest.integrations if integration.kind == "agent_host"}
+    from powercontext.cli.installation import installers
+
+    setup_targets = set(installers())
+
+    assert agent_hosts == setup_targets
+    assert integration_directory_errors(manifest) == ()
+    assert evidence_path_errors(manifest) == ()
+    assert release_tag_errors(manifest) == ()
+    assert tool_surface_errors(manifest) == ()
+
+
+def test_pi_declares_full_profile_after_external_skill_support_is_merged() -> None:
+    manifest = load_integration_manifest()
+    pi = next(integration for integration in manifest.integrations if integration.id == "pi")
+    pi_tools = next(toolset for toolset in manifest.toolsets if toolset.id == "pi-tools")
+    external_tools = {
+        "pc_external_scan:scan_external_skills",
+        "pc_external_list:list_external_skills",
+        "pc_external_resolve:resolve_external_skill",
+        "pc_external_import:import_external_skill",
+    }
+
+    assert "full" in pi.profiles
+    assert "external_skill" in pi.capabilities
+    assert {tool.id for tool in pi_tools.tools if tool.id in external_tools} == external_tools
+    assert all(tool.capabilities == ("external_skill",) for tool in pi_tools.tools if tool.id in external_tools)
+
+
+def test_codex_full_profile_includes_managed_and_external_skill_operations() -> None:
+    manifest = load_integration_manifest()
+    codex = next(integration for integration in manifest.integrations if integration.id == "codex")
+    assert "full" in codex.profiles
+    assert {"experience_read_or_generate", "skill_read_or_generate", "candidate_review", "external_skill"} <= set(
+        codex.capabilities
+    )
+
+
+def test_dsh_mcp_surface_matches_the_server_operation_catalog() -> None:
+    manifest = load_integration_manifest()
+    toolset = next(item for item in manifest.toolsets if item.id == "dsh-mcp")
+    assert toolset.probe == "dsh_mcp"
+    assert all(tool.id.startswith("mcp__powercontext__") for tool in toolset.tools)
+    isolated = manifest.model_copy(update={"toolsets": (toolset,), "integrations": ()})
+    assert tool_surface_errors(isolated) == ()
+
+
+def test_dify_declares_http_tools_without_host_lifecycle_claims() -> None:
+    manifest = load_integration_manifest()
+    toolsets = {item.id: item for item in manifest.toolsets}
+    assert toolsets["dify-tools"].probe == "dify_tools"
+    assert {"pc_search:search_memory", "pc_skill_generate:generate_skill"} <= {
+        tool.id for tool in toolsets["dify-tools"].tools
+    }
+    dify = next(item for item in manifest.integrations if item.id == "dify")
+    assert dify.availability is IntegrationAvailability.EXPERIMENTAL
+    assert dify.profiles == ()
+    assert not {"acknowledge", "work_contract", "external_skill"} & set(dify.capabilities)
+
+
+@pytest.mark.parametrize("change", ["missing", "typo"])
+def test_dsh_probe_detects_plugin_catalog_drift(tmp_path: Path, change: str) -> None:
+    source_root = MANIFEST_PATH.parent.parent
+    plugin = tmp_path / "integrations/dsh/plugins/powercontext/src"
+    plugin.mkdir(parents=True)
+    shutil.copy(source_root / "integrations/dsh/plugins/powercontext/src/mcp.ts", plugin)
+    path = source_root / "integrations/dsh/plugins/powercontext/src/mcp-operations.generated.ts"
+    catalog = path.read_text(encoding="utf-8")
+    entry = '  "search_memory": {\n    "readOnly": true\n  },\n'
+    assert entry in catalog
+    replacement = "" if change == "missing" else entry.replace('"search_memory"', '"search_memories"')
+    (plugin / path.name).write_text(catalog.replace(entry, replacement), encoding="utf-8")
+    manifest = load_integration_manifest()
+    toolset = next(item for item in manifest.toolsets if item.id == "dsh-mcp")
+    isolated = manifest.model_copy(update={"toolsets": (toolset,), "integrations": ()})
+    errors = tool_surface_errors(isolated, tmp_path)
+    assert len(errors) == 1
+    assert "mcp__powercontext__search_memory" in errors[0]
+
+
+@pytest.mark.parametrize("change", ["missing", "operation"])
+def test_dify_probe_checks_provider_entries_and_their_operation_bindings(tmp_path: Path, change: str) -> None:
+    source_root = MANIFEST_PATH.parent.parent
+    plugin = tmp_path / "integrations/dify/plugin"
+    shutil.copytree(source_root / "integrations/dify/plugin", plugin, ignore=shutil.ignore_patterns("__pycache__"))
+    if change == "missing":
+        provider_path = plugin / "provider/powercontext.yaml"
+        provider = yaml.safe_load(provider_path.read_text(encoding="utf-8"))
+        provider["tools"].remove("tools/pc_skill_generate.yaml")
+        provider_path.write_text(yaml.safe_dump(provider), encoding="utf-8")
+    else:
+        entry = plugin / "tools/pc_skill_generate.py"
+        entry.write_text(
+            entry.read_text(encoding="utf-8").replace('"generate_skill"', '"approve_candidate"'),
+            encoding="utf-8",
+        )
+    manifest = load_integration_manifest()
+    toolset = next(item for item in manifest.toolsets if item.id == "dify-tools")
+    isolated = manifest.model_copy(update={"toolsets": (toolset,), "integrations": ()})
+    errors = tool_surface_errors(isolated, tmp_path)
+    assert len(errors) == 1
+    assert "pc_skill_generate:generate_skill" in errors[0]
+    if change == "operation":
+        assert "pc_skill_generate:approve_candidate" in errors[0]
+
+
+def test_manifest_defines_each_availability_state() -> None:
+    manifest = load_integration_manifest()
+
+    assert set(manifest.availability_definitions) == set(IntegrationAvailability)
+
+
+def test_manifest_v2_declares_pre_compaction_mode_for_every_maintained_agent_host() -> None:
+    manifest = load_integration_manifest()
+
+    assert manifest.schema_version == 2
+    modes = {
+        integration.id: integration.lifecycle.pre_compaction.mode.value
+        for integration in manifest.integrations
+        if integration.kind is IntegrationKind.AGENT_HOST and integration.lifecycle is not None
+    }
+    assert modes == {
+        "codex": "unsupported",
+        "claude-code": "unsupported",
+        "dsh": "unsupported",
+        "hermes": "unsupported",
+        "openclaw": "best_effort",
+        "opencode": "unsupported",
+        "pi": "best_effort",
+        "workbuddy": "unsupported",
+        "zcode": "unsupported",
+        "kimi-code": "unsupported",
+    }
+
+
+@pytest.mark.parametrize(
+    ("integration_id", "mutation"),
+    [
+        ("codex", lambda integration: integration.pop("lifecycle")),
+        (
+            "codex",
+            lambda integration: integration.__setitem__(
+                "lifecycle", {"pre_compaction": {"mode": "unsupported", "surface": "SessionStart"}}
+            ),
+        ),
+        (
+            "openclaw",
+            lambda integration: integration["lifecycle"]["pre_compaction"].__setitem__(
+                "surface", "private_compaction_callback"
+            ),
+        ),
+        (
+            "openclaw",
+            lambda integration: integration["lifecycle"].__setitem__(
+                "pre_compaction",
+                {"mode": "required_capable", "surface": "before_compaction"},
+            ),
+        ),
+        (
+            "openclaw",
+            lambda integration: integration["lifecycle"].__setitem__(
+                "pre_compaction",
+                {"mode": "unsupported"},
+            ),
+        ),
+    ],
+)
+def test_manifest_rejects_invalid_pre_compaction_declarations(integration_id: str, mutation) -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    integration = next(item for item in payload["integrations"] if item["id"] == integration_id)
+    mutation(integration)
+
+    with pytest.raises(ValidationError):
+        IntegrationManifest.model_validate(payload)
+
+
+def test_manifest_rejects_lifecycle_declarations_from_non_agent_integrations() -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    integration = next(item for item in payload["integrations"] if item["id"] == "langchain")
+    integration["lifecycle"] = {"pre_compaction": {"mode": "unsupported"}}
+
+    with pytest.raises(ValidationError):
+        IntegrationManifest.model_validate(payload)
+
+
+def test_manifest_rejects_required_mode_opt_in_for_best_effort() -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    integration = next(item for item in payload["integrations"] if item["id"] == "openclaw")
+    integration["lifecycle"]["pre_compaction"]["required_mode_opt_in"] = "POWERCONTEXT_REQUIRED_CHECKPOINT"
+
+    with pytest.raises(ValidationError, match="only required_capable"):
+        IntegrationManifest.model_validate(payload)
+
+
+@pytest.mark.parametrize("pointer", ["", "missing/required-capable-evidence.ts", "docs"])
+def test_lifecycle_evidence_must_reference_existing_files(pointer: str, tmp_path: Path) -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    integration = next(item for item in payload["integrations"] if item["id"] == "openclaw")
+    integration["lifecycle"]["pre_compaction"]["evidence"]["implementation"] = [pointer]
+
+    if not pointer:
+        with pytest.raises(ValidationError):
+            IntegrationManifest.model_validate(payload)
+        return
+
+    (tmp_path / "docs").mkdir()
+    manifest = IntegrationManifest.model_validate(payload)
+    errors = evidence_path_errors(manifest, tmp_path)
+
+    assert f"openclaw: missing lifecycle implementation evidence: {pointer}" in errors
+
+
+@pytest.mark.parametrize("locale", ["en", "zh"])
+def test_generated_capability_matrix_is_current(locale: str) -> None:
+    manifest = load_integration_manifest()
+
+    assert DOCUMENTATION_PATHS[locale].read_text(encoding="utf-8") == render_integration_capability_reference(
+        manifest, locale
+    )
+
+
+def test_tool_surface_probe_rejects_renamed_or_added_tools() -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    payload["toolsets"][0]["tools"][0]["id"] = "renamed_memory_search"
+    manifest = IntegrationManifest.model_validate(payload)
+
+    errors = tool_surface_errors(manifest)
+
+    assert errors
+    assert "server-mcp: tool surface drift" in errors[0]
+    assert "renamed_memory_search" in errors[0]
+    assert "search_memory" in errors[0]
+
+
+@pytest.mark.parametrize(
+    ("integration_id", "config_name", "command", "arguments"),
+    [
+        ("codex", "hooks.json", "/bin/true", None),
+        (
+            "claude-code",
+            "hooks.json",
+            "/bin/true",
+            ["${CLAUDE_PLUGIN_ROOT}/hooks/user_prompt_submit.py"],
+        ),
+        (
+            "claude-code",
+            "hooks.json",
+            "python3",
+            [
+                "${CLAUDE_PLUGIN_ROOT}/hooks/missing.py",
+                "${CLAUDE_PLUGIN_ROOT}/hooks/user_prompt_submit.py",
+            ],
+        ),
+        (
+            "codex",
+            "hooks.json",
+            "uv run --frozen /bin/true python ${PLUGIN_ROOT}/hooks/recall.py",
+            None,
+        ),
+    ],
+)
+def test_prompt_hook_probe_follows_registered_command(
+    tmp_path: Path,
+    integration_id: str,
+    config_name: str,
+    command: str,
+    arguments: list[str] | None,
+) -> None:
+    for target_id in ("codex", "claude-code", "workbuddy"):
+        relative_path = Path(target_id, "plugins", "powercontext", "hooks")
+        shutil.copytree(MANIFEST_PATH.parent / relative_path, tmp_path / "integrations" / relative_path)
+
+    config_path = tmp_path / "integrations" / integration_id / "plugins/powercontext/hooks" / config_name
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    command_hook = config["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+    command_hook["command"] = command
+    if arguments is None:
+        command_hook.pop("args", None)
+    else:
+        command_hook["args"] = arguments
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    payload = load_integration_manifest().model_dump(mode="json")
+    payload["toolsets"] = [toolset for toolset in payload["toolsets"] if toolset["id"] == "prompt-hooks"]
+    payload["integrations"] = [
+        {
+            "id": "codex",
+            "kind": "agent_host",
+            "availability": "master_only",
+            "capabilities": [
+                "source_capture",
+                "context_injection",
+                "flush_or_checkpoint",
+                "persistent_scope_binding",
+            ],
+            "toolsets": ["prompt-hooks"],
+            "lifecycle": {"pre_compaction": {"mode": "unsupported"}},
+            "evidence": {
+                "implementation": ["integrations/codex/plugins/powercontext/hooks/recall.py"],
+                "documentation": ["integrations/codex/README.md"],
+                "tests": ["tests/test_integration_manifest.py"],
+            },
+        }
+    ]
+    manifest = IntegrationManifest.model_validate(payload)
+
+    assert tool_surface_errors(manifest, tmp_path) == (
+        f"prompt-hooks: tool surface drift (missing ['{integration_id}:UserPromptSubmit']; "
+        f"unexpected ['{integration_id}:UserPromptSubmit:incomplete'])",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload["integrations"].append(deepcopy(payload["integrations"][0])),
+        lambda payload: payload["integrations"][0].__setitem__("profiles", ["minimal"]),
+        lambda payload: payload["integrations"][8].__setitem__("profiles", ["minimal"]),
+        lambda payload: payload["integrations"][0].__setitem__("capabilities", ["unknown"]),
+        lambda payload: payload["integrations"][0].__setitem__("toolsets", ["unknown-toolset"]),
+        lambda payload: payload["integrations"][0]["evidence"].__setitem__("tests", []),
+        lambda payload: payload["availability_definitions"].pop("released"),
+        lambda payload: payload["toolsets"][0]["tools"][0].__setitem__(
+            "non_profile_reason", "duplicate classification"
+        ),
+        lambda payload: payload["integrations"][0].__setitem__("availability", "released"),
+    ],
+)
+def test_manifest_rejects_contradictory_implemented_declarations(mutation) -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    mutation(payload)
+
+    with pytest.raises(ValidationError):
+        IntegrationManifest.model_validate(payload)
+
+
+def test_manifest_accepts_planned_capabilities_without_claiming_current_support() -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    payload["integrations"].append({
+        "id": "future-host",
+        "kind": "agent_host",
+        "availability": "proposed",
+        "capabilities": ["memory_read"],
+        "proposal": "https://github.com/oceanbase/powercontext/issues/1357",
+    })
+
+    manifest = IntegrationManifest.model_validate(payload)
+
+    assert manifest.integrations[-1].availability == "proposed"
+
+
+@pytest.mark.parametrize(
+    ("availability", "pointer", "expected_error"),
+    [
+        ("proposed", "not-a-proposal", "future-host: invalid proposal pointer: not-a-proposal"),
+        (
+            "unsupported",
+            "https://github.com/oceanbase/powercontext/issues/1357",
+            "future-host: invalid rationale pointer: https://github.com/oceanbase/powercontext/issues/1357",
+        ),
+    ],
+)
+def test_unimplemented_status_pointers_must_have_their_required_evidence(
+    availability: str, pointer: str, expected_error: str
+) -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    payload["integrations"].append({
+        "id": "future-host",
+        "kind": "agent_host",
+        "availability": availability,
+        "proposal" if availability == "proposed" else "rationale": pointer,
+    })
+    manifest = IntegrationManifest.model_validate(payload)
+
+    assert evidence_path_errors(manifest) == (expected_error,)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        {
+            "id": "missing-proposal",
+            "kind": "agent_host",
+            "availability": "proposed",
+        },
+        {
+            "id": "unsupported-with-capability",
+            "kind": "agent_host",
+            "availability": "unsupported",
+            "capabilities": ["memory_read"],
+            "rationale": "docs/en/docs/develop/interfaces.md",
+        },
+        {
+            "id": "unsupported-without-rationale",
+            "kind": "agent_host",
+            "availability": "unsupported",
+        },
+        {
+            "id": "unsupported-with-implementation",
+            "kind": "agent_host",
+            "availability": "unsupported",
+            "rationale": "docs/en/docs/develop/interfaces.md",
+            "evidence": {"implementation": ["src/powercontext/integration_manifest.py"]},
+        },
+    ],
+)
+def test_manifest_rejects_invalid_unimplemented_status_evidence(declaration) -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    payload["integrations"].append(declaration)
+
+    with pytest.raises(ValidationError):
+        IntegrationManifest.model_validate(payload)
+
+
+def test_released_entries_need_a_resolvable_tag() -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    payload["integrations"][0]["availability"] = "released"
+    payload["integrations"][0]["release_tag"] = "not-a-powercontext-release"
+    manifest = IntegrationManifest.model_validate(payload)
+
+    assert release_tag_errors(manifest) == ("codex: release tag does not resolve: not-a-powercontext-release",)
+
+
+@pytest.fixture
+def integration_tree(tmp_path: Path) -> Path:
+    """A real filesystem fixture with the manifest's directory and evidence contract."""
+    manifest = load_integration_manifest()
+    for integration in manifest.integrations:
+        (tmp_path / "integrations" / integration.id).mkdir(parents=True)
+        for paths in integration.evidence.model_dump().values():
+            for pointer in paths:
+                path = tmp_path / pointer
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("evidence\n", encoding="utf-8")
+        if integration.lifecycle is not None:
+            for paths in integration.lifecycle.pre_compaction.evidence.model_dump().values():
+                for pointer in paths:
+                    path = tmp_path / pointer
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("lifecycle evidence\n", encoding="utf-8")
+    for name in manifest.directory_exclusions:
+        (tmp_path / "integrations" / name).mkdir(parents=True)
+    return tmp_path
+
+
+def test_directory_gate_reports_both_directions_without_writing(integration_tree: Path) -> None:
+    manifest = load_integration_manifest()
+    assert integration_directory_errors(manifest, integration_tree) == ()
+    (integration_tree / "integrations/newhost").mkdir()
+    destination = integration_tree / "codex-evidence"
+    assert destination.resolve().is_relative_to(integration_tree.resolve())
+    (integration_tree / "integrations/codex").rename(destination)
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns) for path in integration_tree.rglob("*") if path.is_file()
+    }
+
+    assert integration_directory_errors(manifest, integration_tree) == (
+        "integrations/newhost/: present but undeclared",
+        "integrations/codex/: declared but absent",
+    )
+    assert before == {
+        path: (path.read_bytes(), path.stat().st_mtime_ns) for path in integration_tree.rglob("*") if path.is_file()
+    }
+
+
+def test_removing_a_declaration_does_not_hide_its_directory(integration_tree: Path) -> None:
+    manifest = load_integration_manifest()
+    manifest = manifest.model_copy(
+        update={"integrations": tuple(item for item in manifest.integrations if item.id != "pi")}
+    )
+    assert integration_directory_errors(manifest, integration_tree) == ("integrations/pi/: present but undeclared",)
+
+
+def test_stale_directory_exclusion_is_reported(integration_tree: Path) -> None:
+    manifest = load_integration_manifest()
+    (integration_tree / "integrations/minimax").rmdir()
+    assert integration_directory_errors(manifest, integration_tree) == ("integrations/minimax/: excluded but absent",)
+
+
+@pytest.mark.parametrize("locale", ["en", "zh"])
+def test_each_documentation_locale_is_required(integration_tree: Path, locale: str) -> None:
+    pointer = f"docs/{locale}/docs/integrations/codex.md"
+    (integration_tree / pointer).unlink()
+    assert integration_directory_errors(load_integration_manifest(), integration_tree) == (
+        f"codex: missing {locale} integration documentation: {pointer}",
+    )
+
+
+@pytest.mark.parametrize("kind", list(IntegrationKind))
+def test_unsupported_directory_uses_rationale_without_claiming_documentation_evidence(
+    integration_tree: Path, kind: IntegrationKind
+) -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    payload["integrations"].append({
+        "id": "unsupported-adapter",
+        "kind": kind,
+        "availability": "unsupported",
+        "rationale": "docs/unsupported-adapter-rationale.md",
+    })
+    directory = integration_tree / "integrations/unsupported-adapter"
+    directory.mkdir()
+    rationale = integration_tree / "docs/unsupported-adapter-rationale.md"
+    rationale.write_text("This adapter is not supported.\n", encoding="utf-8")
+    for locale in ("en", "zh"):
+        page = integration_tree / f"docs/{locale}/docs/integrations/unsupported-adapter.md"
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text("Unsupported; see the local rationale.\n", encoding="utf-8")
+
+    manifest = IntegrationManifest.model_validate(payload)
+    assert integration_directory_errors(manifest, integration_tree) == ()
+    assert evidence_path_errors(manifest, integration_tree) == ()
+    if kind.value not in payload["documentation_waivers"]:
+        for locale in ("en", "zh"):
+            pointer = f"docs/{locale}/docs/integrations/unsupported-adapter.md"
+            page = integration_tree / pointer
+            page.unlink()
+            assert integration_directory_errors(manifest, integration_tree) == (
+                f"unsupported-adapter: missing {locale} integration documentation: {pointer}",
+            )
+            page.write_text("Unsupported.\n", encoding="utf-8")
+    rationale.unlink()
+    assert evidence_path_errors(manifest, integration_tree)
+    payload["integrations"][-1]["evidence"] = {"documentation": ["docs/en/docs/integrations/unsupported-adapter.md"]}
+    with pytest.raises(ValidationError, match="unsupported integrations cannot claim current support"):
+        IntegrationManifest.model_validate(payload)
+
+
+@pytest.mark.parametrize("category", ["implementation", "documentation", "tests"])
+def test_missing_declared_evidence_is_reported(integration_tree: Path, category: str) -> None:
+    manifest = load_integration_manifest()
+    pointer = getattr(manifest.integrations[0].evidence, category)[0]
+    (integration_tree / pointer).unlink()
+    assert f"codex: missing {category} evidence: {pointer}" in evidence_path_errors(manifest, integration_tree)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("directory_exclusions", {"minimax": "  "}),
+        ("directory_exclusions", {"../other": "outside"}),
+        ("directory_exclusions", {"codex": "already declared"}),
+        ("documentation_waivers", {"evaluation_harness": "\n"}),
+        ("documentation_waivers", {"unknown_kind": "not a declared kind"}),
+    ],
+)
+def test_exclusions_and_waivers_require_unambiguous_rationales(field: str, value: dict[str, str]) -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    payload[field] = value
+    with pytest.raises(ValidationError):
+        IntegrationManifest.model_validate(payload)

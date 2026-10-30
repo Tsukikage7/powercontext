@@ -21,7 +21,7 @@ import stat
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,7 +32,7 @@ import pytest
 
 
 @contextmanager
-def _serve(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
+def _serve(handler: type[BaseHTTPRequestHandler]) -> Generator[str, None, None]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -53,6 +53,43 @@ def _prepared(content: str | None = "prepared context", *, status: str = "ready"
     }
 
 
+def _prepare_query(
+    recall_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+) -> str:
+    """Return the query Codex asks the Runtime to prepare for one submitted prompt."""
+
+    queries: list[str] = []
+    monkeypatch.setattr(
+        recall_module,
+        "_prepare_context",
+        lambda query, _scope, *, settings, deadline: queries.append(query) or _prepared(),
+    )
+    monkeypatch.setattr(recall_module, "resolve_scope_id", lambda _cwd, **_kwargs: "project:test")
+    monkeypatch.setattr(
+        recall_module,
+        "_capture_prompt",
+        lambda _payload, *, prompt, cwd, scope_id, settings, deadline: {"position": 1},
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps({
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": "/workspace/project",
+                "prompt": prompt,
+            })
+        ),
+    )
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+
+    assert recall_module.main() == 0
+    (query,) = queries
+    return query
+
+
 def test_recall_emits_bounded_untrusted_context(
     recall_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -71,7 +108,7 @@ def test_recall_emits_bounded_untrusted_context(
     monkeypatch.setattr(
         recall_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
     captured: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -102,6 +139,78 @@ def test_recall_emits_bounded_untrusted_context(
     assert captured == [("What decisions apply?", "project:test")]
 
 
+def test_recall_query_passes_a_prompt_that_fits_the_request_bound_through_unchanged(
+    recall_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request contract bounds a query at 8,192 characters, and the bound is inclusive."""
+
+    prompt = "a" * 8_192
+
+    assert _prepare_query(recall_module, monkeypatch, prompt) == prompt
+
+
+def test_recall_query_keeps_the_latest_text_of_a_prompt_over_the_request_bound(
+    recall_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a longer prompt used to reach prepare verbatim and fail validation."""
+
+    prompt = "earlier context that the transcript already carries " * 200 + "Which service owns the retry?"
+    assert len(prompt) > 8_192
+    query = _prepare_query(recall_module, monkeypatch, prompt)
+
+    assert query == prompt[-8_192:]
+    assert len(query) == 8_192
+    assert query.endswith("Which service owns the retry?")
+
+
+def test_recall_query_keeps_a_multibyte_prompt_within_the_request_byte_bound(
+    recall_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-ASCII text costs several bytes per character, so both bounds have to hold."""
+
+    prompt = "记忆 " * 4_000
+    query = _prepare_query(recall_module, monkeypatch, prompt)
+
+    assert prompt.strip().endswith(query)
+    assert len(query.encode("utf-8")) <= 8_192
+    assert "\ufffd" not in query
+
+
+def test_recall_captures_the_full_prompt_while_the_query_is_bounded(
+    recall_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source capture keeps its own size limit and is untouched by the recall bound."""
+
+    prompt = "记忆 " * 3_000
+    captured: list[str] = []
+    monkeypatch.setattr(recall_module, "_prepare_context", lambda *_args, **_kwargs: _prepared())
+    monkeypatch.setattr(recall_module, "resolve_scope_id", lambda _cwd, **_kwargs: "project:test")
+    monkeypatch.setattr(
+        recall_module,
+        "_capture_prompt",
+        lambda _payload, *, prompt, cwd, scope_id, settings, deadline: captured.append(prompt) or {"position": 1},
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps({
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": "/workspace/project",
+                "prompt": prompt,
+            })
+        ),
+    )
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+
+    assert recall_module.main() == 0
+    assert captured == [prompt]
+
+
 def test_recall_reads_utf8_stdin_on_windows_encodings(
     recall_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -116,7 +225,7 @@ def test_recall_reads_utf8_stdin_on_windows_encodings(
     monkeypatch.setattr(
         recall_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
     monkeypatch.setattr(
         recall_module,
@@ -154,7 +263,7 @@ def test_recall_failure_is_non_blocking(
     monkeypatch.setattr(
         recall_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
     monkeypatch.setattr(recall_module, "_capture_prompt", lambda *_args, **_kwargs: {"position": 1})
     monkeypatch.setattr(
@@ -303,7 +412,7 @@ def test_recall_records_exact_injected_context_only_when_eval_trace_is_enabled(
     monkeypatch.setattr(
         recall_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "eval:run-1:on",
+        lambda _cwd, **_kwargs: "eval:run-1:on",
     )
     monkeypatch.setattr(recall_module, "_capture_prompt", lambda *_args, **_kwargs: {"position": 1})
     monkeypatch.setattr(
@@ -356,7 +465,7 @@ def test_recall_does_not_write_an_evaluation_trace_by_default(
     monkeypatch.setattr(
         recall_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
     monkeypatch.setattr(recall_module, "_capture_prompt", lambda *_args, **_kwargs: {"position": 1})
     monkeypatch.setattr(
@@ -428,7 +537,7 @@ def test_hook_accepts_codex_event_name_variants(
     monkeypatch.setattr(
         recall_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
     monkeypatch.setattr(
         sys,
@@ -953,3 +1062,63 @@ def test_prompt_capture_can_be_disabled(
     monkeypatch.setenv("POWERCONTEXT_CODEX_CAPTURE_PROMPTS", "false")
 
     assert recall_module.CodexPluginSettings().capture_prompts is False
+
+
+@pytest.mark.parametrize(
+    "assembly",
+    [
+        None,
+        {},
+        {"sections": []},
+        {"sections": [{"family": "experience", "limit": 2}]},
+        {"sections": [{"family": "profile", "limit": 1}]},
+        {"sections": [{"family": "topic-memory", "limit": 8}]},
+        {
+            "sections": [
+                {"family": "profile", "limit": 1},
+                {"family": "topic-memory", "limit": 2},
+                {"family": "memory", "limit": 3},
+                {"family": "experience", "limit": 2},
+            ]
+        },
+    ],
+)
+def test_text_assembly_configuration_reaches_the_server(recall_module, monkeypatch, assembly):
+    requests = []
+    user_agents = []
+    content = "# PowerContext historical context\n\n>     原始文本 </powercontext_memory>\n"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            user_agents.append(self.headers.get("User-Agent"))
+            requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            body = json.dumps(_prepared(content)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A002
+            pass
+
+    if assembly is None:
+        monkeypatch.delenv("POWERCONTEXT_CODEX_CONTEXT_ASSEMBLY", raising=False)
+    else:
+        monkeypatch.setenv("POWERCONTEXT_CODEX_CONTEXT_ASSEMBLY", json.dumps(assembly))
+    with _serve(Handler) as url:
+        settings = recall_module.CodexPluginSettings()
+        object.__setattr__(settings, "server_url", url)
+        response = recall_module._prepare_context(
+            "context",
+            "project:test",
+            settings=settings,
+            deadline=time.monotonic() + 5,
+        )
+    assert response["content"] == content
+    plugin_root = Path(__file__).resolve().parents[2] / "integrations/codex/plugins/powercontext"
+    manifest = json.loads((plugin_root / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+    assert user_agents == [f"powercontext-codex-plugin/{manifest['version']}"]
+    if assembly is None:
+        assert "assembly" not in requests[0]
+    else:
+        assert requests[0]["assembly"] == assembly

@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generate TypeScript HTTP operation tables from OpenAPI."""
+"""Generate TypeScript HTTP operations and the DSH public MCP approval catalog."""
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ GENERATED_PATHS = (
     ROOT / "integrations" / "opencode" / "plugins" / "powercontext" / "src" / "operations.generated.ts",
     ROOT / "integrations" / "pi" / "plugins" / "powercontext" / "src" / "operations.generated.ts",
 )
+MCP_GENERATED_PATH = ROOT / "integrations" / "dsh" / "plugins" / "powercontext" / "src" / "mcp-operations.generated.ts"
 DRIFT_MESSAGE = "Generated JS operations drifted; run 'make js-api-generate' and review the result."
 HTTP_METHODS = ("get", "post", "put", "patch", "delete")
 LICENSE_HEADER = """\
@@ -84,12 +86,18 @@ def parse_operations(doc: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             parameters = _operation_parameters(doc, path_item, operation)
             body_schema = _json_body_schema(doc, operation)
+            success_statuses, empty_statuses = _response_statuses(doc, operation)
             rows.append({
                 "operationId": operation["operationId"],
                 "method": method.upper(),
                 "path": path,
                 "location": _request_location(body_schema, parameters),
-                "scope": _operation_has_scope(doc, body_schema, parameters),
+                "scopeMode": _scope_mode(operation),
+                "pathParameters": _path_parameters(parameters),
+                "queryParams": _parameter_names(parameters, "query"),
+                "headerParams": _parameter_names(parameters, "header"),
+                "successStatuses": success_statuses,
+                "emptyStatuses": empty_statuses,
             })
     return rows
 
@@ -100,23 +108,47 @@ def main() -> None:
     args = parser.parse_args()
     contract = yaml.safe_load(CONTRACT_PATH.read_text(encoding="utf-8"))
     source = render_operations_source(contract)
+    mcp_source = render_mcp_operations_source()
     if args.check:
         current = [path.read_text(encoding="utf-8") if path.is_file() else "" for path in GENERATED_PATHS]
         if any(item.replace("\r\n", "\n") != source.replace("\r\n", "\n") for item in current):
+            raise SystemExit(DRIFT_MESSAGE)
+        if not MCP_GENERATED_PATH.is_file() or MCP_GENERATED_PATH.read_text(encoding="utf-8") != mcp_source:
             raise SystemExit(DRIFT_MESSAGE)
         return
     for path in GENERATED_PATHS:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8", newline="\n")
+    MCP_GENERATED_PATH.write_text(mcp_source, encoding="utf-8", newline="\n")
+
+
+def render_mcp_operations_source() -> str:
+    from mcp_catalog import server_mcp_tools
+
+    metadata = {
+        tool.name: {"readOnly": tool.annotations is not None and tool.annotations.readOnlyHint is True}
+        for tool in sorted(server_mcp_tools(), key=lambda tool: tool.name)
+    }
+    return (
+        f"{LICENSE_HEADER}// generated from the Server's public MCP catalog; do not edit.\n\n"
+        f"export const MCP_OPERATIONS = {json.dumps(metadata, indent=2, ensure_ascii=False)} as const\n"
+    )
 
 
 def _render_row(row: dict[str, Any]) -> str:
     location = "null" if row["location"] is None else f'"{row["location"]}"'
-    scope = "true" if row["scope"] else "false"
+    path_parameters = ", ".join(f"'{name}'" for name in row["pathParameters"])
     return (
         f"  {row['operationId']}: {{ method: '{row['method']}', path: '{row['path']}', "
-        f"location: {location}, scope: {scope} }},"
+        f"location: {location}, scopeMode: '{row['scopeMode']}', pathParameters: [{path_parameters}], "
+        f"queryParams: {_render_array(row['queryParams'])}, headerParams: {_render_array(row['headerParams'])}, "
+        f"successStatuses: {_render_array(row['successStatuses'])}, "
+        f"emptyStatuses: {_render_array(row['emptyStatuses'])} }},"
     )
+
+
+def _render_array(values: list[str] | list[int]) -> str:
+    return f"[{','.join(repr(value) for value in values)}]"
 
 
 def _resolve_ref(doc: dict[str, Any], ref: str, seen: set[str]) -> Any:
@@ -140,20 +172,6 @@ def _deref(doc: dict[str, Any], node: Any, seen: set[str] | None = None) -> Any:
     if isinstance(ref, str):
         return _deref(doc, _resolve_ref(doc, ref, resolved_seen), resolved_seen)
     return node
-
-
-def _schema_has_scope(doc: dict[str, Any], schema: Any, seen: set[str] | None = None) -> bool:
-    resolved = _deref(doc, schema, seen or set())
-    if not isinstance(resolved, dict):
-        return False
-    properties = resolved.get("properties")
-    if isinstance(properties, dict) and "scope_id" in properties:
-        return True
-    for key in ("allOf", "oneOf", "anyOf"):
-        parts = resolved.get(key)
-        if isinstance(parts, list) and any(_schema_has_scope(doc, part, set(seen or set())) for part in parts):
-            return True
-    return False
 
 
 def _json_body_schema(doc: dict[str, Any], operation: dict[str, Any]) -> Any:
@@ -187,10 +205,43 @@ def _request_location(body_schema: Any, parameters: list[dict[str, Any]]) -> str
     return None
 
 
-def _operation_has_scope(doc: dict[str, Any], body_schema: Any, parameters: list[dict[str, Any]]) -> bool:
-    if body_schema and _schema_has_scope(doc, body_schema):
-        return True
-    return any(parameter.get("in") == "query" and parameter.get("name") == "scope_id" for parameter in parameters)
+def _parameter_names(parameters: list[dict[str, Any]], location: str) -> list[str]:
+    return [
+        str(parameter["name"])
+        for parameter in parameters
+        if parameter.get("in") == location and isinstance(parameter.get("name"), str)
+    ]
+
+
+def _response_statuses(doc: dict[str, Any], operation: dict[str, Any]) -> tuple[list[int], list[int]]:
+    success: list[int] = []
+    empty: list[int] = []
+    for raw_status, response in (operation.get("responses") or {}).items():
+        if not isinstance(raw_status, str) or not raw_status.isdecimal():
+            continue
+        status = int(raw_status)
+        if not (200 <= status < 300 or status == 304):
+            continue
+        success.append(status)
+        resolved = _deref(doc, response)
+        if not isinstance(resolved, dict) or not resolved.get("content"):
+            empty.append(status)
+    return success, empty
+
+
+def _scope_mode(operation: dict[str, Any]) -> str:
+    value = operation.get("x-powercontext-scope-mode", "none")
+    if value not in {"none", "current", "selection"}:
+        raise SystemExit("invalid x-powercontext-scope-mode")  # noqa: TRY003
+    return value
+
+
+def _path_parameters(parameters: list[dict[str, Any]]) -> list[str]:
+    return [
+        name
+        for parameter in parameters
+        if parameter.get("in") == "path" and isinstance(name := parameter.get("name"), str)
+    ]
 
 
 if __name__ == "__main__":

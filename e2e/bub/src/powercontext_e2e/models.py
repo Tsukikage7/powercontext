@@ -19,6 +19,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
+from powercontext.http import ArtifactReference
 from pydantic import BaseModel, ConfigDict, Field
 
 from .catalog import E2ETask
@@ -31,9 +32,12 @@ class EvidenceModel(BaseModel):
 class RunEnvironment(EvidenceModel):
     commit: str
     database: str
+    # Evidence written before hosts were selectable was always Bub.
+    adapter: str = "bub"
     adapter_version: str
     adapter_protocol_version: str
     agent_model: str | None = None
+    agent_settings: dict[str, str] = Field(default_factory=dict)
     started_at: datetime
     finished_at: datetime
 
@@ -44,6 +48,8 @@ class SourceReferenceSnapshot(EvidenceModel):
 
 
 class MemoryEntrySnapshot(EvidenceModel):
+    """Retained legacy Entry evidence, readable by offline replay rescoring."""
+
     entry_id: str
     entry_version_id: str
     version: int
@@ -53,8 +59,21 @@ class MemoryEntrySnapshot(EvidenceModel):
     source_refs: tuple[SourceReferenceSnapshot, ...] = ()
 
 
+class AtomicMemorySnapshot(EvidenceModel):
+    """Current lifecycle state and lineage from the exact immutable revision."""
+
+    artifact: ArtifactReference
+    kind: str
+    text: str
+    state: str
+    state_version: int
+    merged_into_id: str | None
+    sources: tuple[SourceReferenceSnapshot, ...] = ()
+    artifacts: tuple[ArtifactReference, ...] = ()
+
+
 class MemorySnapshot(EvidenceModel):
-    entries: tuple[MemoryEntrySnapshot, ...] = ()
+    entries: tuple[AtomicMemorySnapshot | MemoryEntrySnapshot, ...] = ()
 
 
 class PreparedContextSnapshot(EvidenceModel):
@@ -78,6 +97,8 @@ class CaptureRecord(EvidenceModel):
     high_watermark: int | None = None
     processed_source_count: int | None = None
     memory_created: bool | None = None
+    cursor_advanced: bool | None = None
+    remaining_work: bool | None = None
     content_bytes: int | None = None
     captured_events: int | None = None
     flushed_position: int | None = None
@@ -87,6 +108,28 @@ class RecallProbeObservation(EvidenceModel):
     id: str
     query: str
     prepared_context: PreparedContextSnapshot
+    forbidden_context_matched: bool | None = None
+
+
+class SessionSnapshot(EvidenceModel):
+    """Server-side state of one Scope after an agent session and the flush that followed it."""
+
+    session: int = Field(ge=0)
+    flush_rounds: int = Field(ge=0)
+    sources: int = Field(ge=0)
+    memory_pending: int = Field(ge=0)
+    memory_entries: int = Field(ge=0)
+    preparations: int = Field(ge=0)
+    ready_preparations: int = Field(ge=0)
+    # Model usage the Server attributes to the Scope, cumulative like the counts above.
+    generation_requests: int = Field(default=0, ge=0)
+    generation_input_tokens: int | None = Field(default=None, ge=0)
+    generation_output_tokens: int | None = Field(default=None, ge=0)
+    embedding_requests: int = Field(default=0, ge=0)
+    embedding_input_tokens: int | None = Field(default=None, ge=0)
+    recalled_tokens: int = Field(
+        default=0, ge=0, description="The Server's estimate of the context tokens it returned."
+    )
 
 
 class HarborTrialObservation(EvidenceModel):
@@ -159,3 +202,157 @@ class EvaluationReport(EvidenceModel):
     @property
     def accepted(self) -> bool:
         return all(bool(result.value) for case in self.cases for result in case.assertions.values())
+
+
+Arm = Literal["off", "on"]
+ArmOutcome = Literal["passed", "failed", "timeout", "error", "integration_failed", "cross_scope_access"]
+
+
+class StepObservation(EvidenceModel):
+    """One Harbor step of an arm run: the agent session's time and the host's own usage figures."""
+
+    name: str
+    seconds: float | None = Field(default=None, ge=0, description="Agent execution time Harbor measured for the step.")
+    input_tokens: int | None = Field(
+        default=None, ge=0, description="Input tokens including cache reads, as the host reports."
+    )
+    cache_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+
+
+class OutsideScopeAccess(EvidenceModel):
+    """One API or MCP authorization decision, made while an ON arm ran, about anything but the arm's own Scope."""
+
+    occurred_at: datetime
+    request_id: str | None = None
+    transport: str
+    operation: str
+    action: str
+    scope_id: str | None = Field(description="The other Scope, or none for the Server as a whole, as when listing.")
+    allowed: bool
+    request_rejected: bool = Field(
+        description="Whether the Server denied the request this or another check it enforces, which rejects it."
+    )
+
+
+class PairedArmObservation(EvidenceModel):
+    """One arm of one OFF/ON trial for a paired workload."""
+
+    # v2 records each step's time and the host's usage figures, and Server usage in the session snapshots; v3 adds
+    # what the Server's Access audit recorded outside an ON arm's Scope while it ran.
+    schema_: Literal["powercontext.e2e-paired-arm/v3"] = Field(
+        default="powercontext.e2e-paired-arm/v3",
+        alias="schema",
+    )
+    run_id: str
+    task_id: str
+    trial: int = Field(ge=1)
+    arm: Arm
+    position: int = Field(ge=1, le=2, description="Whether this arm ran first or second within its trial.")
+    environment: RunEnvironment
+    scope_id: str | None = None
+    harbor: HarborTrialObservation
+    step_rewards: dict[str, float] = Field(default_factory=dict)
+    steps: tuple[StepObservation, ...] = ()
+    outcome: ArmOutcome
+    errors: tuple[str, ...] = ()
+    sessions: tuple[SessionSnapshot, ...] = ()
+    treatment_failures: tuple[str, ...] = ()
+    outside_scope: tuple[OutsideScopeAccess, ...] = ()
+
+
+class Interval(EvidenceModel):
+    low: float
+    high: float
+
+
+class MetricSummary(EvidenceModel):
+    runs: int = Field(ge=1, description="Scored runs that reported the metric.")
+    mean: float
+    min: float
+    max: float
+
+
+class StepSummary(EvidenceModel):
+    """One step's metrics over an arm's scored runs; a metric the host does not report is absent."""
+
+    runs: int = Field(ge=1, description="Scored runs that ran the step.")
+    seconds: MetricSummary | None = None
+    input_tokens: MetricSummary | None = None
+    cache_tokens: MetricSummary | None = None
+    output_tokens: MetricSummary | None = None
+    cost_usd: MetricSummary | None = None
+
+
+class ServerUsageSummary(EvidenceModel):
+    """Mean Server usage per scored ON run, from each run's final Scope snapshot.
+
+    The Server leaves a Scope's tokens unknown when a provider did not report them, so each token metric covers only
+    the runs whose snapshot has them.
+    """
+
+    runs: int = Field(ge=1)
+    generation_requests: float
+    generation_input_tokens: MetricSummary | None = None
+    generation_output_tokens: MetricSummary | None = None
+    embedding_requests: float
+    embedding_input_tokens: MetricSummary | None = None
+    recalled_tokens: float
+
+
+class ArmSummary(EvidenceModel):
+    scored: int = Field(ge=0, description="Runs that count toward the success rate: passed, failed, or timed out.")
+    passed: int = Field(ge=0)
+    timeouts: int = Field(ge=0)
+    errors: int = Field(ge=0)
+    integration_failures: int = Field(ge=0)
+    cross_scope_accesses: int = Field(
+        default=0,
+        ge=0,
+        description="ON runs that the Server allowed a request on another Scope or Scope content across the Server.",
+    )
+    success_rate: float | None = Field(default=None, description="Passed over scored runs.")
+    success_rate_interval: Interval | None = Field(default=None, description="95% Wilson score interval.")
+    steps: dict[str, StepSummary] = Field(default_factory=dict, description="Per-step metrics over scored runs.")
+    server: ServerUsageSummary | None = Field(default=None, description="Server usage; only ON runs have a Scope.")
+
+
+class PairedSummary(EvidenceModel):
+    off: ArmSummary
+    on: ArmSummary
+    pairs: int = Field(ge=0, description="Trials in which both arms were scored.")
+    mean_delta: float | None = Field(default=None, description="Mean ON minus OFF score over scored pairs.")
+    delta_interval: Interval | None = Field(
+        default=None, description="95% percentile bootstrap interval of the mean ON minus OFF score."
+    )
+    on_better: int = Field(default=0, ge=0, description="Scored pairs in which only ON passed.")
+    off_better: int = Field(default=0, ge=0, description="Scored pairs in which only OFF passed.")
+    tied: int = Field(default=0, ge=0, description="Scored pairs with the same score in both arms.")
+
+
+class PairedTaskSummary(PairedSummary):
+    task_id: str
+
+
+class PairedAgent(EvidenceModel):
+    """The agent host and runtime-selected model that ran both arms."""
+
+    host: str
+    version: str
+    model: str | None = None
+    settings: dict[str, str] = Field(default_factory=dict)
+
+
+class PairedReport(EvidenceModel):
+    # v2 records the agent host that ran both arms; v3 adds intervals, step metrics, and Server usage; v4 counts ON
+    # runs that reached another Scope. The harness does not read reports back.
+    schema_: Literal["powercontext.e2e-paired-report/v4"] = Field(
+        default="powercontext.e2e-paired-report/v4",
+        alias="schema",
+    )
+    experiment: str
+    agent: PairedAgent
+    trials: int = Field(ge=1)
+    tasks: tuple[PairedTaskSummary, ...] = Field(min_length=1)
+    total: PairedSummary

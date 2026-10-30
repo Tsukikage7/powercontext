@@ -1,0 +1,280 @@
+---
+title: 审核 Candidate
+description: 检查、修订、批准或拒绝待审核的 Experience 和 Skill Candidate。
+---
+
+# 审核 Candidate
+
+使用 Review Inbox 判断生成或提交的 Experience、managed Skill 是否应成为 Artifact Revision。批准会写入不可变的
+Revision；拒绝会关闭 Candidate，但不会写入 Artifact。
+
+## 统一接口与升级
+
+候选管理统一使用六个 POST 接口：`/v1/candidates/list`、`get`、`history`、`revise`、`approve`、`reject`。
+`candidate_kind=artifact|tag` 区分正文提案与标签变更；family 仍表示目标制品类别。列表支持类型筛选，未指定时包含两类候选。
+Artifact 批准结果包含真实的 `result_artifact`；Tag 批准结果包含目标、标签集合和 ETag，不产生正文 Revision。
+Tag 审核同时检查候选版本、正文基准、标签 ETag 和权限；修改提案必须重新审核。
+下文 Experience/Skill 命令示例属于 artifact 类型。
+
+旧 `/v1/artifact-candidates/*` 直接移除，无别名或重定向；Client 和集成必须同步升级。
+停止旧 Server/Worker 并备份数据库后启动新版。首次初始化自动将原候选两张表改名为
+`pc_candidate_heads`、`pc_candidate_versions`，回填类型并保留历史数据和关联引用，验证完成前不开放服务。
+迁移失败会阻止启动并提示原因；重试续跑，不清空数据。不支持新旧版本混跑；回退需要恢复升级前备份。
+
+## 开始之前
+
+启动 Server，并确认它已经就绪：
+
+```bash
+powercontext ready
+```
+
+将 `POWERCONTEXT_SCOPE_ID` 设置为 Candidate 所在的已有 Scope ID。本指南从 Experience 或 Skill 操作已经创建
+pending Candidate 后开始。
+
+## 审核权限
+
+Review 是一次状态转换：pending 内容只有经过显式批准，才能成为不可变的 Artifact Revision。
+这一步本身不证明内容由人审核，也不要求审核者与提案人不同。
+
+| Server 权限模式 | 谁可以批准 |
+| --- | --- |
+| `disabled`（默认） | 能访问审核操作的调用者；不强制审核者身份 |
+| `enforced` | 拥有 `scope.review` 的已认证 Principal，同时满足 Candidate 的证据与目标权限要求 |
+
+HTTP、Python Client、CLI 和 MCP 使用同一套 Server 授权。一个 Principal 同时具有提交和审核权限时，可以批准自己的
+Candidate。内置静态 Bearer token 代表一个共享的管理员身份；共享该 token 无法区分 Agent 与审核者。
+
+MCP 暴露 `approve_candidate`、`reject_candidate` 和 `revise_candidate`。这些工具的注解描述操作副作用，供宿主执行
+自己的确认策略。注解不会强制弹出确认，也不证明已经经过人工确认。批准 Skill 同样不等于安装、发布或授予执行权限。
+
+## 分离 Agent 提交与审核
+
+如果希望由 Agent 提交新的 Experience 或 Skill Candidate，再由人决定是否批准：
+
+1. 启用 `POWERCONTEXT_SERVER_ACCESS_MODE=enforced`，配置能够建立不同身份的 Authentication Provider。
+   参见 [Scope 与访问控制](scopes-and-access.md#启用访问控制)。共享静态 token 无法满足这一要求。
+2. 由管理员在同一个精确 Scope 上，为 Agent 分配 `scope.contributor`，为审核者分配 `scope.reviewer`。
+   不要通过其他角色、群组或额外凭据向 Agent 授予审核或角色管理权限。
+3. 不要把审核者凭据交给 Agent 的工具或进程环境。审核使用已认证的 Client 或集成；Dashboard 面向个人和演示部署，
+   不支持团队 RBAC。
+4. 以 Agent 身份提交 Candidate，再分别以两个身份读取。Agent 通过 HTTP 或 MCP 尝试批准时都应被拒绝；
+   审核者可以批准确切的 pending version。
+5. 需要修改时，由审核者填写原因并拒绝，再提交修正后的新 Candidate。拒绝是终态。修订已有 Candidate 同时要求
+   `scope.review` 和原提案人身份，因此上述两个分离的角色都不能直接使用 `revise`；不要为了编辑提案给 Agent 增加审核权限。
+
+使用内置可写 Access Provider 时，管理员可以向 `POST /v1/access/bindings/create` 分别发送以下请求。
+将身份替换为 Authentication Provider 确认的身份，将 Scope ID 替换为已有值；请求体只分配角色，不会认证其中的主体。
+
+```json
+{
+  "subject": {"type": "service", "id": "coding-agent"},
+  "resource": {"type": "scope", "scope_id": "scope-project"},
+  "role": "scope.contributor",
+  "idempotency_key": "project-agent-contributor"
+}
+```
+
+```json
+{
+  "subject": {"type": "user", "id": "reviewer"},
+  "resource": {"type": "scope", "scope_id": "scope-project"},
+  "role": "scope.reviewer",
+  "idempotency_key": "project-human-reviewer"
+}
+```
+
+上述分配适用于创建新的 Artifact identity。修改已有 Artifact 的提案还需要相应的目标权限，两个 Scope 角色并不授权所有
+replacement。这个工作流通过角色分配隔离权限，Server 没有全面禁止自审的规则；若同一身份后来同时获得两种权限，
+它仍然可以提交并批准自己的 Candidate。
+
+## 从已有证据发起 Dream
+
+Dream 在后台将选中的 Atomic Memory 或 Experience Revision 提炼成一个待审核候选；也可以返回 `no_change` 或
+`needs_evidence`，不创建候选。先用 `powercontext capabilities` 确认 Server 返回 `artifact_dreaming: true`。
+内置模型适配器目前支持 OpenAI 兼容和 Anthropic 生成配置；SDK 自动重试被关闭，由运行记录统一控制调用预算。
+
+将 Memory API 返回的精确 Atomic Memory 引用写入 `dream.json`：
+
+```json
+{
+  "operation": "refine_experience",
+  "artifacts": [{"family": "atomic-memory", "artifact_id": "ARTIFACT_ID", "revision": 3}],
+  "idempotency_key": "review-write-retry-evidence"
+}
+```
+
+将示例标识替换为同一 Scope 中实际存在的引用，然后提交并查询返回的运行 ID：
+
+```bash
+powercontext dream run --scope-id "$POWERCONTEXT_SCOPE_ID" --request-file dream.json
+powercontext dream show --scope-id "$POWERCONTEXT_SCOPE_ID" RUN_ID
+powercontext dream list --scope-id "$POWERCONTEXT_SCOPE_ID" --status succeeded
+```
+
+HTTP 资源为 `/v1/scopes/{scope_id}/dream`：POST 受理运行，GET 列出运行，
+GET `/v1/scopes/{scope_id}/dream/{run_id}` 查询详情。POST 对进行中的任务返回 202，重放已经结束的请求返回 200。
+相同 key 和规范化后的相同输入返回原运行，修改输入但沿用 key 返回 409。结果为 `proposed` 时，使用其中的
+Candidate ID 按下文审核。运行成功不会自动批准或安装制品。
+
+派生 Skill 时，将 `operation` 改为 `derive_skill`，并在 `artifacts` 中放入已批准的 Experience 引用。
+Atomic Memory 引用可支持修订操作；`derive_skill` 需要已批准的 Experience 引用。要替换已有 Experience，将其当前精确引用同时放入
+`artifacts` 和 `target`。
+
+输入去重后包含 1–20 个 Atomic Memory 和 Experience 引用；加上补充 `sources` 后最多 32 项。Source 使用
+`source_type` 和 `source_id`。默认预算为 32 项投影、64 KiB 模型输入、两次模型调用、每次最多 4,096 输出 token，
+从首次执行起最多 120 秒。每个 Scope 默认最多容纳 32 个排队或运行中的请求。重启后，Worker 通过租约恢复
+已保存的请求，保持原证据快照和执行截止时间。
+
+使用下文的 Candidate 命令或 `POST /v1/candidates/get` 读取当前版本及 `artifact_refs`，
+再通过精确 Source／Artifact Revision 读取接口核对引用正文。
+Dream 运行详情中的 `input_manifest` 保留生成时的根 Source 分组和独立性说明；同一根来源的重复引用不增加独立观察次数，
+无法确认独立性时保留“未知”。审核按当前 Candidate version 及审核者当前权限重新校验证据；引用不可用时不能批准。
+批准后的 Experience Revision 在 lineage 中保存 Candidate 的引用。
+
+Dashboard 默认关闭，是与 Server 共用访问模式的个人内容查看器；启用认证时使用静态 Bearer token。启用后可阅读已批准的 Experience 和 Skill，
+并沿精确引用查看被引用的 Atomic Memory revision；Dream 发起、运行查询和候选审核通过 CLI／Client／HTTP API 完成。
+个人启用步骤见[安装和运行](../get-started/install-and-run.md)。
+
+Dream 使用 `pc_dream_runs` 和统一的 `pc_candidate_heads` / `pc_candidate_versions` 表。已有数据库需在完成 Atomic Memory 转换后，通过统一迁移框架执行协调停服升级。普通启动只校验就绪状态，不重命名 Candidate 表，也不恢复旧引用列。
+
+## 1. 列出待审核 Candidate
+
+```bash
+powercontext candidate list --scope-id "$POWERCONTEXT_SCOPE_ID"
+```
+
+默认 Review Inbox 只列出 `pending` Candidate head。需要时可以按 family 筛选：
+
+```bash
+powercontext candidate list --scope-id "$POWERCONTEXT_SCOPE_ID" --family experience
+powercontext candidate list --scope-id "$POWERCONTEXT_SCOPE_ID" --family skill
+```
+
+响应包含每个 Candidate 的 `candidate_id` 和当前 `version`。如果响应返回 `next_cursor`，通过 `--cursor` 读取下一页。
+`--limit` 可设为 1 到 100，默认值为 50。
+
+## 2. 检查一个 Candidate
+
+```bash
+powercontext candidate show --scope-id "$POWERCONTEXT_SCOPE_ID" CANDIDATE_ID
+```
+
+做决定前，检查以下内容：
+
+- `proposal`，包括全部 Experience 字段，或完整的 Skill 指令与验证项；
+- `source_refs`、`artifact_refs`，以及这些精确引用所标识的证据；
+- `target`，如果该提案会替换已有 Artifact Revision；
+- `reason`、`family`、`status` 和当前 `version`。
+
+证据不能支持的结论不要批准。Skill 指令以后可能被导出，因此包含密钥或不安全指令的 proposal 也应拒绝。批准操作本身
+不会安装或执行 Skill。
+
+## 3. 批准、拒绝或修订
+
+将你刚检查的 `version` 作为 `--expected-version`。
+
+### 批准精确版本
+
+```bash
+powercontext candidate approve \
+  --scope-id "$POWERCONTEXT_SCOPE_ID" \
+  --expected-version 1 \
+  CANDIDATE_ID
+```
+
+响应包含 `status: approved` 和精确的 `result_artifact`。批准会在同一个事务中提交 proposal 并将 Candidate
+标记为 approved。此后 Candidate 进入终态。
+
+### 拒绝精确版本
+
+```bash
+powercontext candidate reject \
+  --scope-id "$POWERCONTEXT_SCOPE_ID" \
+  --expected-version 1 \
+  --reason "证据不能支持提议的经验结论。" \
+  CANDIDATE_ID
+```
+
+响应包含 `status: rejected`，拒绝理由保存在 `decision_reason` 中，并且没有 `result_artifact`。拒绝后 Candidate
+进入终态。
+
+### 修订 Experience Candidate
+
+修订提交的是完整替代 proposal，不是局部补丁。请同时提供新版本应保留的证据：
+
+```bash
+powercontext candidate revise experience \
+  --scope-id "$POWERCONTEXT_SCOPE_ID" \
+  --expected-version 1 \
+  --situation "只测试了一个存储后端。" \
+  --action "在两个后端运行相同的验收场景。" \
+  --outcome "两个后端都通过了测试。" \
+  --lesson "验收行为应与后端无关。" \
+  --source-ref content/SOURCE_ID \
+  CANDIDATE_ID
+```
+
+响应仍为 `pending`，但 `version` 会增加。做下一次决定前，请检查这个新版本。
+
+### 修订 Skill Candidate
+
+较长的指令应放在 UTF-8 文件中。`--instructions` 和 `--instructions-file` 只能选择一个；每个验证项分别使用
+一次 `--validation`：
+
+```bash
+powercontext candidate revise skill \
+  --scope-id "$POWERCONTEXT_SCOPE_ID" \
+  --expected-version 1 \
+  --name backend-validation \
+  --description "以一致方式验证存储后端。" \
+  --instructions-file instructions.md \
+  --validation "SQLite 通过测试。" \
+  --validation "OceanBase 通过测试。" \
+  --artifact-ref experience/EXPERIENCE_ID@REVISION \
+  CANDIDATE_ID
+```
+
+只有替换现有 Artifact 时才使用 `--target FAMILY/ID@REVISION`。CLI 会自动将 target 加入 Candidate 的 Artifact
+证据。
+
+## 4. 验证审核结果
+
+再次读取 Candidate：
+
+```bash
+powercontext candidate show --scope-id "$POWERCONTEXT_SCOPE_ID" CANDIDATE_ID
+```
+
+Candidate 已批准时，记录精确的 `result_artifact`；Candidate 已拒绝时，确认 `decision_reason`。默认 Inbox 不再列出
+这两种终态，需要审计时应显式查询：
+
+```bash
+powercontext candidate list --scope-id "$POWERCONTEXT_SCOPE_ID" --status approved
+powercontext candidate list --scope-id "$POWERCONTEXT_SCOPE_ID" --status rejected
+```
+
+如果写操作报告 Candidate 版本过期，请重新显示 Candidate 并审核新版本。不要在未检查替代内容时直接修改
+`--expected-version`。进入终态的 Candidate 不能再次批准、拒绝或修订。
+
+HTTP API、Python Client 和 MCP 暴露相同的六个 Review 操作，并使用相同的并发规则。接口契约和可用范围见
+[接口](../develop/interfaces.md)。
+
+## 5. 在后续任务中使用 Dream 经验
+
+例如，先记录写请求超时、重放请求以及数据库行数检查的实际结果，再从这些 Source 提取 Memory 条目。
+同一次检查被多条记忆转述时，审核页仍应只显示一个根来源；不要将转述次数当成重复验证次数。
+将这些条目提交给 Dream，检查候选是否明确区分读取重试、幂等写入和提交状态不明的写入，然后批准精确版本。
+
+在后续重试任务开始时，向 `POST /v1/context/prepare` 提交：
+
+```json
+{
+  "scope_id": "SCOPE_ID",
+  "query": "写请求超时且提交状态不明时，怎样避免重试产生重复记录？"
+}
+```
+
+检查返回上下文是否包含已批准 Experience 的精确引用，再将其作为历史证据提供给 Agent。
+pending 或 rejected Candidate、Dream 运行说明不会作为经验进入该上下文。后续任务仍需实际检查提交状态和
+去重结果，并将新的验证结果记录为 Source。若原 Memory 条目已停用，引用它的新 Dream 提交和候选批准都会被阻止。

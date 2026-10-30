@@ -1,5 +1,7 @@
 # PowerContext integration for Hermes Agent
 
+`community`
+
 This directory contains a standard Hermes `MemoryProvider` backed by a running
 PowerContext server. It keeps Hermes responsible for memory lifecycle and Agent
 orchestration while PowerContext provides external storage, retrieval, context
@@ -83,14 +85,12 @@ Configuration can also be stored manually in `$HERMES_HOME/powercontext/config.j
 ```json
 {
   "base_url": "http://127.0.0.1:8000",
-  "scope_id": "hermes:{profile}:{user_id}",
   "max_bytes": 8000,
   "timeout": 5,
   "capture_turns": true,
   "flush_on_session_end": true,
   "capture_pre_compress": false,
-  "evaluation_trace": false,
-  "workstream_persistence": true
+  "evaluation_trace": false
 }
 ```
 
@@ -100,9 +100,10 @@ Environment variables override file values:
 | --- | --- |
 | `POWERCONTEXT_HERMES_CONFIG` | Path to a JSON config file (defaults to `$HERMES_HOME/powercontext/config.json`). |
 | `POWERCONTEXT_HERMES_BASE_URL` | PowerContext server URL |
+| `POWERCONTEXT_HERMES_ALLOW_INSECURE_HTTP` | Explicit non-loopback HTTP consent; overrides common and saved consent, including `false`. |
 | `POWERCONTEXT_HERMES_AUTHORIZATION` | Complete authorization header, e.g. `Bearer <token>` |
 | `POWERCONTEXT_HERMES_TOKEN` | Token shorthand; used when `AUTHORIZATION` is absent |
-| `POWERCONTEXT_HERMES_SCOPE_ID` | Explicit scope or scope template |
+| `POWERCONTEXT_HERMES_SCOPE_ID` | Explicit server-owned Scope ID |
 | `POWERCONTEXT_HERMES_MAX_BYTES` | Maximum prepared context size, 512–32768 |
 | `POWERCONTEXT_HERMES_TIMEOUT` | HTTP request timeout in seconds |
 | `POWERCONTEXT_HERMES_CAPTURE_TURNS` | Capture completed turns as PowerContext Sources |
@@ -110,13 +111,37 @@ Environment variables override file values:
 | `POWERCONTEXT_HERMES_CAPTURE_PRE_COMPRESS` | Capture filtered new user/assistant turns before compression; disabled by default |
 | `POWERCONTEXT_HERMES_EVALUATION_TRACE` | Record recalled context in per-session local JSONL files; disabled by default |
 | `POWERCONTEXT_HERMES_EVALUATION_TRACE_PATH` | Override the evaluation trace directory |
-| `POWERCONTEXT_HERMES_WORKSTREAM` | Read the shared Git-private Workstream scope binding; enabled by default |
 
-The default scope template is `hermes:{profile}:{user_id}`. The provider uses
-the active Hermes profile and gateway user identifier when available. For local
-CLI sessions without a user identifier, it derives a stable identifier from
-the active `HERMES_HOME` path. This prevents cross-profile memory leakage while
-keeping memories available across sessions.
+The client accepts HTTPS and loopback HTTP by default. To configure a
+non-loopback HTTP endpoint explicitly:
+
+```bash
+powercontext setup hermes --server-url http://memory.example:8000 --allow-insecure-http
+```
+
+Setup stores nonsecret settings under `hosts.hermes` in
+`~/.config/powercontext/clients.json` (`POWERCONTEXT_CLIENT_CONFIG_FILE` overrides
+the path). Hermes' native `base_url` configuration remains supported; when it
+is absent, the provider also checks `POWERCONTEXT_CLIENT_SERVER_URL` and saved
+client settings before the loopback default. The host URL environment overrides
+native configuration.
+
+A direct client `allow_insecure_http` argument overrides
+`POWERCONTEXT_HERMES_ALLOW_INSECURE_HTTP`, then
+`POWERCONTEXT_CLIENT_ALLOW_INSECURE_HTTP`, then saved consent. Native Hermes
+configuration can store `allow_insecure_http` with `base_url`; this pair takes
+precedence over shared saved settings. Saved consent belongs only to the
+matching endpoint after stripping trailing slashes and `/mcp`. Changing an
+endpoint through the setup wizard or a session override clears inherited
+consent. Invalid boolean values are rejected.
+
+HTTP sends request content and authorization headers without encryption. This
+opt-in does not change HTTPS certificate verification.
+
+Hermes asks the Server to resolve an explicit Scope, durable session and
+workspace bindings, or the Server default, in that order. Workspace paths are
+hashed only as external binding keys. Hermes does not generate Scope IDs from
+profiles, users, repositories, or directories.
 
 ## Runtime behavior
 
@@ -129,9 +154,23 @@ keeping memories available across sessions.
 - `on_session_end()` waits for queued writes and calls `/v1/memory/flush`.
 - `on_pre_compress()` optionally persists only filtered new user/assistant turns
   and flushes them before Hermes discards old messages. It is disabled by
-  default and uses stable source IDs for overlapping compression windows.
+  default and uses stable source IDs for overlapping compression windows. The
+  provider advertises the pre-compress checkpoint API v2 contract: it captures
+  the host-normalized evidence list when Hermes supplies one, and a checkpoint
+  that cannot be committed raises, so `compression.checkpoint_required` keeps the
+  uncompressed transcript instead of discarding it behind a failed capture.
 - `on_memory_write()` mirrors built-in Hermes memory additions as explicit
-  entries and retires the mapped PowerContext entry for replacements/removals.
+  Atomic records. Replacements revise the same identity with the actual content ETag; removals perform reversible
+  forgetting with the captured Artifact reference and `state_version`. Its local map retains real versioned
+  snapshots, so a later conflict is reported instead of silently refreshing the write basis.
+  Existing maps containing only legacy entry IDs are read-only. To resume mirroring an old item, inspect its migrated
+  Atomic record and explicitly replace that item's value in `$HERMES_HOME/powercontext-memory-map.json` with the
+  actual `{ "artifact": ..., "state_version": ... }` snapshot. Keep the existing item key and verify its text and Scope;
+  the adapter cannot infer an Atomic identity from an entry ID.
+- Automatic writes stay off outside a primary agent context: an `agent_context` of
+  `cron`, `flush` or `subagent`, or a `cron`/`subagent` session platform, disables
+  turn capture and memory mirroring so scheduled runs and delegated children do
+  not write into the user's own memory. Recall is unaffected.
 - Agent tools expose the complete PowerContext operation groups: Memory
   search/list/read/write/change tracking, Work Contract and Handoff flows,
   Experience/Skill proposal and generation, External Skills discovery/import,
@@ -139,9 +178,8 @@ keeping memories available across sessions.
 - Mutating operations are described as explicit user-authorized actions. Artifact
   approval and rejection should only be used after the candidate has been
   reviewed.
-- When Workstream persistence is enabled, Hermes reads
-  .git/powercontext/codex-workspace.json, the same Git-private binding used by
-  the other integrations. An explicit scope_id configuration takes precedence.
+- `/pc scope bind SCOPE_ID` stores a durable workspace binding in PowerContext.
+  `/pc scope clear` removes it and resolves the current Scope again.
 - When evaluation tracing is enabled, each session gets its own JSONL file under
   `powercontext/evaluation-trace/sessions/`. Events include the session ID,
   parent session ID, scope, turn number, and a unique event ID.
@@ -191,80 +229,68 @@ Hermes exposes that invocation context.
 /pc changes [SINCE_REVISION]
 /pc stats [today|7d|30d]
 /pc remember KIND TEXT [REASON]
-/pc revise CITATION_JSON KIND TEXT [REASON]
-/pc retire CITATION_JSON [REASON]
+/pc revise REFERENCE_JSON KIND TEXT
+/pc retire REFERENCE_JSON
 /pc flush
 /pc handoff {contract|current|acknowledge|outcome|activate|prepare|finalize|commit|continue} PAYLOAD_JSON
 /pc experience {propose|generate|get} PAYLOAD_JSON
 /pc skill {propose|generate|get} PAYLOAD_JSON
 /pc external-skills {scan|list|resolve|import} [PAYLOAD_JSON]
 /pc review {list|get|approve|reject|revise} [PAYLOAD_JSON]
-/pc workstream {status|bind SCOPE_ID|clear}
+/pc scope {status|bind SCOPE_ID|clear}
 /pc call OPERATION [PAYLOAD_JSON]
 ```
 
 ### Read, revise, or retire a memory entry
 
-`/pc get` and `/pc retire` do not accept a search keyword or a bare
-`entry_id`. They require the complete `citation` object returned by
-`/pc search`, including the current Memory revision and the entry version.
-Copy only the `hits[].citation` value from the search response, not the whole
-hit object.
-
-For example, first write a memory entry and then search for it:
+Atomic search returns `hits[].memory` records. Copy the actual `artifact` and `state_version` values; do not invent
+entry IDs or a collection revision. `score` is the fused RRF rank score, not confidence or similarity.
+Response `matched_by` channels are `text` and `vector`; search request modes remain `auto`, `fts`, `vector`, or `hybrid`.
 
 ```text
 /pc remember preference "Prefers uv for Python project management"
 /pc search uv
 ```
 
-The relevant part of the `/pc search uv` response includes both the returned
-text and the citation needed by the exact-entry commands. The identifiers and
-revision below are illustrative; always copy them from the current response:
+The response has this shape (the identifiers are illustrative; use the actual returned values):
 
 ```json
 {
-  "memory": {
-    "family": "memory",
-    "artifact_id": "memory",
-    "revision": 2
-  },
   "mode": "fts",
-  "hits": [
-    {
-      "citation": {
-        "memory_ref": {
-          "family": "memory",
-          "artifact_id": "memory",
-          "revision": 2
-        },
-        "entry_id": "mem_ent_8f9653d66a664398aa18bc5c88e0283d",
-        "entry_version_id": "mem_ver_b12a8e6434254cae8a747792905006ed"
-      },
-      "text": "Prefers uv for Python project management (venv, dependency resolution, lockfile) over pip/Poetry/pip-tools."
-    }
-  ]
+  "hits": [{
+    "memory": {
+      "artifact": {"family": "atomic-memory", "artifact_id": "am_example", "revision": 1},
+      "kind": "preference",
+      "text": "Prefers uv for Python project management",
+      "state": "active",
+      "state_version": 0,
+      "merged_into_id": null
+    },
+    "score": 0.01639344262295082,
+    "matched_by": ["text"]
+  }]
 }
 ```
 
-Copy the `hits[0].citation` object from the actual response and use it as
-follows:
+Use the captured reference for exact reads and conditional changes:
 
 ```text
-/pc get {"memory_ref":{"family":"memory","artifact_id":"memory","revision":2},"entry_id":"mem_ent_8f9653d66a664398aa18bc5c88e0283d","entry_version_id":"mem_ver_b12a8e6434254cae8a747792905006ed"}
-/pc retire {"memory_ref":{"family":"memory","artifact_id":"memory","revision":2},"entry_id":"mem_ent_8f9653d66a664398aa18bc5c88e0283d","entry_version_id":"mem_ver_b12a8e6434254cae8a747792905006ed"} "no longer needed"
+/pc get {"artifact":{"family":"atomic-memory","artifact_id":"am_example","revision":1},"state_version":0}
+/pc revise {"artifact":{"family":"atomic-memory","artifact_id":"am_example","revision":1},"state_version":0} preference "Prefers uv for Python projects"
+/pc retire {"artifact":{"family":"atomic-memory","artifact_id":"am_example","revision":1},"state_version":0}
 ```
 
-To revise instead of retiring, use the same citation with:
+Run each mutation with the current returned reference; these example commands are alternatives. Revision reads the
+current content ETag and submits `If-Match`. Public manual content edits compare content revision only; they do not
+compare lifecycle state versions. Active and forgotten records can be edited; merged and retired records cannot.
+`retire` is the retained host command name for reversible forgetting, checked against both the actual Artifact
+reference and its captured `state_version`. Refresh and inspect after a conflict before retrying.
 
-```text
-/pc revise {"memory_ref":{"family":"memory","artifact_id":"memory","revision":2},"entry_id":"mem_ent_8f9653d66a664398aa18bc5c88e0283d","entry_version_id":"mem_ver_b12a8e6434254cae8a747792905006ed"} preference "Prefers uv for Python project management" "updated preference"
-```
-
-`retire` is a logical retirement; it removes the entry from active memory but
-keeps its history. Because every memory mutation advances the artifact
-revision, do not reuse this citation after `revise` or another write. Search
-again and use the newest citation before the next `get`, `revise`, or `retire`.
+Get also accepts a plain exact Atomic ArtifactRef
+(`{"family":"atomic-memory","artifact_id":...,"revision":...}`). `MemoryCitation` objects with `memory_ref`,
+`entry_id`, and `entry_version_id` are rejected locally for reads, revisions, and retirement. `/pc changes` explicitly
+reports unsupported collection history; use precise Artifact revision reads. The `powercontext_get_memory` and `powercontext_retire_memory` tools take a `reference` object, while
+`powercontext_revise_memory_entry` takes that object in `citation`.
 
 Trace enable/disable changes the current Hermes process only. Configure
 `evaluation_trace` or `POWERCONTEXT_HERMES_EVALUATION_TRACE` when tracing should
@@ -281,6 +307,7 @@ hermes powercontext status
 hermes powercontext search "Python project management"
 hermes powercontext remember preference "The user prefers uv"
 hermes powercontext flush
+hermes powercontext get '{"artifact":{"family":"atomic-memory","artifact_id":"am_example","revision":1},"state_version":0}'
 hermes powercontext call get_stats '{"period":"7d"}'
 ```
 

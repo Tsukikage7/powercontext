@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shlex
 import shutil
 import socket
 import subprocess
@@ -26,23 +25,23 @@ import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 import uvicorn
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from pydantic import SecretStr
-from pydantic_ai.models.test import TestModel
 
 from powercontext.builtin.artifacts.handoff import HandoffDraft, HandoffGenerationRequest, HandoffStatement
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import InferenceConfig
 from powercontext.server.factory import create_server_app
-from powercontext.server.settings import BearerAuthConfig, McpConfig, ServerSettings
+from powercontext.server.settings import AccessControlConfig, BearerAuthConfig, McpConfig, ServerSettings
+from tests.e2e.atomic_memory_models import independent_atomic_memory_model
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CLAUDE_PLUGIN = PROJECT_ROOT / "integrations" / "claude-code" / "plugins" / "powercontext"
 CODEX_PLUGIN = PROJECT_ROOT / "integrations" / "codex" / "plugins" / "powercontext"
-SCOPE_ID = "git:github.com/oceanbase/powercontext"
 AUTH_TOKEN = "claude-code-e2e-token"  # noqa: S105 - non-secret test credential.
 AUTHORIZATION = f"Bearer {AUTH_TOKEN}"
 
@@ -66,27 +65,16 @@ def test_claude_sessions_and_codex_share_one_project_memory(
     monkeypatch: pytest.MonkeyPatch,
     authentication_enabled: bool,
 ) -> None:
-    model_output = """
-    {
-      "candidates": [{
-        "intent": "add",
-        "kind": "decision",
-        "text": "Use PowerContext as the shared project context service.",
-        "evidence_ids": ["source:0"],
-        "reason": "captured by the Claude Code hook"
-      }]
-    }
-    """
     monkeypatch.setattr(
         "pydantic_ai.models.infer_model",
-        lambda _: TestModel(custom_output_text=model_output),
+        lambda _: independent_atomic_memory_model("Use PowerContext as the shared project context service."),
     )
     app = create_server_app(
         settings=ServerSettings(
             auth=BearerAuthConfig(
-                enabled=authentication_enabled,
                 token=SecretStr(AUTH_TOKEN) if authentication_enabled else None,
             ),
+            access=AccessControlConfig(mode="enforced" if authentication_enabled else "disabled"),
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}"),
             inference=InferenceConfig(generation_model="test"),
             mcp=McpConfig(enabled=True),
@@ -107,6 +95,10 @@ def test_claude_sessions_and_codex_share_one_project_memory(
         mcp_configuration = json.loads((codex_plugin / ".mcp.json").read_text())
         mcp_configuration["mcpServers"]["powercontext"]["url"] = f"{base_url}/mcp"
         (codex_plugin / ".mcp.json").write_text(json.dumps(mcp_configuration))
+        scope_id = _create_scope(
+            base_url,
+            authorization=AUTHORIZATION if authentication_enabled else None,
+        )
 
         captured = _run_claude_hook(
             prompt="Remember the shared project context service.",
@@ -114,6 +106,7 @@ def test_claude_sessions_and_codex_share_one_project_memory(
             prompt_id="prompt-1",
             base_url=base_url,
             authorization=AUTHORIZATION if authentication_enabled else None,
+            scope_id=scope_id,
         )
         assert captured.stdout == ""
         assert AUTH_TOKEN not in captured.stderr
@@ -124,6 +117,7 @@ def test_claude_sessions_and_codex_share_one_project_memory(
             prompt_id="prompt-2",
             base_url=base_url,
             authorization=AUTHORIZATION if authentication_enabled else None,
+            scope_id=scope_id,
         )
         claude_context = json.loads(recalled_by_claude.stdout)["hookSpecificOutput"]["additionalContext"]
         claude_envelope = json.loads(claude_context.splitlines()[-2])
@@ -134,6 +128,7 @@ def test_claude_sessions_and_codex_share_one_project_memory(
             codex_plugin,
             prompt="Which shared project context service should we use?",
             authorization=AUTHORIZATION if authentication_enabled else None,
+            scope_id=scope_id,
         )
         codex_context = json.loads(recalled_by_codex.stdout)["hookSpecificOutput"]["additionalContext"]
         codex_envelope = json.loads(codex_context.splitlines()[-2])
@@ -154,9 +149,9 @@ def test_claude_plugin_mcp_supports_explicit_memory_and_handoff_workflows(
     app = create_server_app(
         settings=ServerSettings(
             auth=BearerAuthConfig(
-                enabled=authentication_enabled,
                 token=SecretStr(AUTH_TOKEN) if authentication_enabled else None,
             ),
+            access=AccessControlConfig(mode="enforced" if authentication_enabled else "disabled"),
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'mcp.db'}"),
             mcp=McpConfig(enabled=True),
         ),
@@ -185,7 +180,7 @@ def test_claude_plugin_mcp_supports_explicit_memory_and_handoff_workflows(
 
     assert AUTH_TOKEN not in helper_errors
     assert result == {
-        "memory_state": "inactive",
+        "memory_state": "forgotten",
         "memory_text": "Use the Claude Code plugin MCP transport for explicit operations.",
         "temporary_selection": "prepared",
         "committed_family": "handoff",
@@ -196,26 +191,24 @@ def test_claude_plugin_mcp_supports_explicit_memory_and_handoff_workflows(
 def _claude_mcp_connection(base_url: str, *, authorization: str | None) -> tuple[str, dict[str, str], str]:
     configuration = json.loads((CLAUDE_PLUGIN / ".mcp.json").read_text(encoding="utf-8"))["powercontext"]
     endpoint = configuration["url"].replace("${user_config.server_url}", base_url)
-    helper_command = configuration["headersHelper"].replace("${CLAUDE_PLUGIN_ROOT}", CLAUDE_PLUGIN.as_posix())
-    environment = dict(os.environ)
-    environment.pop("POWERCONTEXT_CLAUDE_AUTHORIZATION", None)
-    if authorization is not None:
-        environment["POWERCONTEXT_CLAUDE_AUTHORIZATION"] = authorization
-    completed = subprocess.run(
-        shlex.split(helper_command),
-        cwd=PROJECT_ROOT,
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=True,
-        timeout=5,
+    header = configuration["headers"]["Authorization"].replace(
+        "${POWERCONTEXT_CLAUDE_AUTHORIZATION:-}",
+        authorization or "",
     )
-    return endpoint, json.loads(completed.stdout), completed.stderr
+    return endpoint, {"Authorization": header} if header else {}, ""
 
 
 async def _exercise_explicit_mcp_workflows(endpoint: str, headers: dict[str, str]) -> dict[str, object]:
-    scope_id = "project:claude-code-mcp"
     async with Client(StreamableHttpTransport(endpoint, headers=headers)) as client:
+        created_scope = await client.call_tool(
+            "create_scope",
+            {
+                "title": "Claude Code MCP workflow",
+                "summary": "Explicit memory and Handoff workflow acceptance.",
+                "idempotency_key": "claude-code-mcp-workflow",
+            },
+        )
+        scope_id = (created_scope.structured_content or {})["scope_id"]
         remembered_result = await client.call_tool(
             "remember_memory",
             {
@@ -226,23 +219,33 @@ async def _exercise_explicit_mcp_workflows(endpoint: str, headers: dict[str, str
             },
         )
         remembered = remembered_result.structured_content or {}
+        memory = remembered["records"][0]["artifact"]
+        target = {"scope_id": scope_id, "family": memory["family"], "artifact_id": memory["artifact_id"]}
+        head_result = await client.call_tool("get_artifact", target)
+        head = head_result.structured_content or {}
         revised_result = await client.call_tool(
-            "revise_memory_entry",
+            "replace_artifact",
             {
-                "scope_id": scope_id,
-                "citation": remembered["entry"]["citation"],
-                "kind": "decision",
-                "text": "Use the Claude Code plugin MCP transport for explicit operations.",
-                "reason": "Clarify the integration boundary.",
+                **target,
+                "If-Match": head["etag"],
+                "content": {
+                    "kind": "decision",
+                    "text": "Use the Claude Code plugin MCP transport for explicit operations.",
+                },
             },
         )
         revised = revised_result.structured_content or {}
+        state_result = await client.call_tool(
+            "get_atomic_memory_state", {"scope_id": scope_id, "artifact_id": memory["artifact_id"]}
+        )
+        state = state_result.structured_content or {}
+        assert state["artifact"]["revision"] == revised["artifact"]["revision"]
         retired_result = await client.call_tool(
-            "retire_memory_entry",
+            "change_atomic_memory_lifecycle",
             {
                 "scope_id": scope_id,
-                "citation": revised["entry"]["citation"],
-                "reason": "Exercise the complete explicit maintenance lifecycle.",
+                "target": {"artifact": state["artifact"], "state_version": state["state_version"]},
+                "state": "forgotten",
             },
         )
         retired = retired_result.structured_content or {}
@@ -287,8 +290,8 @@ async def _exercise_explicit_mcp_workflows(endpoint: str, headers: dict[str, str
         latest = latest_result.structured_content or {}
 
     return {
-        "memory_state": retired["entry"]["state"],
-        "memory_text": retired["entry"]["text"],
+        "memory_state": retired["records"][0]["state"],
+        "memory_text": retired["records"][0]["text"],
         "temporary_selection": temporary["selection"],
         "committed_family": committed["reference"]["family"],
         "latest_matches_commit": latest["selected_revision"] == committed["reference"],
@@ -302,6 +305,7 @@ def _run_claude_hook(
     prompt_id: str,
     base_url: str,
     authorization: str | None,
+    scope_id: str,
 ) -> subprocess.CompletedProcess[str]:
     environment: dict[str, str] = {
         **os.environ,
@@ -309,7 +313,7 @@ def _run_claude_hook(
         "POWERCONTEXT_CLAUDE_FLUSH_ON_CAPTURE": "true",
         "POWERCONTEXT_CLAUDE_HTTP_BUDGET_SECONDS": "10",
         "POWERCONTEXT_CLAUDE_REQUEST_TIMEOUT_SECONDS": "5",
-        "POWERCONTEXT_CLAUDE_SCOPE_ID": SCOPE_ID,
+        "POWERCONTEXT_CLAUDE_SCOPE_ID": scope_id,
     }
     environment.pop("POWERCONTEXT_CLAUDE_AUTHORIZATION", None)
     if authorization is not None:
@@ -337,10 +341,11 @@ def _run_codex_hook(
     *,
     prompt: str,
     authorization: str | None,
+    scope_id: str,
 ) -> subprocess.CompletedProcess[str]:
     environment: dict[str, str] = {
         **os.environ,
-        "POWERCONTEXT_CODEX_SCOPE_ID": SCOPE_ID,
+        "POWERCONTEXT_CODEX_SCOPE_ID": scope_id,
         "POWERCONTEXT_CODEX_CAPTURE_PROMPTS": "false",
         "POWERCONTEXT_CODEX_HTTP_BUDGET_SECONDS": "10",
         "POWERCONTEXT_CODEX_REQUEST_TIMEOUT_SECONDS": "5",
@@ -364,6 +369,22 @@ def _run_codex_hook(
         check=True,
         timeout=15,
     )
+
+
+def _create_scope(base_url: str, *, authorization: str | None) -> str:
+    headers = {"Authorization": authorization} if authorization is not None else None
+    response = httpx.post(
+        f"{base_url}/v1/scopes",
+        headers=headers,
+        json={
+            "title": "Shared agent work",
+            "summary": "Shared memory for the Claude Code and Codex sessions.",
+            "idempotency_key": "shared-agent-work",
+        },
+        timeout=5,
+    )
+    response.raise_for_status()
+    return response.json()["scope_id"]
 
 
 def _wait_until_started(server: uvicorn.Server, thread: threading.Thread) -> None:

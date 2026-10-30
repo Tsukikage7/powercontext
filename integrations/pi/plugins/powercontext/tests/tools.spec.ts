@@ -15,6 +15,14 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fauxProvider, fauxAssistantMessage, fauxToolCall, validateToolArguments, type Tool, type ToolCall } from '@earendil-works/pi-ai'
+import { getModel, streamSimple } from '@earendil-works/pi-ai/compat'
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ToolDefinition } from '@earendil-works/pi-coding-agent'
+import type { TSchema } from 'typebox'
+import { Value } from 'typebox/value'
 import powercontextPi from '../extensions/powercontext.ts'
 import { PowerContextClient, type FetchFn } from '../src/client.ts'
 import { registerTools } from '../src/tools.ts'
@@ -29,6 +37,7 @@ function createRuntime(fetch: FetchFn): PluginRuntime {
     }),
     config: {
       baseUrl: 'http://127.0.0.1:8000',
+      allowInsecureHttp: false,
       scopeId: undefined,
       authorization: undefined,
       capturePrompts: true,
@@ -37,25 +46,32 @@ function createRuntime(fetch: FetchFn): PluginRuntime {
       maxBytes: 8000,
       flushOnCapture: false,
       flushMaxCalls: 4,
+      diagnostics: 'off',
     },
     resolveScope: async () => 'project:demo',
   } as PluginRuntime
 }
 
 type RegisteredTool<Params> = {
+  parameters?: TSchema
   execute: (
     id: string,
     params: Params,
     signal: AbortSignal,
     update: () => void,
     context: Record<string, unknown>,
-  ) => Promise<{ details: { code?: string; data?: unknown; ok: boolean } }>
+  ) => Promise<{ details: { code?: string; data?: unknown; message?: string; ok: boolean } }>
 }
 
 function registeredTool<Params>(tools: Array<Record<string, unknown>>, name: string): RegisteredTool<Params> {
   const tool = tools.find((candidate) => candidate.name === name)
   if (!tool) throw new Error(`Expected ${name} to be registered.`)
   return tool as unknown as RegisteredTool<Params>
+}
+
+function validatePiArguments(tool: Tool & { prepareArguments?: (args: unknown) => Record<string, unknown> }, call: ToolCall) {
+  const args = tool.prepareArguments ? tool.prepareArguments(call.arguments) : call.arguments
+  return validateToolArguments(tool, { ...call, arguments: args })
 }
 
 describe('Pi native tool surface', () => {
@@ -72,15 +88,37 @@ describe('Pi native tool surface', () => {
       'pc_remember',
       'pc_memory_list',
       'pc_memory_get',
+      'pc_memory_state',
+      'pc_stats',
       'pc_memory_revise',
       'pc_memory_retire',
       'pc_prepare_context',
       'pc_capture_source',
+      'pc_capture_working_note',
       'pc_handoff_activate',
+      'pc_work_contract',
+      'pc_handoff_current',
+      'pc_handoff_acknowledge',
+      'pc_task_outcome',
       'pc_handoff_prepare',
       'pc_handoff_finalize',
       'pc_handoff_commit',
       'pc_handoff_continue',
+      'pc_experience_get',
+      'pc_skill_get',
+      'pc_experience_generate',
+      'pc_skill_generate',
+      'pc_topic_search',
+      'pc_topic_get',
+      'pc_review_list',
+      'pc_review_get',
+      'pc_review_approve',
+      'pc_review_reject',
+      'pc_review_revise',
+      'pc_external_scan',
+      'pc_external_list',
+      'pc_external_resolve',
+      'pc_external_import',
     ]))
     expect(tools.map((tool) => tool.name)).not.toContain('pc_call')
   })
@@ -122,6 +160,696 @@ describe('Pi native tool surface', () => {
       text: 'keep API async',
       scope_id: 'project:demo',
     })
+  })
+
+  it('routes Memory State and Stats as read-only current-Scope operations', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true })))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const confirm = vi.fn(async () => true)
+    const context = { cwd: '/workspace/repo', hasUI: false, ui: { confirm } }
+    const signal = new AbortController().signal
+
+    await registeredTool<{ artifact_id: string }>(registered, 'pc_memory_state').execute(
+      'call-state', { artifact_id: 'atomic-7' }, signal, () => undefined, context,
+    )
+    await registeredTool<{ period: string }>(registered, 'pc_stats').execute(
+      'call-stats', { period: '7d' }, signal, () => undefined, context,
+    )
+
+    expect(confirm).not.toHaveBeenCalled()
+    expect(fetch.mock.calls.map(([url, init]) => [url, init?.body ? JSON.parse(String(init.body)) : {}])).toEqual([
+      ['http://127.0.0.1:8000/v1/scopes/project%3Ademo/artifacts/atomic-memory/atomic-7/state', {}],
+      ['http://127.0.0.1:8000/v1/stats', { period: '7d', selection: { mode: 'exact', scope_ids: ['project:demo'] } }],
+    ])
+  })
+
+  it('routes Working Note capture as a scoped, confirmed write', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => (
+      new Response(JSON.stringify({ status: 'accepted', source: { name: 'content', source_id: 'note-1' }, position: 1 }), { status: 202 })
+    ))
+    registerTools(
+      { registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never,
+      createRuntime(fetch),
+    )
+    const confirm = vi.fn(async () => true)
+
+    const result = await registeredTool<{
+      source_id: string
+      content: string
+      session_id: string
+      note_kind: string
+      expires_at?: string
+    }>(registered, 'pc_capture_working_note').execute(
+      'call-note',
+      {
+        source_id: 'note-1',
+        content: 'Parser validation is still in progress.',
+        session_id: 'session-1',
+        note_kind: 'validation',
+        expires_at: '2030-01-02T00:00:00Z',
+      },
+      new AbortController().signal,
+      () => undefined,
+      { cwd: '/workspace/repo', hasUI: true, ui: { confirm } },
+    )
+
+    expect(result.details).toMatchObject({ ok: true })
+    expect(confirm).toHaveBeenCalled()
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([[
+      'http://127.0.0.1:8000/v1/sources/working-notes',
+      {
+        source_id: 'note-1',
+        content: 'Parser validation is still in progress.',
+        session_id: 'session-1',
+        note_kind: 'validation',
+        expires_at: '2030-01-02T00:00:00Z',
+        scope_id: 'project:demo',
+      },
+    ]])
+  })
+
+  it('keeps the read-only tool schemas within the API contract', () => {
+    const registered: Array<Record<string, unknown>> = []
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(vi.fn()))
+    const state = registeredTool<Record<string, unknown>>(registered, 'pc_memory_state') as unknown as { parameters: TSchema }
+    const stats = registeredTool<Record<string, unknown>>(registered, 'pc_stats') as unknown as { parameters: TSchema }
+
+    expect(Value.Check(state.parameters, {})).toBe(false)
+    expect(Value.Check(state.parameters, { artifact_id: 'atomic-7' })).toBe(true)
+    expect(Value.Check(state.parameters, { artifact_id: '' })).toBe(false)
+    expect(Value.Check(state.parameters, { artifact_id: null })).toBe(false)
+    expect(Value.Check(state.parameters, { artifact_id: 'has space' })).toBe(false)
+    expect(Value.Check(state.parameters, { artifact_id: 'atomic-7', extra: true })).toBe(false)
+    expect(Value.Check(stats.parameters, {})).toBe(true)
+    expect(Value.Check(stats.parameters, { period: 'today' })).toBe(true)
+    expect(Value.Check(stats.parameters, { period: '7d' })).toBe(true)
+    expect(Value.Check(stats.parameters, { period: '90d' })).toBe(false)
+    expect(Value.Check(stats.parameters, { period: '30d', extra: true })).toBe(false)
+  })
+
+  it('preserves exact Atomic Memory identity through Pi argument validation', () => {
+    const registered: Array<Record<string, unknown>> = []
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(vi.fn()))
+    const tool = registeredTool<Record<string, unknown>>(registered, 'pc_memory_state') as unknown as Tool
+    const call = (artifact_id: unknown): ToolCall => ({
+      type: 'toolCall', id: 'call-validation', name: 'pc_memory_state', arguments: { artifact_id },
+    })
+
+    for (const artifact_id of ['atomic-7', 'null', 'undefined', '123', 'true']) {
+      expect(validatePiArguments(tool, call(artifact_id))).toEqual({ artifact_id })
+    }
+    for (const artifact_id of [null, 123, true, 'has space', '']) {
+      expect(() => validatePiArguments(tool, call(artifact_id))).toThrow('Validation failed')
+    }
+  })
+
+  it('rejects coerced Atomic Memory references before exact reads and writes', () => {
+    const registered: Array<Record<string, unknown>> = []
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(vi.fn()))
+    for (const name of ['pc_memory_get', 'pc_memory_revise', 'pc_memory_retire']) {
+      const tool = registeredTool<Record<string, unknown>>(registered, name) as unknown as Tool
+      const fields = name === 'pc_memory_revise' ? { kind: 'decision', text: 'curated fact', if_match: '"content-etag"' }
+        : name === 'pc_memory_retire' ? { state_version: 3 } : {}
+      const call = (artifact_id: unknown, revision: unknown = 1): ToolCall => ({
+        type: 'toolCall', id: 'call-validation', name,
+        arguments: { ...fields, artifact: { family: 'atomic-memory', artifact_id, revision } },
+      })
+      for (const artifact_id of ['atomic-7', 'null', 'undefined', '123', 'true']) {
+        expect(validatePiArguments(tool, call(artifact_id))).toEqual(call(artifact_id).arguments)
+      }
+      for (const artifact_id of [null, 123, true]) {
+        expect(() => validatePiArguments(tool, call(artifact_id))).toThrow('Validation failed')
+      }
+      for (const revision of ['1', true]) {
+        expect(() => validatePiArguments(tool, call('atomic-7', revision))).toThrow('Validation failed')
+      }
+    }
+  })
+
+  it('publishes strict Atomic Memory identity schemas through Pi provider serialization', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(vi.fn()))
+    const tool = registeredTool<Record<string, unknown>>(registered, 'pc_memory_state') as unknown as Tool
+    for (const model of [getModel('openai', 'gpt-4o'), getModel('anthropic', 'claude-sonnet-4-5')]) {
+      let parameters: (TSchema & { type?: string; required?: string[] }) | undefined
+      const stream = streamSimple(model, { messages: [], tools: [tool] }, {
+        apiKey: 'schema-fixture',
+        onPayload: (payload) => {
+          const serialized = JSON.parse(JSON.stringify(payload)) as {
+            tools: Array<{ function?: { parameters: TSchema }; parameters?: TSchema; input_schema?: TSchema }>
+          }
+          parameters = serialized.tools[0]?.function?.parameters ?? serialized.tools[0]?.parameters ?? serialized.tools[0]?.input_schema
+          throw new Error('schema fixture stops before network dispatch')
+        },
+      })
+      expect((await stream.result()).errorMessage).toContain('schema fixture stops before network dispatch')
+      expect(parameters?.type).toBe('object')
+      expect(parameters?.required).toContain('artifact_id')
+      expect(Value.Check(parameters as TSchema, { artifact_id: 'null' })).toBe(true)
+      for (const artifact_id of [null, 123, true]) {
+        expect(Value.Check(parameters as TSchema, { artifact_id })).toBe(false)
+      }
+    }
+  })
+
+  it('blocks invalid raw identities in the real Pi agent loop before HTTP dispatch', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'pc-pi-identity-'))
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true })))
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(fetch))
+    const tool = registeredTool<Record<string, unknown>>(registered, 'pc_memory_state') as unknown as ToolDefinition
+    const settingsManager = SettingsManager.inMemory()
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: home, agentDir: home, settingsManager,
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    })
+    const faux = fauxProvider({ tokensPerSecond: Infinity })
+    let session: Awaited<ReturnType<typeof createAgentSession>>['session'] | undefined
+    try {
+      await resourceLoader.reload()
+      const modelRuntime = await ModelRuntime.create({ authPath: join(home, 'auth.json'), modelsPath: null })
+      modelRuntime.registerNativeProvider(faux.provider)
+      ;({ session } = await createAgentSession({
+        cwd: home, agentDir: home, model: faux.getModel(), noTools: 'builtin', customTools: [tool],
+        sessionManager: SessionManager.inMemory(home), settingsManager, resourceLoader, modelRuntime,
+      }))
+      for (const artifact_id of [null, 123, true, 'null', '123', 'true']) {
+        session.agent.reset()
+        faux.setResponses([
+          fauxAssistantMessage(fauxToolCall('pc_memory_state', { artifact_id }), { stopReason: 'toolUse' }),
+          fauxAssistantMessage('done'),
+        ])
+        await session.agent.prompt('Inspect the Memory state.')
+        const result = session.agent.state.messages.find((message) => message.role === 'toolResult')
+        expect(result?.role, JSON.stringify(session.agent.state.messages)).toBe('toolResult')
+        if (result?.role !== 'toolResult') throw new Error('Pi must report the tool outcome.')
+        expect(result.isError).toBe(typeof artifact_id !== 'string')
+        if (typeof artifact_id !== 'string') {
+          expect(JSON.stringify(result.content)).toContain('Validation failed')
+          expect(fetch).not.toHaveBeenCalled()
+        }
+      }
+      expect(fetch.mock.calls.map(([url]) => url)).toEqual(['null', '123', 'true'].map((artifact_id) =>
+        `http://127.0.0.1:8000/v1/scopes/project%3Ademo/artifacts/atomic-memory/${artifact_id}/state`,
+      ))
+    } finally {
+      session?.dispose()
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('requires confirmation and filters secrets for all structured work writes', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true })))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const context = {
+      cwd: '/workspace/repo',
+      hasUI: false,
+      ui: { confirm: vi.fn(async () => true) },
+    }
+    const signal = new AbortController().signal
+
+    const workWrites: Array<[string, Record<string, unknown>]> = [
+      ['pc_work_contract', { source_id: 'contract-1', contract: { objective: 'ship feature' } }],
+      ['pc_handoff_current', { source_id: 'boundary-1', handoff: { objective: 'continue feature' } }],
+      ['pc_handoff_acknowledge', {
+        source_id: 'receipt-1', receiver: 'pi', status: 'accepted', selection: 'exact',
+        receiver_checks: { live_state: 'confirmed', capability: 'confirmed', authorization: 'confirmed' },
+        revision: { family: 'handoff', artifact_id: 'handoff-1', revision: 1 },
+      }],
+      ['pc_task_outcome', { source_id: 'outcome-1', outcome: { status: 'succeeded' } }],
+    ]
+
+    for (const [name, params] of workWrites) {
+      const result = await registeredTool<Record<string, unknown>>(registered, name).execute(
+        `call-${name}`, params, signal, () => undefined, context,
+      )
+      expect(result.details).toMatchObject({ ok: false, code: 'confirmation_required' })
+    }
+    expect(fetch).not.toHaveBeenCalled()
+
+    context.hasUI = true
+    const confirm = vi.fn(async () => true)
+    context.ui.confirm = confirm
+    await registeredTool<{ source_id: string; outcome: Record<string, unknown> }>(registered, 'pc_task_outcome').execute(
+      'call-secret', { source_id: 'outcome-2', outcome: { summary: 'token=secret' } }, signal, () => undefined, context,
+    )
+    expect(confirm).toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('routes generation requests as scoped, confirmed candidate writes', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ status: 'pending', candidate: { id: 'candidate-1' } })))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const context = { cwd: '/workspace/repo', hasUI: true, ui: { confirm: vi.fn(async () => true) } }
+    const signal = new AbortController().signal
+    const source = { name: 'git', source_id: 'commit-1' }
+    const artifact = { family: 'experience', artifact_id: 'exp-1', revision: 1 }
+
+    await registeredTool<Record<string, unknown>>(registered, 'pc_experience_generate').execute(
+      'call-experience', { source_refs: [source], artifact_refs: [artifact], target: null, reason: 'requested' },
+      signal, () => undefined, context,
+    )
+    await registeredTool<Record<string, unknown>>(registered, 'pc_skill_generate').execute(
+      'call-skill', { origin: 'experience', source_refs: [source], artifact_refs: [artifact], target: null, reason: 'requested' },
+      signal, () => undefined, context,
+    )
+
+    expect(context.ui.confirm).toHaveBeenCalledTimes(2)
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([
+      ['http://127.0.0.1:8000/v1/experience/generate', { source_refs: [source], artifact_refs: [artifact], target: null, reason: 'requested', scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/skill/generate', { origin: 'experience', source_refs: [source], artifact_refs: [artifact], target: null, reason: 'requested', scope_id: 'project:demo' }],
+    ])
+  })
+
+  it('uses the separate generation deadline and reports a timeout as an unknown write outcome', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const runtime = createRuntime(async (_url, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }))
+    runtime.config.generationTimeoutMs = 10
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+
+    const result = await registeredTool<Record<string, unknown>>(registered, 'pc_experience_generate').execute(
+      'call-timeout', { source_refs: [], artifact_refs: [] }, new AbortController().signal, () => undefined,
+      { cwd: '/workspace/repo', hasUI: true, ui: { confirm: vi.fn(async () => true) } },
+    )
+
+    expect(result.details).toMatchObject({ ok: false, code: 'unknown_write_outcome' })
+    expect(result.details.message).toContain('pc_review_list')
+  })
+
+  it('publishes generation fields through Pi top-level schemas and rejects excess combined evidence before dispatch', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(vi.fn()))
+    const source = { name: 'git', source_id: 'commit-1' }
+    const artifact = { family: 'experience', artifact_id: 'exp-1', revision: 1 }
+    const experienceSchema = registeredTool<Record<string, unknown>>(registered, 'pc_experience_generate').parameters
+    const skillSchema = registeredTool<Record<string, unknown>>(registered, 'pc_skill_generate').parameters
+    expect(experienceSchema).toMatchObject({
+      type: 'object', required: ['source_refs', 'artifact_refs'],
+      properties: { source_refs: expect.anything(), artifact_refs: expect.anything(), target: expect.anything(), reason: expect.anything() },
+    })
+    expect(skillSchema).toMatchObject({
+      type: 'object', required: ['origin', 'source_refs', 'artifact_refs'],
+      properties: { origin: expect.anything(), source_refs: expect.anything(), artifact_refs: expect.anything() },
+    })
+    expect(Value.Check(experienceSchema as TSchema, {
+      source_refs: Array.from({ length: 32 }, () => source),
+      artifact_refs: [],
+    })).toBe(true)
+    expect(Value.Check(experienceSchema as TSchema, {
+      source_refs: Array.from({ length: 32 }, () => source),
+      artifact_refs: [artifact],
+    })).toBe(true)
+
+    const overLimit = await registeredTool<Record<string, unknown>>(registered, 'pc_experience_generate').execute(
+      'call-over-limit', { source_refs: Array.from({ length: 32 }, () => source), artifact_refs: [artifact] },
+      new AbortController().signal, () => undefined, { cwd: '/workspace/repo', hasUI: true, ui: { confirm: vi.fn() } },
+    )
+    expect(overLimit.details).toMatchObject({ ok: false, code: 'invalid_request' })
+  })
+
+  it('validates candidate review parameters against the API limits', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(vi.fn()))
+
+    const approve = registeredTool<Record<string, unknown>>(registered, 'pc_review_approve') as unknown as { parameters: TSchema }
+    const reject = registeredTool<Record<string, unknown>>(registered, 'pc_review_reject') as unknown as { parameters: TSchema }
+    const revise = registeredTool<Record<string, unknown>>(registered, 'pc_review_revise') as unknown as { parameters: TSchema }
+
+    expect(Value.Check(approve.parameters, { candidate_id: 'candidate-1', expected_version: 1 })).toBe(true)
+    expect(Value.Check(approve.parameters, { candidate_id: '', expected_version: 1 })).toBe(false)
+    expect(Value.Check(approve.parameters, { candidate_id: 'candidate-1', expected_version: 0 })).toBe(false)
+    expect(Value.Check(approve.parameters, { candidate_id: 'candidate-1', expected_version: 1, extra: true })).toBe(false)
+    expect(Value.Check(reject.parameters, { candidate_id: 'candidate-1', expected_version: 1, reason: '   ' })).toBe(false)
+    expect(Value.Check(reject.parameters, { candidate_id: 'candidate-1', expected_version: 1, reason: 'x'.repeat(2001) })).toBe(false)
+    expect(Value.Check(revise.parameters, {
+      candidate_id: 'candidate-1',
+      expected_version: 1,
+      proposal: { situation: 'before', action: 'change', outcome: 'after', lesson: 'keep tests' },
+      source_refs: [],
+      artifact_refs: [],
+    })).toBe(true)
+    expect(Value.Check(revise.parameters, {
+      candidate_id: 'candidate-1',
+      expected_version: 1,
+      proposal: { situation: 'before', action: 'change', outcome: 'after', lesson: 'keep tests', extra: 'reject' },
+      source_refs: [],
+      artifact_refs: [],
+    })).toBe(false)
+    expect(Value.Check(revise.parameters, {
+      candidate_id: 'candidate-1',
+      expected_version: 1,
+      proposal: { situation: 'before', action: 'change', outcome: 'after', lesson: 'keep tests' },
+      memory_citations: [],
+      source_refs: [],
+      artifact_refs: [],
+    })).toBe(false)
+    expect(Value.Check(revise.parameters, {
+      candidate_id: 'candidate-1',
+      expected_version: 1,
+      proposal: { situation: 'before', action: 'change', outcome: 'after', lesson: 'keep tests' },
+      source_refs: Array.from({ length: 17 }, () => ({ name: 'test', source_id: 'source-1' })),
+      artifact_refs: Array.from({ length: 16 }, () => ({ family: 'experience', artifact_id: 'artifact-1', revision: 1 })),
+    })).toBe(true)
+    expect((revise.parameters as unknown as { type: string }).type).toBe('object')
+    await expect(registeredTool<Record<string, unknown>>(registered, 'pc_review_revise').execute(
+      'call-invalid-references', {
+        candidate_id: 'candidate-1',
+        expected_version: 1,
+        proposal: { situation: 'before', action: 'change', outcome: 'after', lesson: 'keep tests' },
+        source_refs: Array.from({ length: 17 }, () => ({ name: 'test', source_id: 'source-1' })),
+        artifact_refs: Array.from({ length: 16 }, () => ({ family: 'experience', artifact_id: 'artifact-1', revision: 1 })),
+      }, new AbortController().signal, () => undefined, { cwd: '/workspace/repo', hasUI: true, ui: { confirm: vi.fn() } },
+    )).rejects.toThrow('at most 32 references in total')
+  })
+
+  it('routes candidate review decisions through confirmed scoped operations', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ status: 'ok' })))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const context = { cwd: '/workspace/repo', hasUI: true, ui: { confirm: vi.fn(async () => true) } }
+    const signal = new AbortController().signal
+    const proposal = { situation: 'before', action: 'change', outcome: 'after', lesson: 'keep tests' }
+    const common = { candidate_id: 'candidate-1', expected_version: 2 }
+
+    await registeredTool<Record<string, unknown>>(registered, 'pc_review_approve').execute(
+      'call-approve', common, signal, () => undefined, context,
+    )
+    await registeredTool<Record<string, unknown>>(registered, 'pc_review_reject').execute(
+      'call-reject', { ...common, reason: 'not applicable' }, signal, () => undefined, context,
+    )
+    await registeredTool<Record<string, unknown>>(registered, 'pc_review_revise').execute(
+      'call-revise', { ...common, proposal, source_refs: [], artifact_refs: [], target: null, reason: 'clarify' },
+      signal, () => undefined, context,
+    )
+
+    expect(context.ui.confirm).toHaveBeenCalledTimes(3)
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([
+      ['http://127.0.0.1:8000/v1/candidates/approve', { ...common, scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/candidates/reject', { ...common, reason: 'not applicable', scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/candidates/revise', {
+        ...common, proposal, source_refs: [], artifact_refs: [], target: null, reason: 'clarify', scope_id: 'project:demo',
+      }],
+    ])
+  })
+
+  it('keeps external skill discovery read-only and confirms imports', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true })))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const confirm = vi.fn(async () => true)
+    const context = { cwd: '/workspace/repo', hasUI: true, ui: { confirm } }
+    const signal = new AbortController().signal
+    const fingerprint = 'a'.repeat(64)
+
+    const denied = await registeredTool<Record<string, unknown>>(registered, 'pc_external_import').execute(
+      'call-import-no-ui', { external_skill_id: 'skill-1', fingerprint, mode: 'import' },
+      signal, () => undefined, { ...context, hasUI: false },
+    )
+    expect(denied.details).toMatchObject({ ok: false, code: 'confirmation_required' })
+
+    await registeredTool<Record<string, unknown>>(registered, 'pc_external_scan').execute(
+      'call-scan', {}, signal, () => undefined, context,
+    )
+    await registeredTool<{ include_unavailable: boolean }>(registered, 'pc_external_list').execute(
+      'call-list', { include_unavailable: true }, signal, () => undefined, context,
+    )
+    await registeredTool<{ external_skill_id: string; fingerprint: string }>(registered, 'pc_external_resolve').execute(
+      'call-resolve', { external_skill_id: 'skill-1', fingerprint }, signal, () => undefined, context,
+    )
+    await registeredTool<Record<string, unknown>>(registered, 'pc_external_import').execute(
+      'call-import', { external_skill_id: 'skill-1', fingerprint, mode: 'import', reason: null },
+      signal, () => undefined, context,
+    )
+
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([
+      ['http://127.0.0.1:8000/v1/external-skills/scan', { scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/external-skills/list', { include_unavailable: true, scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/external-skills/resolve', { external_skill_id: 'skill-1', fingerprint, scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/external-skills/import', {
+        external_skill_id: 'skill-1', fingerprint, mode: 'import', reason: null, scope_id: 'project:demo',
+      }],
+    ])
+  })
+
+  it('routes structured work payloads to their scoped APIs unchanged after confirmation', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true })))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const context = {
+      cwd: '/workspace/repo',
+      hasUI: true,
+      ui: { confirm: vi.fn(async () => true) },
+    }
+    const signal = new AbortController().signal
+    const sourceCitation = { kind: 'source', source_ref: { name: 'git', source_id: 'commit-1' } }
+    const claim = { text: 'tests passed', basis: 'verified', evidence: [sourceCitation] }
+    const contract = {
+      schema: 'powercontext.work-contract.v1', trust: 'untrusted_input', objective: 'ship feature',
+      facts: [claim], in_scope: ['implementation'], exclusions: ['unrelated cleanup'],
+      completion_criteria: ['tests pass'], authorization_notes: ['user authorized implementation'], open_questions: [],
+    }
+    const handoff = {
+      schema: 'powercontext.current-work-handoff.v1', trust: 'untrusted_input', objective: 'continue feature',
+      state: [claim], disposition: 'continuable', next_action: claim, omissions: [],
+    }
+    const outcome = {
+      schema: 'powercontext.task-outcome.v1', trust: 'untrusted_observation', objective: 'ship feature',
+      status: 'succeeded', summary: 'implemented', handoff_receipt_ref: null, observations: [claim], checks: [],
+      produced_artifacts: [], remaining_work: [],
+    }
+
+    await registeredTool<{ source_id: string; contract: Record<string, unknown> }>(registered, 'pc_work_contract').execute(
+      'call-contract', { source_id: 'contract-1', contract }, signal, () => undefined, context,
+    )
+    await registeredTool<{ source_id: string; handoff: Record<string, unknown> }>(registered, 'pc_handoff_current').execute(
+      'call-current', { source_id: 'boundary-1', handoff }, signal, () => undefined, context,
+    )
+    await registeredTool<Record<string, unknown>>(registered, 'pc_handoff_acknowledge').execute(
+      'call-acknowledge', {
+        source_id: 'receipt-1', receiver: 'pi', status: 'accepted', selection: 'exact',
+        receiver_checks: { live_state: 'confirmed', capability: 'confirmed', authorization: 'confirmed' },
+        revision: { family: 'handoff', artifact_id: 'handoff-1', revision: 1 },
+      }, signal, () => undefined, context,
+    )
+    await registeredTool<{ source_id: string; outcome: Record<string, unknown> }>(registered, 'pc_task_outcome').execute(
+      'call-outcome', { source_id: 'outcome-1', outcome }, signal, () => undefined, context,
+    )
+
+    expect(context.ui.confirm).toHaveBeenCalledTimes(4)
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([
+      ['http://127.0.0.1:8000/v1/work/contracts/create', { source_id: 'contract-1', contract, scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/work/handoffs/prepare-current', { source_id: 'boundary-1', handoff, scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/work/handoffs/acknowledge', {
+        source_id: 'receipt-1', receiver: 'pi', status: 'accepted', selection: 'exact',
+        receiver_checks: { live_state: 'confirmed', capability: 'confirmed', authorization: 'confirmed' },
+        revision: { family: 'handoff', artifact_id: 'handoff-1', revision: 1 }, scope_id: 'project:demo',
+      }],
+      ['http://127.0.0.1:8000/v1/work/outcomes/record', { source_id: 'outcome-1', outcome, scope_id: 'project:demo' }],
+    ])
+  })
+
+  it('accepts and forwards advisory rollover reasons for Handoff preparation', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true })))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const activate = registeredTool<Record<string, unknown>>(registered, 'pc_handoff_activate')
+    const prepare = registeredTool<Record<string, unknown>>(registered, 'pc_handoff_prepare')
+    const boundarySource = { name: 'content', source_id: 'turn-1' }
+    const reasons = ['host_context_budget', 'context_quality']
+    const context = { cwd: '/workspace/repo', hasUI: true, ui: { confirm: vi.fn(async () => true) } }
+    const signal = new AbortController().signal
+
+    expect(Value.Check(activate.parameters!, {
+      boundary_source: boundarySource,
+      objective: 'Continue in a fresh session.',
+      rollover_reasons: reasons,
+    })).toBe(true)
+    expect(Value.Check(prepare.parameters!, {
+      objective: 'Continue in a fresh session.',
+      evidence: [{ kind: 'source', source_ref: boundarySource }],
+      rollover_reasons: reasons,
+    })).toBe(true)
+
+    await activate.execute('call-activate', {
+      boundary_source: boundarySource,
+      objective: 'Continue in a fresh session.',
+      rollover_reasons: reasons,
+    }, signal, () => undefined, context)
+    await prepare.execute('call-prepare', {
+      objective: 'Continue in a fresh session.',
+      evidence: [{ kind: 'source', source_ref: boundarySource }],
+      rollover_reasons: reasons,
+    }, signal, () => undefined, context)
+
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([
+      ['http://127.0.0.1:8000/v1/handoff/activate', {
+        boundary_source: boundarySource,
+        objective: 'Continue in a fresh session.',
+        evidence: [],
+        rollover_reasons: reasons,
+        scope_id: 'project:demo',
+      }],
+      ['http://127.0.0.1:8000/v1/handoff/prepare', {
+        objective: 'Continue in a fresh session.',
+        evidence: [{ kind: 'source', source_ref: boundarySource }],
+        rollover_reasons: reasons,
+        scope_id: 'project:demo',
+      }],
+    ])
+  })
+
+  it('accepts the check results the OpenAPI contract marks optional', () => {
+    const registered: Array<Record<string, unknown>> = []
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(vi.fn()))
+    const parameters = (
+      registered.find((tool) => tool.name === 'pc_task_outcome') as { parameters: TSchema }
+    ).parameters
+    const outcome = {
+      schema: 'powercontext.task-outcome.v1',
+      trust: 'untrusted_observation',
+      objective: 'ship feature',
+      status: 'succeeded',
+      summary: 'implemented',
+      observations: [{
+        text: 'tests passed',
+        basis: 'verified',
+        evidence: [{ kind: 'source', source_ref: { name: 'git', source_id: 'commit-1' } }],
+      }],
+      checks: [{ name: 'tests', status: 'passed', basis: 'declared', evidence: [] }],
+      produced_artifacts: [],
+      remaining_work: [],
+    }
+
+    expect(Value.Check(parameters, { source_id: 'outcome-1', outcome })).toBe(true)
+    expect(Value.Check(parameters, {
+      source_id: 'outcome-1',
+      outcome: { ...outcome, checks: [{ ...outcome.checks[0], details: null }] },
+    })).toBe(true)
+    expect(Value.Check(parameters, {
+      source_id: 'outcome-1',
+      outcome: { ...outcome, checks: [{ name: 'tests', status: 'passed', evidence: [] }] },
+    })).toBe(false)
+  })
+
+  it('reads exact artifacts and inspects candidates without requesting confirmation', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => (
+      new Response(JSON.stringify({ status: 'ok' }))
+    ))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const context = {
+      cwd: '/workspace/repo',
+      hasUI: true,
+      ui: { confirm: vi.fn(async () => false) },
+    }
+    const signal = new AbortController().signal
+
+    await registeredTool<{ artifact: Record<string, unknown> }>(registered, 'pc_experience_get').execute(
+      'call-1', { artifact: { family: 'experience', artifact_id: 'exp-1', revision: 2 } }, signal,
+      () => undefined, context,
+    )
+    await registeredTool<{ artifact: Record<string, unknown> }>(registered, 'pc_skill_get').execute(
+      'call-2', { artifact: { family: 'skill', artifact_id: 'skill-1', revision: 3 } }, signal,
+      () => undefined, context,
+    )
+    await registeredTool<{ status?: string; family?: string; cursor?: string; limit?: number }>(
+      registered, 'pc_review_list',
+    ).execute('call-3', {
+      status: 'approved', family: 'skill', cursor: 'next-page', limit: 120,
+    }, signal, () => undefined, context)
+    await registeredTool<{ candidate_id: string }>(registered, 'pc_review_get').execute(
+      'call-4', { candidate_id: 'candidate-1' }, signal, () => undefined, context,
+    )
+
+    expect(context.ui.confirm).not.toHaveBeenCalled()
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([
+      ['http://127.0.0.1:8000/v1/experience/get', {
+        artifact: { family: 'experience', artifact_id: 'exp-1', revision: 2 },
+        scope_id: 'project:demo',
+      }],
+      ['http://127.0.0.1:8000/v1/skill/get', {
+        artifact: { family: 'skill', artifact_id: 'skill-1', revision: 3 },
+        scope_id: 'project:demo',
+      }],
+      ['http://127.0.0.1:8000/v1/candidates/list', {
+        status: 'approved', family: 'skill', cursor: 'next-page', limit: 100, scope_id: 'project:demo',
+      }],
+      ['http://127.0.0.1:8000/v1/candidates/get', {
+        candidate_id: 'candidate-1', scope_id: 'project:demo',
+      }],
+    ])
+  })
+
+  it('searches and reads Topic Memory through the read-only current-Scope APIs', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => (
+      new Response(JSON.stringify({ mode: 'fts', hits: [] }))
+    ))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const context = {
+      cwd: '/workspace/repo',
+      hasUI: true,
+      ui: { confirm: vi.fn(async () => false) },
+    }
+    const signal = new AbortController().signal
+
+    await registeredTool<{ query: string; limit?: number }>(registered, 'pc_topic_search').execute(
+      'call-1', { query: 'deployment decisions', limit: 50 }, signal, () => undefined, context,
+    )
+    await registeredTool<{ query: string; limit?: number }>(registered, 'pc_topic_search').execute(
+      'call-2', { query: 'deployment decisions', limit: 0 }, signal, () => undefined, context,
+    )
+    await registeredTool<{ query: string; limit?: number }>(registered, 'pc_topic_search').execute(
+      'call-3', { query: 'deployment decisions' }, signal, () => undefined, context,
+    )
+    await registeredTool<{ artifact: Record<string, unknown> }>(registered, 'pc_topic_get').execute(
+      'call-4', { artifact: { family: 'topic-memory', artifact_id: 'topic-1', revision: 4 } }, signal,
+      () => undefined, context,
+    )
+
+    expect(context.ui.confirm).not.toHaveBeenCalled()
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([
+      ['http://127.0.0.1:8000/v1/topic-memory/search', {
+        query: 'deployment decisions', limit: 20, scope_id: 'project:demo',
+      }],
+      ['http://127.0.0.1:8000/v1/topic-memory/search', {
+        query: 'deployment decisions', limit: 1, scope_id: 'project:demo',
+      }],
+      ['http://127.0.0.1:8000/v1/topic-memory/search', {
+        query: 'deployment decisions', limit: 10, scope_id: 'project:demo',
+      }],
+      ['http://127.0.0.1:8000/v1/topic-memory/get', {
+        artifact: { family: 'topic-memory', artifact_id: 'topic-1', revision: 4 },
+        scope_id: 'project:demo',
+      }],
+    ])
+  })
+
+  it('publishes the Topic Memory search schema without retrieval controls', () => {
+    const registered: Array<Record<string, unknown>> = []
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(vi.fn()))
+    const search = registeredTool<Record<string, unknown>>(registered, 'pc_topic_search') as unknown as {
+      parameters: { properties: Record<string, Record<string, unknown>> }
+    }
+
+    expect(search.parameters.properties.limit).toMatchObject({ type: 'number' })
+    expect(search.parameters.properties).not.toHaveProperty('mode')
   })
 
   it('registers the /pc status and diagnostic command', () => {

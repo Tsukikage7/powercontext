@@ -1,0 +1,185 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Serializable, domain-independent Scope invocation and Worker contracts."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Protocol, runtime_checkable
+
+from powercontext.builtin.persistence.supervision import ArtifactProcessingFence
+from powercontext.builtin.processing_diagnostics import ProcessingDiagnostics
+
+
+class ArtifactProcessingWorkerOutcome(StrEnum):
+    """Terminal control results; domain conflicts are safe to reschedule."""
+
+    SUCCEEDED = "succeeded"
+    CURSOR_CONFLICT = "cursor_conflict"
+    HEAD_CONFLICT = "head_conflict"
+    LEADERSHIP_LOST = "leadership_lost"
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactProcessingModelUsageDelta:
+    """Bounded loss counters returned by one completed child Worker."""
+
+    dropped_records: int = 0
+    write_failures: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.dropped_records) is not int
+            or type(self.write_failures) is not int
+            or self.dropped_records < 0
+            or self.write_failures < 0
+        ):
+            raise ValueError("model usage delta counters must be nonnegative integers")  # noqa: TRY003
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactProcessingWorkAssignment:
+    """One accepted Scope invocation, independent of its processor's inputs."""
+
+    binding_name: str
+    scope_id: str
+    artifact_family: str
+    claimed_request_generation: int
+    fence: ArtifactProcessingFence
+    worker_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactProcessingBlock:
+    """A domain-owned durable rejection, independent of invocation generation.
+
+    Details contain operational counters only, never input or provider data.
+    The opaque key identifies the progress frontier within one ProcessingKey.
+    """
+
+    key: str
+    stage: str
+    error_code: str
+    details: tuple[tuple[str, int], ...] = ()
+
+
+class ArtifactProcessingBlockedError(RuntimeError):
+    """A Worker encountered a durable rejection after the admission check."""
+
+    def __init__(self, block: ArtifactProcessingBlock) -> None:
+        super().__init__(block.error_code)
+        self.block = block
+        self.stage = block.stage
+        self.error_code = block.error_code
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactProcessingWorkerFailure:
+    """Sanitized metadata safe to return across a child process boundary.
+
+    The child records cancellation independently of the diagnostic exception type.
+    """
+
+    stage: str
+    error_code: str
+    exception_type: str
+    traceback: str
+    block: ArtifactProcessingBlock | None = None
+    cancelled: bool = False
+    model_usage: ArtifactProcessingModelUsageDelta | None = None
+    diagnostics: ProcessingDiagnostics | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactProcessingWorkerCompletion:
+    """Control result; success still requires durable acknowledgement."""
+
+    outcome: ArtifactProcessingWorkerOutcome = ArtifactProcessingWorkerOutcome.SUCCEEDED
+    held_count: int = 0
+    hold_codes: tuple[str, ...] = ()
+    model_usage: ArtifactProcessingModelUsageDelta | None = None
+    noop: bool = False
+
+
+class ArtifactProcessingWorkerHandle(Protocol):
+    """One child whose termination completes only after its exit is observed."""
+
+    async def wait(self) -> ArtifactProcessingWorkerCompletion: ...
+
+    async def terminate(self) -> None: ...
+
+
+class ArtifactProcessingWorkerLauncher(Protocol):
+    """Launch a child, reclaiming partially started resources on cancellation."""
+
+    async def start(self, assignment: ArtifactProcessingWorkAssignment) -> ArtifactProcessingWorkerHandle: ...
+
+
+WorkerEntrypoint = Callable[[ArtifactProcessingWorkAssignment], ArtifactProcessingWorkerCompletion | None]
+
+
+@runtime_checkable
+class WorkerInitializerPreparation(Protocol):
+    """Own per-launch resources through spawn or cancellation cleanup.
+
+    The context yields a picklable callable that runs inside the new child.
+    """
+
+    def prepare(self) -> AbstractContextManager[Callable[[], None]]: ...
+
+
+def processing_error_code(exception_type: type[BaseException] | str, error_code: str = "") -> str:
+    """Expose only known categories, never exception messages or custom codes."""
+
+    inference_codes = {
+        "InferenceConfigurationError": "model_configuration_error",
+        "PydanticAIConfigurationError": "model_configuration_error",
+        "InferenceTimeoutError": "model_timeout",
+        "InferenceUnavailableError": "model_unavailable",
+        "InvalidInferenceOutputError": "invalid_model_output",
+    }
+    names = (exception_type,) if isinstance(exception_type, str) else (base.__name__ for base in exception_type.__mro__)
+    for name in names:
+        if name in inference_codes:
+            return inference_codes[name]
+    if error_code in {
+        *inference_codes.values(),
+        "worker_crash",
+        "invalid_worker_result",
+        "missing_durable_acknowledgement",
+        "invalid_topic_placeholder",
+        "invalid_topic_coordination_content",
+    }:
+        return error_code
+    return "processing_failed"
+
+
+__all__ = [
+    "ArtifactProcessingBlock",
+    "ArtifactProcessingBlockedError",
+    "ArtifactProcessingModelUsageDelta",
+    "ArtifactProcessingWorkAssignment",
+    "ArtifactProcessingWorkerCompletion",
+    "ArtifactProcessingWorkerFailure",
+    "ArtifactProcessingWorkerHandle",
+    "ArtifactProcessingWorkerLauncher",
+    "ArtifactProcessingWorkerOutcome",
+    "WorkerEntrypoint",
+    "WorkerInitializerPreparation",
+    "processing_error_code",
+]

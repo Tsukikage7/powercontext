@@ -19,12 +19,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from .catalog import MemoryEvaluationSpec, OutcomeEvaluationSpec
+from .catalog import MemoryEvaluationSpec, OutcomeEvaluationSpec, normalize_context_fragment
 from .models import (
+    AtomicMemorySnapshot,
     CaseEvaluation,
     EvaluationReport,
     EvaluationValue,
     HarborTrialObservation,
+    MemoryEntrySnapshot,
+    RecallProbeObservation,
     TaskObservation,
 )
 
@@ -121,26 +124,39 @@ class MemoryEvaluator:
         captured_records = [record for record in eligible_records if record.status == "captured"]
         capture_coverage = len(captured_records) / len(eligible_records) if eligible_records else 0.0
 
-        memory_before_ids = {entry.entry_id for entry in observation.memory_before.entries}
-        new_memory = [entry for entry in observation.memory_after.entries if entry.entry_id not in memory_before_ids]
+        memory_before_ids = {_memory_identity(entry) for entry in observation.memory_before.entries}
+        new_memory = [
+            entry for entry in observation.memory_after.entries if _memory_identity(entry) not in memory_before_ids
+        ]
         captured_source_ids = {record.source_id for record in captured_records if record.source_id is not None}
         grounded_memory = [
             entry
             for entry in new_memory
-            if entry.source_refs and all(source.source_id in captured_source_ids for source in entry.source_refs)
+            if (sources := entry.sources if isinstance(entry, AtomicMemorySnapshot) else entry.source_refs)
+            and all(source.source_id in captured_source_ids for source in sources)
         ]
         groundedness = len(grounded_memory) / len(new_memory) if new_memory else 0.0
 
         probes_by_id = {probe.id: probe for probe in observation.probes}
+        forbidden_context_matches = [
+            probe_spec.id
+            for probe_spec in evaluation.probes
+            if (probe := probes_by_id.get(probe_spec.id)) is not None
+            and probe.prepared_context.status == "ready"
+            and _probe_matches_forbidden_context(probe, probe_spec.forbidden_context)
+        ]
+        forbidden_context_match_ids = set(forbidden_context_matches)
+        positive_probes = [probe_spec for probe_spec in evaluation.probes if probe_spec.expected_context]
         supported_probes = [
             probe_spec
-            for probe_spec in evaluation.probes
+            for probe_spec in positive_probes
             if (probe := probes_by_id.get(probe_spec.id)) is not None
             and probe.prepared_context.status == "ready"
             and bool(probe.prepared_context.content.strip())
             and _contains_fragments(probe.prepared_context.content, probe_spec.expected_context)
+            and probe_spec.id not in forbidden_context_match_ids
         ]
-        probe_coverage = len(supported_probes) / len(evaluation.probes)
+        probe_coverage = len(supported_probes) / len(positive_probes) if positive_probes else 1.0
         in_run_contexts = sum(
             record.event == "context"
             and record.status == "ready"
@@ -235,6 +251,15 @@ class MemoryEvaluator:
                 value=expected_memory_found,
                 reason=f"Expected Memory fragments: {list(evaluation.expected_memory)!r}.",
             )
+        if any(probe.forbidden_context for probe in evaluation.probes):
+            assertions["forbidden_context_absent"] = EvaluationValue(
+                value=not forbidden_context_matches,
+                reason=(
+                    "No forbidden context matched."
+                    if not forbidden_context_matches
+                    else f"Forbidden context matched for probes: {forbidden_context_matches!r}."
+                ),
+            )
         scores = {
             "capture_coverage": EvaluationValue(value=capture_coverage),
             "groundedness": EvaluationValue(value=groundedness),
@@ -260,9 +285,31 @@ class MemoryEvaluator:
         )
 
 
+def _memory_identity(entry: AtomicMemorySnapshot | MemoryEntrySnapshot) -> tuple[str, str]:
+    if isinstance(entry, AtomicMemorySnapshot):
+        return entry.artifact.family, entry.artifact.artifact_id
+    return "memory", entry.entry_id
+
+
 def _contains_fragments(value: str, expected: tuple[str, ...]) -> bool:
-    folded = value.casefold()
-    return all(fragment.casefold() in folded for fragment in expected)
+    normalized = normalize_context_fragment(value)
+    return all(normalize_context_fragment(fragment) in normalized for fragment in expected)
+
+
+def matches_forbidden_context(value: str, forbidden: tuple[str, ...]) -> bool:
+    normalized = normalize_context_fragment(value)
+    return any(normalize_context_fragment(fragment) in normalized for fragment in forbidden)
+
+
+def _probe_matches_forbidden_context(
+    probe: RecallProbeObservation,
+    forbidden: tuple[str, ...],
+) -> bool:
+    if not forbidden:
+        return False
+    if probe.forbidden_context_matched is not None:
+        return probe.forbidden_context_matched
+    return matches_forbidden_context(probe.prepared_context.content, forbidden)
 
 
 def _attributes(observation: TaskObservation) -> dict[str, str]:

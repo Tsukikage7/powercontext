@@ -22,6 +22,7 @@ from typing import TypeAlias
 from pydantic import BaseModel
 
 from powercontext.artifacts import Artifact, ArtifactRef
+from powercontext.builtin.artifacts.atomic_memory.models import AtomicMemory, AtomicMemoryStateValue
 from powercontext.builtin.artifacts.experience import Experience, ExperienceContent, ExperienceGenerator
 from powercontext.builtin.artifacts.generation import (
     MAX_GENERATION_EVIDENCE_CHARS,
@@ -29,14 +30,17 @@ from powercontext.builtin.artifacts.generation import (
     GenerationEvidence,
     GenerationEvidenceKind,
 )
+from powercontext.builtin.artifacts.prompt.service import ScopedPrompts, current_prompt, prompt_operation
 from powercontext.builtin.artifacts.skill import Skill, SkillContent, SkillGenerator
+from powercontext.builtin.evidence.resolver import AuthorizationContext, EvidenceAuthorizer
 from powercontext.builtin.persistence.artifacts import ArtifactRepository
+from powercontext.builtin.persistence.atomic_memory import AtomicMemoryStateRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import RepositoryNotFoundError
-from powercontext.builtin.persistence.sources import SourceRepository
+from powercontext.builtin.persistence.generation_sources import GenerationSourceAccess
 from powercontext.builtin.review.errors import InvalidCandidateError
-from powercontext.builtin.review.models import ArtifactCandidate
-from powercontext.builtin.review.service import ReviewService
+from powercontext.builtin.review.models import Candidate
+from powercontext.builtin.review.service import CandidateCommitHook, ReviewService
 from powercontext.errors import PowerContextError
 from powercontext.sources import Source, SourceRef
 
@@ -57,7 +61,7 @@ class GenerationCapabilityUnavailableError(PowerContextError, RuntimeError):
         super().__init__(f"{family} generation is not configured")
 
 
-GeneratedCandidate: TypeAlias = ArtifactCandidate[ExperienceContent] | ArtifactCandidate[SkillContent]
+GeneratedCandidate: TypeAlias = Candidate[ExperienceContent] | Candidate[SkillContent]
 
 
 class GeneratedCandidateResult(BaseModel):
@@ -78,20 +82,28 @@ class ReviewedGenerationService:
         *,
         database: AsyncDatabase,
         scope_id: str,
-        sources: SourceRepository,
+        sources: GenerationSourceAccess,
         artifacts: ArtifactRepository,
         review: ReviewService,
         experience_generator: ExperienceGenerator | None,
         skill_generator: SkillGenerator | None,
+        prompt_context: ScopedPrompts | None = None,
     ) -> None:
         self._database = database
         self._scope_id = scope_id
+        self._prompt_context = prompt_context
         self._sources = sources
         self._artifacts = artifacts
         self._review = review
         self._experience_generator = experience_generator
         self._skill_generator = skill_generator
+        self._authorize: EvidenceAuthorizer | None = None
 
+    def configure_authorization(self, authorize: EvidenceAuthorizer, context: AuthorizationContext) -> None:
+        self._authorize = authorize
+        self._review.configure_authorization(authorize, context)
+
+    @prompt_operation("experience.generate")
     async def experience(
         self,
         *,
@@ -99,6 +111,7 @@ class ReviewedGenerationService:
         artifacts: tuple[ArtifactRef, ...],
         target: ArtifactRef | None,
         reason: str | None,
+        on_commit: CandidateCommitHook | None = None,
     ) -> GeneratedCandidateResult:
         if self._experience_generator is None:
             raise GenerationCapabilityUnavailableError(Experience.family)
@@ -111,12 +124,14 @@ class ReviewedGenerationService:
         candidate = await self._review.propose_experience(
             proposal,
             sources=sources,
-            artifacts=artifacts,
+            artifacts=_with_prompt_lineage(artifacts, "experience.generate"),
             target=target,
             reason=reason,
+            **({"on_commit": on_commit} if on_commit is not None else {}),
         )
         return GeneratedCandidateResult(candidate=candidate)
 
+    @prompt_operation("skill.generate")
     async def skill(
         self,
         *,
@@ -125,10 +140,11 @@ class ReviewedGenerationService:
         artifacts: tuple[ArtifactRef, ...],
         target: ArtifactRef | None,
         reason: str | None,
+        on_commit: CandidateCommitHook | None = None,
     ) -> GeneratedCandidateResult:
         if self._skill_generator is None:
             raise GenerationCapabilityUnavailableError(Skill.family)
-        _validate_skill_lineage(origin, sources, artifacts, target)
+        validate_skill_lineage(origin, sources, artifacts, target)
         evidence = await self._evidence(sources, artifacts)
         proposal = await self._skill_generator.generate(_generation_input(evidence, target))
         if proposal is None:
@@ -136,9 +152,10 @@ class ReviewedGenerationService:
         candidate = await self._review.propose_skill(
             proposal,
             sources=sources,
-            artifacts=artifacts,
+            artifacts=_with_prompt_lineage(artifacts, "skill.generate"),
             target=target,
             reason=reason,
+            **({"on_commit": on_commit} if on_commit is not None else {}),
         )
         return GeneratedCandidateResult(candidate=candidate)
 
@@ -148,19 +165,34 @@ class ReviewedGenerationService:
         artifacts: tuple[ArtifactRef, ...],
     ) -> tuple[GenerationEvidence, ...]:
         evidence: list[GenerationEvidence] = []
+        if self._authorize is not None:
+            for ref in (*sources, *artifacts):
+                await self._authorize(ref)
         try:
             async with self._database.transaction() as connection:
-                for ref in sources:
-                    row = await self._sources.get(connection, self._scope_id, ref)
-                    evidence.append(_source_evidence(ref, row.value))
+                source_rows = await self._sources.require_for_generation(connection, self._scope_id, sources)
+                evidence.extend(_source_evidence(row.ref, row.value) for row in source_rows)
                 for ref in artifacts:
+                    if ref.family == "prompt":
+                        raise InvalidCandidateError("evidence", "Prompt configuration is not factual evidence")
                     artifact = await self._artifacts.get(connection, self._scope_id, ref)
+                    if isinstance(artifact, AtomicMemory):
+                        state = await AtomicMemoryStateRepository().get(connection, self._scope_id, ref.artifact_id)
+                        if state.state is not AtomicMemoryStateValue.ACTIVE:
+                            raise InvalidCandidateError("evidence", "Atomic Memory is not active")
                     evidence.append(_artifact_evidence(ref, artifact))
         except RepositoryNotFoundError as error:
             raise InvalidCandidateError("evidence", "reference is not available in this scope") from error
         if not evidence:
             raise InvalidCandidateError("evidence", "at least one exact reference is required")
         return tuple(evidence)
+
+
+def _with_prompt_lineage(artifacts: tuple[ArtifactRef, ...], key: str) -> tuple[ArtifactRef, ...]:
+    selection = current_prompt(key)
+    if selection is None or selection.artifact is None or selection.artifact in artifacts:
+        return artifacts
+    return (*artifacts, selection.artifact)
 
 
 def _source_evidence(ref: SourceRef, source: Source) -> GenerationEvidence:
@@ -198,12 +230,14 @@ def _generation_input(
     return ArtifactGenerationInput(evidence=evidence, target_evidence_id=target_id)
 
 
-def _validate_skill_lineage(
+def validate_skill_lineage(
     origin: SkillGenerationOrigin,
     sources: tuple[SourceRef, ...],
     artifacts: tuple[ArtifactRef, ...],
     target: ArtifactRef | None,
 ) -> None:
+    """Validate the shared provenance contract before proposing a generated Skill."""
+
     if origin is SkillGenerationOrigin.EXPERIENCE:
         if target is not None or not artifacts or any(ref.family != Experience.family for ref in artifacts):
             raise InvalidCandidateError(
@@ -227,4 +261,5 @@ __all__ = [
     "GenerationCapabilityUnavailableError",
     "ReviewedGenerationService",
     "SkillGenerationOrigin",
+    "validate_skill_lineage",
 ]

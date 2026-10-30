@@ -14,13 +14,25 @@
 
 """Focused tests for the deterministic LoCoMo benchmark boundary."""
 
+import asyncio
 import json
+from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from benchmark.locomo.dataset import load_locomo, render_session
-from benchmark.locomo.metrics import (
+from evaluation.memory.locomo import runner
+from evaluation.memory.locomo.dataset import (
+    LoCoMoConversation,
+    LoCoMoDataset,
+    LoCoMoQuestion,
+    LoCoMoSession,
+    LoCoMoTurn,
+    load_locomo,
+    render_session,
+)
+from evaluation.memory.locomo.metrics import (
     bleu1,
     diagnose_observations,
     exact_match,
@@ -29,17 +41,24 @@ from benchmark.locomo.metrics import (
     summarize_observations,
     token_f1,
 )
-from benchmark.locomo.runner import (
+from evaluation.memory.locomo.runner import (
     normalize_run_id,
     prepare_rejudge,
     prepare_run,
     scope_id,
 )
+from powercontext.builtin.artifacts.atomic_memory.extraction import atomic_memory_extraction_instructions
+from powercontext.builtin.artifacts.atomic_memory.reconciliation import ATOMIC_MEMORY_RECONCILIATION_INSTRUCTIONS
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
-from powercontext.builtin.runtime import InferenceConfig, MemoryExtractionProfile, RuntimeConfig
+from powercontext.builtin.runtime import (
+    InferenceConfig,
+    MemoryExtractionProfile,
+    RuntimeConfig,
+)
+from powercontext.builtin.scope import ScopeNotFoundError
 from powercontext.server.settings import ServerSettings
 
-DATASET = Path(__file__).parents[2] / "benchmark" / "locomo" / "dataset" / "locomo10.json"
+DATASET = Path(__file__).parents[2] / "evaluation" / "memory" / "locomo" / "dataset" / "locomo10.json"
 
 
 def test_canonical_locomo_dataset_has_expected_shape_and_scored_selection() -> None:
@@ -165,40 +184,53 @@ def test_run_manifest_is_stable_and_excludes_database_credentials(tmp_path: Path
         ),
     )
 
-    first = prepare_run(
-        dataset=dataset,
-        settings=settings,
-        run_id="smoke / test",
-        output_directory=tmp_path,
-        top_k=30,
-        categories=(1, 2, 3, 4),
-        conversation_limit=1,
-        question_limit=5,
-        operation_retries=3,
+    first = asyncio.run(
+        prepare_run(
+            dataset=dataset,
+            settings=settings,
+            run_id="smoke / test",
+            output_directory=tmp_path,
+            top_k=30,
+            categories=(1, 2, 3, 4),
+            conversation_limit=1,
+            question_limit=5,
+            operation_retries=3,
+        )
     )
-    second = prepare_run(
-        dataset=dataset,
-        settings=settings,
-        run_id="smoke / test",
-        output_directory=tmp_path,
-        top_k=30,
-        categories=(1, 2, 3, 4),
-        conversation_limit=1,
-        question_limit=5,
-        operation_retries=3,
+    second = asyncio.run(
+        prepare_run(
+            dataset=dataset,
+            settings=settings,
+            run_id="smoke / test",
+            output_directory=tmp_path,
+            top_k=30,
+            categories=(1, 2, 3, 4),
+            conversation_limit=1,
+            question_limit=5,
+            operation_retries=3,
+        )
     )
 
     assert first == second
     assert first["run_id"] == "smoke-test"
     assert first["configuration"]["memory_extraction_profile"] == "conversation"
-    assert first["configuration"]["memory_extraction_instructions"] == "powercontext.memory.extract.conversation.v1"
+    assert (
+        first["configuration"]["memory_extraction_instructions_sha256"]
+        == sha256(
+            atomic_memory_extraction_instructions(MemoryExtractionProfile.CONVERSATION).encode("utf-8")
+        ).hexdigest()
+    )
+    assert (
+        first["configuration"]["memory_reconciliation_instructions_sha256"]
+        == sha256(ATOMIC_MEMORY_RECONCILIATION_INSTRUCTIONS.encode("utf-8")).hexdigest()
+    )
     assert first["candidate_k"] == 30
     assert first["answer_k"] == 30
     assert first["rerank_mode"] == "none"
     assert first["answer_source_content"] is False
     assert "answer_inference_aware" not in first
     assert "answer_unknown_fallback_inference" not in first
-    assert first["schema"] == "powercontext.benchmark.locomo.run.v5"
+    assert first["schema"] == "powercontext.benchmark.locomo.run.v8"
     assert first["generation_temperature"] == 0.0
     assert first["judge_profile"] == "strict"
     assert "secret" not in json.dumps(first)
@@ -219,36 +251,40 @@ def test_run_manifest_records_inference_aware_answer_policy(tmp_path: Path) -> N
         ),
     )
 
-    manifest = prepare_run(
-        dataset=dataset,
-        settings=settings,
-        run_id="inference-aware",
-        output_directory=tmp_path / "treatment",
-        top_k=30,
-        answer_k=10,
-        answer_source_content=True,
-        answer_inference_aware=True,
-        categories=(3,),
-        conversation_limit=None,
-        question_limit=None,
-        operation_retries=3,
-    )
-
-    assert manifest["schema"] == "powercontext.benchmark.locomo.run.v6"
-    assert manifest["answer_inference_aware"] is True
-    assert manifest["answer_instructions"] == "powercontext.benchmark.locomo.answer.source.inference.v1"
-    with pytest.raises(ValueError, match="requires Source expansion"):
+    manifest = asyncio.run(
         prepare_run(
             dataset=dataset,
             settings=settings,
-            run_id="invalid-inference-aware",
-            output_directory=tmp_path / "invalid",
+            run_id="inference-aware",
+            output_directory=tmp_path / "treatment",
             top_k=30,
+            answer_k=10,
+            answer_source_content=True,
             answer_inference_aware=True,
             categories=(3,),
             conversation_limit=None,
             question_limit=None,
             operation_retries=3,
+        )
+    )
+
+    assert manifest["schema"] == "powercontext.benchmark.locomo.run.v8"
+    assert manifest["answer_inference_aware"] is True
+    assert manifest["answer_instructions"] == "powercontext.benchmark.locomo.answer.source.inference.v1"
+    with pytest.raises(ValueError, match="requires Source expansion"):
+        asyncio.run(
+            prepare_run(
+                dataset=dataset,
+                settings=settings,
+                run_id="invalid-inference-aware",
+                output_directory=tmp_path / "invalid",
+                top_k=30,
+                answer_inference_aware=True,
+                categories=(3,),
+                conversation_limit=None,
+                question_limit=None,
+                operation_retries=3,
+            )
         )
 
 
@@ -265,39 +301,43 @@ def test_run_manifest_records_unknown_fallback_inference_policy(tmp_path: Path) 
         ),
     )
 
-    manifest = prepare_run(
-        dataset=dataset,
-        settings=settings,
-        run_id="unknown-fallback-inference",
-        output_directory=tmp_path / "fallback",
-        top_k=30,
-        answer_k=10,
-        answer_source_content=True,
-        answer_unknown_fallback_inference=True,
-        categories=(1, 2, 3, 4),
-        conversation_limit=None,
-        question_limit=None,
-        operation_retries=3,
+    manifest = asyncio.run(
+        prepare_run(
+            dataset=dataset,
+            settings=settings,
+            run_id="unknown-fallback-inference",
+            output_directory=tmp_path / "fallback",
+            top_k=30,
+            answer_k=10,
+            answer_source_content=True,
+            answer_unknown_fallback_inference=True,
+            categories=(1, 2, 3, 4),
+            conversation_limit=None,
+            question_limit=None,
+            operation_retries=3,
+        )
     )
 
-    assert manifest["schema"] == "powercontext.benchmark.locomo.run.v7"
+    assert manifest["schema"] == "powercontext.benchmark.locomo.run.v8"
     assert manifest["answer_unknown_fallback_inference"] is True
     assert manifest["answer_instructions"] == "powercontext.benchmark.locomo.answer.source.unknown_fallback.v1"
     assert manifest["answer_fallback_trigger"] == "normalized-answer-equals-unknown"
     assert manifest["direct_answer_instructions"] == "powercontext.benchmark.locomo.answer.source.v1"
     assert manifest["fallback_answer_instructions"] == "powercontext.benchmark.locomo.answer.source.inference.v1"
     with pytest.raises(ValueError, match="requires Source expansion"):
-        prepare_run(
-            dataset=dataset,
-            settings=settings,
-            run_id="invalid-unknown-fallback",
-            output_directory=tmp_path / "invalid-fallback",
-            top_k=30,
-            answer_unknown_fallback_inference=True,
-            categories=(3,),
-            conversation_limit=None,
-            question_limit=None,
-            operation_retries=3,
+        asyncio.run(
+            prepare_run(
+                dataset=dataset,
+                settings=settings,
+                run_id="invalid-unknown-fallback",
+                output_directory=tmp_path / "invalid-fallback",
+                top_k=30,
+                answer_unknown_fallback_inference=True,
+                categories=(3,),
+                conversation_limit=None,
+                question_limit=None,
+                operation_retries=3,
+            )
         )
 
 
@@ -372,3 +412,118 @@ def test_rejudge_manifest_freezes_answers_and_records_independent_judge(tmp_path
             run_id="qwen topical judge",
             judge_model="openai:different-judge",
         )
+
+
+def _scored_conversation(sample_id: str) -> LoCoMoConversation:
+    """One conversation with one scored question, so evaluation has pending work."""
+
+    question = LoCoMoQuestion(
+        question_id=f"{sample_id}:q001",
+        sample_id=sample_id,
+        question="What did Alice buy?",
+        answer="A book.",
+        category=1,
+        evidence_raw=("D1:1",),
+        evidence=("D1:1",),
+    )
+    return LoCoMoConversation(
+        sample_id,
+        "Alice",
+        "Bob",
+        (LoCoMoSession("D1", 1, "1:56 pm on 8 May, 2023", (LoCoMoTurn("D1:1", "Alice", "I bought a book."),)),),
+        (question,),
+    )
+
+
+def _configured_database_settings(tmp_path: Path, name: str) -> ServerSettings:
+    """Settings with inference configured, for a database that never ingested this run."""
+
+    return ServerSettings(
+        database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / name}"),
+        inference=InferenceConfig(
+            generation_model="openai:answer-model",
+            embedding_model="openai:answer-embedding",
+            embedding_profile_id="locomo-scope-ordering",
+            embedding_dimension=8,
+        ),
+    )
+
+
+def _no_client_may_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail on every provider entry point, keeping the configured inference in place.
+
+    The runtime composes generation and embedding clients, and evaluation composes its answer
+    and judge clients. Replacing the provider boundary instead of emptying `InferenceConfig`
+    keeps the configured inference, so a missed Scope cannot hide behind an inert runtime
+    configuration: reaching any boundary here means a client opened before the Scope resolved.
+    """
+
+    def boundary(*args: Any, **_kwargs: Any) -> None:
+        pytest.fail(f"evaluation opened {args[0] if args else 'a model client'} before validating the recorded Scope")
+
+    monkeypatch.setattr(runner, "infer_model", boundary)
+    monkeypatch.setattr("pydantic_ai.models.infer_model", boundary)
+    monkeypatch.setattr("pydantic_ai.embeddings.infer_embedding_model", boundary)
+
+
+def _recorded_ingestion(run_id: str, sample_id: str, scope: str) -> dict[str, Any]:
+    """One conversation's ingestion record, in the shape ingestion.json stores it."""
+
+    return {
+        "run_id": runner.normalize_run_id(run_id),
+        "conversations": {sample_id: {"namespace": runner.scope_id(run_id, sample_id), "scope_id": scope}},
+    }
+
+
+def test_evaluation_resolves_the_recorded_scope_before_setting_up_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the #1894 review: the Scope precondition precedes every client.
+
+    Scoring against a database that never ingested the run registered an empty Scope, scored the
+    empty retrieval as a valid observation, and spent answer and judge requests on it. Evaluation
+    now resolves the Scope ingestion recorded, and that precondition is checked before the runtime
+    composes its generation and embedding providers, so a database that cannot answer for the run
+    reports the missing Scope instead of a provider setup failure.
+    """
+
+    _no_client_may_open(monkeypatch)
+    dataset = LoCoMoDataset(path=DATASET, sha256="0" * 64, conversations=(_scored_conversation("conv-26"),))
+    (tmp_path / "ingestion.json").write_text(
+        json.dumps(_recorded_ingestion("scope-required", "conv-26", "scp_never_registered")), encoding="utf-8"
+    )
+
+    with pytest.raises(ScopeNotFoundError):
+        asyncio.run(
+            runner.evaluate_dataset(
+                dataset,
+                settings=_configured_database_settings(tmp_path, "empty.db"),
+                run_id="scope-required",
+                output_directory=tmp_path,
+                progress=lambda _message: None,
+            )
+        )
+
+    # No observation may be written for a question that was never ingested.
+    assert not (tmp_path / "observations.jsonl").exists()
+
+
+def test_evaluation_rejects_a_run_without_a_recorded_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--skip-ingestion` in a directory that never ingested may not score anything."""
+
+    _no_client_may_open(monkeypatch)
+    dataset = LoCoMoDataset(path=DATASET, sha256="0" * 64, conversations=(_scored_conversation("conv-26"),))
+
+    with pytest.raises(ValueError, match=r"requires ingestion\.json"):
+        asyncio.run(
+            runner.evaluate_dataset(
+                dataset,
+                settings=_configured_database_settings(tmp_path, "empty.db"),
+                run_id="never-ingested",
+                output_directory=tmp_path,
+                progress=lambda _message: None,
+            )
+        )
+
+    # Missing ingestion metadata fails before the database is even opened.
+    assert not (tmp_path / "empty.db").exists()

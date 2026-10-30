@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { InvalidResponseError, ServerResponseError, TransportError } from './errors.ts'
 
 export interface DiagnosticEvent {
@@ -36,6 +38,7 @@ const AUTOMATIC_OPERATION_PATHS = new Map([
   ['context_prepare', '/v1/context/prepare'],
   ['capture_source', '/v1/sources/content'],
   ['flush_memory', '/v1/memory/flush'],
+  ['pre_compaction_checkpoint', '/v1/memory/flush'],
 ])
 
 function responseDiagnostic(event: string, outcome: string, error: ServerResponseError): DiagnosticEvent {
@@ -73,6 +76,44 @@ export function failureEvent(event: string, error: unknown): DiagnosticEvent | u
   return { event, outcome: 'invalid_response' }
 }
 
+/**
+ * Pi's ExtensionContext has no logger, and its TUI renders on stdout with cursor
+ * positioning, so anything written to stderr lands inside the input bar. Keep
+ * diagnostics silent unless the user routes them to stderr or a JSON-lines file.
+ */
+export function diagnosticWriter(
+  sink: string,
+  append: (path: string, line: string) => void = (path, line) => appendFileSync(path, line),
+  warn: (line: string) => void = (line) => console.warn(line),
+  ensureDirectory: (path: string) => void = (path) => mkdirSync(dirname(path), { recursive: true }),
+): (line: string) => void {
+  if (sink === 'off') return () => {}
+  // Diagnostics are best effort and must never break the extension, whichever sink is used.
+  if (sink === 'stderr') {
+    return (line) => {
+      try {
+        warn(line)
+      } catch {
+        // ignore
+      }
+    }
+  }
+  // `~/.powercontext/pi-diagnostics.jsonl` is the natural choice and that directory
+  // rarely exists yet; create it once so the first line is not silently lost.
+  try {
+    ensureDirectory(sink)
+  } catch {
+    // ignore: the append below fails the same silent way
+  }
+  return (line) => {
+    try {
+      append(sink, `${line}\n`)
+    } catch {
+      // ignore
+    }
+  }
+}
+
 export function createDiagnosticEmitter(
   write: (line: string) => void,
   now: () => number = Date.now,
@@ -88,7 +129,9 @@ export function createDiagnosticEmitter(
         : {}),
     }
     if (outcome && !['ready', 'ok', 'empty', 'skipped'].includes(outcome)) {
-      const key = outcome
+      const key = [event.event, outcome, event.host, event.lifecycle_event, event.scope_correlation]
+        .filter((value): value is string => typeof value === 'string')
+        .join('\0')
       const timestamp = now()
       const previous = lastEmitted.get(key)
       if (previous !== undefined && timestamp - previous < cooldownMs) return

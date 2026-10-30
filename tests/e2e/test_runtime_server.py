@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,7 +26,13 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from sqlalchemy.engine import make_url
 
+from powercontext.builtin.artifacts.atomic_memory.extraction import (
+    AtomicMemoryCandidate,
+    AtomicMemoryExtractionInput,
+    AtomicMemoryExtractionOutput,
+)
 from powercontext.builtin.artifacts.handoff import (
     HandoffDraft as RuntimeHandoffDraft,
 )
@@ -36,54 +44,66 @@ from powercontext.builtin.artifacts.handoff import (
 )
 from powercontext.builtin.artifacts.memory import (
     EmbeddingProfile,
-    MemoryCandidateRequest,
-    MemoryEntryInput,
 )
-from powercontext.builtin.inference import EmbeddingResult, InferenceConfigurationError
-from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
+from powercontext.builtin.artifacts.memory.errors import InvalidMemoryCandidateError
+from powercontext.builtin.inference import EmbeddingResult, GenerationResult, InferenceConfigurationError
+from powercontext.builtin.persistence.migrations.deployment import deployment_runner
+from powercontext.builtin.persistence.oceanbase import OceanBaseConfig, OceanBaseProfile
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import (
     HandoffReportConfig,
     InferenceConfig,
-    MemorySearchPage,
-    ScopedMemoryApplication,
+    ScopedAtomicMemoryApplication,
 )
-from powercontext.builtin.runtime import (
-    SearchMemoryRequest as RuntimeSearchMemoryRequest,
-)
-from powercontext.builtin.sources import ContentSource
 from powercontext.client import PowerContextClient, ServerResponseError
 from powercontext.errors import RevisionConflictError
 from powercontext.http import (
     AcknowledgeHandoffRequest,
     ActivateHandoffRequest,
+    ArtifactAddress,
+    AtomicMemoryLifecycleRequest,
     CaptureContentSourceRequest,
+    CaptureWorkingNoteRequest,
     CommitHandoffRequest,
     ContinueHandoffRequest,
+    CreateScopeRequest,
     CreateWorkContractRequest,
+    ExactScopeSelection,
     FinalizeHandoffRequest,
     FlushMemoryRequest,
     GetHandoffReportRequest,
-    GetMemoryEntryRequest,
     HandoffCurrentWorkRequest,
     HandoffSelection,
     HandoffSourceCitation,
     ListMemoryChangesRequest,
     ListMemoryEntriesRequest,
     PrepareContextRequest,
+    PublishArtifactRequest,
     ReadinessStatus,
     RecordTaskOutcomeRequest,
     RememberMemoryRequest,
+    ReplaceArtifactRequest,
     ReportFormat,
     RetireMemoryEntryRequest,
     ReviseMemoryEntryRequest,
+    ScopeSelection,
     SearchMemoryRequest,
+    WorkingNoteKind,
 )
 from powercontext.http import MemorySearchMode as HttpMemorySearchMode
 from powercontext.server.factory import create_server_app
 from powercontext.server.settings import McpConfig, ServerSettings
+from tests.e2e.dream_support import atomic_memory_pipeline, memory_source_text
 
-OCEANBASE_URL = os.environ.get("POWERCONTEXT_TEST_OCEANBASE_URL")
+_ACCESS_READINESS_CHECKS = {
+    "access_mode": "disabled",
+    "authentication_provider": "disabled",
+    "access_provider": "disabled",
+    "access_resource_kinds": "server,scope,artifact",
+    "access_artifact_families": (
+        "atomic-memory:enabled,experience:enabled,handoff:enabled,memory:enabled,profile:enabled,prompt:enabled,skill:enabled"
+    ),
+}
 EMBEDDING_PROFILE = EmbeddingProfile(
     profile_id="database-e2e-v1",
     model="database-e2e",
@@ -93,17 +113,47 @@ EMBEDDING_PROFILE = EmbeddingProfile(
 )
 
 
+@pytest.fixture
+def database(database_kind: str, tmp_path: Path) -> Iterator[SQLiteConfig | OceanBaseConfig]:
+    if database_kind == "sqlite":
+        yield SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}")
+        return
+    configured_url = os.environ.get("POWERCONTEXT_TEST_OCEANBASE_URL")
+    if not configured_url:
+        pytest.skip("set POWERCONTEXT_TEST_OCEANBASE_URL with test database creation and deletion privileges")
+    configured = OceanBaseConfig(url=SecretStr(configured_url))
+    name = f"pc_runtime_{uuid4().hex}"
+
+    async def execute(statement: str) -> None:
+        async with (
+            OceanBaseProfile.open(configured, tables=()) as profile,
+            profile.database.transaction() as connection,
+        ):
+            await connection.exec_driver_sql(statement)
+
+    asyncio.run(execute(f"CREATE DATABASE `{name}`"))
+    try:
+        url = make_url(configured_url).set(database=name).render_as_string(hide_password=False)
+        yield OceanBaseConfig(url=SecretStr(url))
+    finally:
+        asyncio.run(execute(f"DROP DATABASE `{name}`"))
+
+
 class ContentCandidatePipeline:
-    async def extract(self, request: MemoryCandidateRequest, /) -> tuple[MemoryEntryInput, ...]:
-        return tuple(
-            MemoryEntryInput(
-                kind="decision",
-                text=source.content,
-                sources=(source,),
-                reason="captured",
+    async def generate(self, request: AtomicMemoryExtractionInput, /) -> GenerationResult[AtomicMemoryExtractionOutput]:
+        return GenerationResult(
+            output=AtomicMemoryExtractionOutput(
+                candidates=tuple(
+                    AtomicMemoryCandidate(
+                        kind="decision",
+                        text=text,
+                        evidence_ids=(evidence.evidence_id,),
+                        description="Extracted fixture fact",
+                    )
+                    for evidence in request.evidence
+                    if (text := memory_source_text(evidence)) is not None
+                )
             )
-            for source in request.sources
-            if isinstance(source, ContentSource)
         )
 
 
@@ -157,24 +207,39 @@ def _server_settings(
     )
 
 
+def _initialize_remote_server_storage(
+    settings: ServerSettings, tmp_path: Path, *, embedding_profile: EmbeddingProfile | None = None
+) -> None:
+    if not isinstance(settings.database, OceanBaseConfig):
+        return
+    runner = deployment_runner(
+        settings,
+        evidence_dir=tmp_path / "migration-evidence",
+        lock_coordination="single-host",
+        embedding_profile=embedding_profile,
+    )
+    plan = runner.plan(backup_policy="skip")
+    result = runner.apply(
+        plan_id=plan.plan_id,
+        backup_policy="skip",
+        accepted=True,
+        maintenance_confirmed=True,
+        accept_no_backup=True,
+    )
+    assert result.state == "ready"
+    assert result.readiness_scope == "server"
+
+
 @pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
 def test_server_databases_share_source_to_memory_search_behavior(
-    database_kind: str,
+    database: SQLiteConfig | OceanBaseConfig,
     tmp_path: Path,
 ) -> None:
-    if database_kind == "oceanbase":
-        if OCEANBASE_URL is None:
-            pytest.skip("set POWERCONTEXT_TEST_OCEANBASE_URL to a dedicated OceanBase MySQL-mode test database")
-        database = OceanBaseConfig(url=SecretStr(OCEANBASE_URL))
-    else:
-        database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}")
-    scope_id = f"database-e2e-{uuid4()}"
+    settings = ServerSettings(database=database, mcp=McpConfig(enabled=False))
+    _initialize_remote_server_storage(settings, tmp_path)
     app = create_server_app(
-        settings=ServerSettings(
-            database=database,
-            mcp=McpConfig(enabled=False),
-        ),
-        candidate_pipeline=ContentCandidatePipeline(),
+        settings=settings,
+        candidate_pipeline=atomic_memory_pipeline(ContentCandidatePipeline()),
     )
 
     async def scenario() -> None:
@@ -188,6 +253,14 @@ def test_server_databases_share_source_to_memory_search_behavior(
             client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
             readiness = await client.get_readiness()
             capabilities = await client.get_capabilities()
+            scope = await client.create_scope(
+                CreateScopeRequest(
+                    title="Database acceptance",
+                    summary="Isolated source-to-memory search acceptance.",
+                    idempotency_key=f"database-e2e-{uuid4()}",
+                )
+            )
+            scope_id = scope.scope_id
             captured = await client.capture_content_source(
                 CaptureContentSourceRequest(
                     scope_id=scope_id,
@@ -205,49 +278,44 @@ def test_server_databases_share_source_to_memory_search_behavior(
                 SearchMemoryRequest(scope_id=scope_id, query="Should we keep blue icons in mobile navigation?")
             )
             entries = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=scope_id))
+            ref = found.hits[0].memory.artifact
+            exact = await client.get_artifact_revision(scope_id, ref.family, ref.artifact_id, ref.revision)
 
-        assert readiness.checks == {"runtime": "ready", "database": "ready"}
+        assert readiness.checks == {
+            "runtime": "ready",
+            "database": "ready",
+            "artifact_processing_supervisor": "disabled",
+            **_ACCESS_READINESS_CHECKS,
+        }
         assert capabilities.source_types == ["content"]
+        assert ref.family == "atomic-memory"
+        assert ref.family in capabilities.artifact_families
+        assert "memory" in capabilities.artifact_families
         assert capabilities.memory_extraction is True
         assert capabilities.search_modes == ["auto", "fts"]
         assert capabilities.context_versions == ["powercontext.prepared-context.v1"]
         assert captured.position == 1
         assert flushed.current_cursor == captured.position
-        assert flushed.memory is not None
-        assert found.mode == "fts"
-        assert [hit.text for hit in found.hits] == ["Keep the OpenAPI contract authoritative."]
+        assert flushed.memory is None
+        assert found.mode == "text"
+        assert [hit.memory.text for hit in found.hits] == ["Keep the OpenAPI contract authoritative."]
         assert prepared.schema_ == "powercontext.prepared-context.v1"
         assert prepared.status == "ready"
         assert prepared.content is not None
         prepared_item = json.loads(prepared.content.splitlines()[-2])["items"][0]
         assert prepared_item["content"] == "Keep the OpenAPI contract authoritative."
-        assert prepared_item["citation"] == found.hits[0].citation.model_dump(mode="json", by_alias=True)
+        assert prepared_item["citation"]["artifact_ref"] == ref.model_dump(mode="json", by_alias=True)
         assert unrelated.hits == []
-        assert entries.memory == flushed.memory
-        assert entries.entries[0].source_refs[0].source_id == "turn-1"
+        assert entries.entries[0].artifact == ref
+        assert exact.sources[0].source_id == "turn-1"
 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
-def test_server_databases_keep_case_and_accent_variant_identities_distinct(
-    database_kind: str,
-    tmp_path: Path,
-) -> None:
-    if database_kind == "oceanbase":
-        if OCEANBASE_URL is None:
-            pytest.skip("set POWERCONTEXT_TEST_OCEANBASE_URL to a dedicated OceanBase MySQL-mode test database")
-        database = OceanBaseConfig(url=SecretStr(OCEANBASE_URL))
-    else:
-        database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'identity.db'}")
-    marker = uuid4().hex[:12]
-    writer_scope = f"PC-{marker}-Alpha"
-    reader_scope = writer_scope.lower()
-    accent_scope = f"{marker}-café"
-    plain_scope = f"{marker}-cafe"
-    memory_text = "Rotate the production signing key every ninety days."
+def test_working_note_http_and_sdk_capture_stays_out_of_memory(tmp_path: Path) -> None:
     app = create_server_app(
-        settings=ServerSettings(database=database, mcp=McpConfig(enabled=False)),
+        settings=_server_settings(tmp_path / "working-note.db"),
+        candidate_pipeline=atomic_memory_pipeline(ContentCandidatePipeline()),
     )
 
     async def scenario() -> None:
@@ -259,22 +327,184 @@ def test_server_databases_keep_case_and_accent_variant_identities_distinct(
             ) as transport,
         ):
             client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
-            await client.remember_memory(RememberMemoryRequest(scope_id=writer_scope, kind="fact", text=memory_text))
-            leaked = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=reader_scope))
-            await client.remember_memory(
-                RememberMemoryRequest(scope_id=accent_scope, kind="fact", text="Espresso is on the third floor.")
+            scope = await client.create_scope(
+                CreateScopeRequest(
+                    title="Working note",
+                    summary="Session-local evidence",
+                    idempotency_key="working-note-http",
+                )
             )
-            accent_leaked = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=plain_scope))
-            source_scope = f"{marker}-src"
+            with pytest.raises(ServerResponseError) as reserved_metadata:
+                await client.capture_content_source(
+                    CaptureContentSourceRequest(
+                        scope_id=scope.scope_id,
+                        source_id="spoofed-note",
+                        content="Generic capture cannot assign a server-owned Source kind.",
+                        metadata={"kind": "working_note"},
+                    )
+                )
+            working_note_metadata = await transport.post(
+                "/v1/sources/working-notes",
+                json={
+                    "scope_id": scope.scope_id,
+                    "source_id": "metadata-expiry",
+                    "content": "The public contract does not expose Working Note metadata.",
+                    "session_id": "session-1",
+                    "note_kind": "validation",
+                    "metadata": {"expires_at": "2000-01-01T00:00:00+00:00"},
+                },
+            )
+            captured = await client.capture_working_note(
+                CaptureWorkingNoteRequest(
+                    scope_id=scope.scope_id,
+                    source_id="note-1",
+                    content="The database migration probe passed locally.",
+                    session_id="session-1",
+                    note_kind=WorkingNoteKind.VALIDATION,
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                )
+            )
+            with pytest.raises(ServerResponseError) as expired:
+                await client.capture_working_note(
+                    CaptureWorkingNoteRequest(
+                        scope_id=scope.scope_id,
+                        source_id="note-expired",
+                        content="This note is already stale.",
+                        session_id="session-1",
+                        note_kind=WorkingNoteKind.VALIDATION,
+                        expires_at=datetime.now(UTC) - timedelta(days=1),
+                    )
+                )
+            naive_expiry = await transport.post(
+                "/v1/sources/working-notes",
+                json={
+                    "scope_id": scope.scope_id,
+                    "source_id": "note-naive-expiry",
+                    "content": "The expiry has no time zone.",
+                    "session_id": "session-1",
+                    "note_kind": "validation",
+                    "expires_at": "2000-01-01T00:00:00",
+                },
+            )
+            flushed = await client.flush_memory(FlushMemoryRequest(scope_id=scope.scope_id))
+            entries = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=scope.scope_id))
+
+        assert captured.source.name == "content"
+        assert reserved_metadata.value.status_code == 422
+        assert reserved_metadata.value.code == "invalid_request"
+        assert working_note_metadata.status_code == 422
+        assert working_note_metadata.json()["error"]["code"] == "invalid_request"
+        assert captured.position == 1
+        assert captured.position == flushed.current_cursor
+        assert expired.value.status_code == 422
+        assert expired.value.code == "invalid_request"
+        assert expired.value.details == {"field": "expires_at", "reason": "not_in_future"}
+        assert naive_expiry.status_code == 422
+        naive_details = naive_expiry.json()["error"]["details"]["errors"]
+        assert [(entry["loc"], entry["type"]) for entry in naive_details] == [
+            (["body", "expires_at"], "timezone_aware"),
+        ]
+        assert flushed.memory is None
+        assert entries.entries == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
+def test_server_databases_keep_case_and_accent_variant_identities_distinct(
+    database: SQLiteConfig | OceanBaseConfig,
+    tmp_path: Path,
+) -> None:
+    marker = uuid4().hex[:12]
+    memory_text = "Rotate the production signing key every ninety days."
+    settings = ServerSettings(database=database, mcp=McpConfig(enabled=False))
+    _initialize_remote_server_storage(settings, tmp_path)
+    app = create_server_app(settings=settings)
+
+    async def scenario() -> None:
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as transport,
+        ):
+            client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
+            writer_scope = await client.create_scope(
+                CreateScopeRequest(
+                    title=f"PC {marker} Alpha",
+                    summary="Writer Scope for case-sensitive isolation acceptance.",
+                    idempotency_key=f"PC-{marker}-Alpha",
+                )
+            )
+            reader_scope = await client.create_scope(
+                CreateScopeRequest(
+                    title=f"pc {marker} alpha",
+                    summary="Reader Scope for case-sensitive isolation acceptance.",
+                    idempotency_key=f"pc-{marker}-alpha",
+                )
+            )
+            accent_scope = await client.create_scope(
+                CreateScopeRequest(
+                    title=f"{marker} café",
+                    summary="Writer Scope for accent-sensitive isolation acceptance.",
+                    idempotency_key=f"{marker}-café",
+                )
+            )
+            plain_scope = await client.create_scope(
+                CreateScopeRequest(
+                    title=f"{marker} cafe",
+                    summary="Reader Scope for accent-sensitive isolation acceptance.",
+                    idempotency_key=f"{marker}-cafe",
+                )
+            )
+            source_scope = await client.create_scope(
+                CreateScopeRequest(
+                    title=f"{marker} source identity",
+                    summary="Source identity case-sensitivity acceptance.",
+                    idempotency_key=f"{marker}-src",
+                )
+            )
+            scope_ids = {
+                writer_scope.scope_id,
+                reader_scope.scope_id,
+                accent_scope.scope_id,
+                plain_scope.scope_id,
+                source_scope.scope_id,
+            }
+            assert len(scope_ids) == 5
+            await client.remember_memory(
+                RememberMemoryRequest(
+                    scope_id=writer_scope.scope_id, kind="fact", text=memory_text, description="Explicit fixture memory"
+                )
+            )
+            leaked = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=reader_scope.scope_id))
+            await client.remember_memory(
+                RememberMemoryRequest(
+                    scope_id=accent_scope.scope_id,
+                    kind="fact",
+                    text="Espresso is on the third floor.",
+                    description="Explicit fixture memory",
+                )
+            )
+            accent_leaked = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=plain_scope.scope_id))
             await client.capture_content_source(
-                CaptureContentSourceRequest(scope_id=source_scope, source_id="Turn-1", content="uppercase turn")
+                CaptureContentSourceRequest(
+                    scope_id=source_scope.scope_id,
+                    source_id="Turn-1",
+                    content="uppercase turn",
+                )
             )
             second = await client.capture_content_source(
-                CaptureContentSourceRequest(scope_id=source_scope, source_id="turn-1", content="lowercase turn")
+                CaptureContentSourceRequest(
+                    scope_id=source_scope.scope_id,
+                    source_id="turn-1",
+                    content="lowercase turn",
+                )
             )
 
         assert not leaked.entries
-        assert leaked.memory is None
+        assert leaked.next_cursor is None
         assert not accent_leaked.entries
         assert second.position == 2
 
@@ -297,9 +527,10 @@ def test_inference_failure_degrades_readiness_without_blocking_database_operatio
         ):
             client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
             readiness = await client.get_readiness()
+            scope_id = (await client.get_default_scope()).scope_id
             captured = await client.capture_content_source(
                 CaptureContentSourceRequest(
-                    scope_id="degraded-readiness",
+                    scope_id=scope_id,
                     source_id="turn-1",
                     content="Database-backed capture remains available.",
                 )
@@ -310,6 +541,8 @@ def test_inference_failure_degrades_readiness_without_blocking_database_operatio
             "runtime": "ready",
             "database": "ready",
             "inference.embedding": "misconfigured",
+            "artifact_processing_supervisor": "disabled",
+            **_ACCESS_READINESS_CHECKS,
         }
         assert captured.position == 1
 
@@ -317,7 +550,6 @@ def test_inference_failure_degrades_readiness_without_blocking_database_operatio
 
 
 def test_sdk_handoff_lifecycle_reaches_generation_and_persistence(tmp_path: Path) -> None:
-    scope_id = "handoff-e2e"
     app = create_server_app(
         settings=_server_settings(tmp_path / "handoff.db"),
         handoff_pipeline=DeterministicHandoffPipeline(),
@@ -332,6 +564,21 @@ def test_sdk_handoff_lifecycle_reaches_generation_and_persistence(tmp_path: Path
             ) as transport,
         ):
             client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
+            source_scope = await client.create_scope(
+                CreateScopeRequest(
+                    title="Source work",
+                    summary="Work prepared for an exact Handoff publication.",
+                    idempotency_key="handoff-e2e-source",
+                )
+            )
+            target_scope = await client.create_scope(
+                CreateScopeRequest(
+                    title="Target work",
+                    summary="Work continued from an exact Handoff publication.",
+                    idempotency_key="handoff-e2e-target",
+                )
+            )
+            scope_id = source_scope.scope_id
             capabilities = await client.get_capabilities()
             captured = await client.capture_content_source(
                 CaptureContentSourceRequest(
@@ -387,8 +634,31 @@ def test_sdk_handoff_lifecycle_reaches_generation_and_persistence(tmp_path: Path
                     selection=HandoffSelection.LATEST,
                 )
             )
+            publication = await client.publish_artifact(
+                PublishArtifactRequest(
+                    source=ArtifactAddress(scope_id=scope_id, artifact=committed.reference),
+                    target_scope_id=target_scope.scope_id,
+                    idempotency_key="handoff-e2e-publication",
+                )
+            )
+            published = await client.continue_handoff(
+                ContinueHandoffRequest(
+                    scope_id=target_scope.scope_id,
+                    selection=HandoffSelection.EXACT,
+                    revision=publication.target.artifact,
+                )
+            )
 
-        assert capabilities.artifact_families == ["memory", "experience", "skill", "handoff"]
+        assert capabilities.artifact_families == [
+            "memory",
+            "atomic-memory",
+            "topic-memory",
+            "experience",
+            "skill",
+            "handoff",
+            "profile",
+            "prompt",
+        ]
         assert capabilities.handoff_generation is True
         assert activation.status == "generated"
         assert repeated.status == "ignored"
@@ -405,12 +675,15 @@ def test_sdk_handoff_lifecycle_reaches_generation_and_persistence(tmp_path: Path
         assert exact.selected_revision == committed.reference
         assert latest.selection == "latest"
         assert latest.selected_revision == committed.reference
+        assert published.selection == "exact"
+        assert published.selected_revision == publication.target.artifact
+        assert published.current_revision == publication.target.artifact
+        assert published.content == committed.content
 
     asyncio.run(scenario())
 
 
 def test_sdk_closes_the_delegation_handoff_and_outcome_loop(tmp_path: Path) -> None:
-    scope_id = "work-continuity-e2e"
     app = create_server_app(settings=_server_settings(tmp_path / "work-continuity.db", handoff_report=True))
 
     async def scenario() -> None:
@@ -422,6 +695,16 @@ def test_sdk_closes_the_delegation_handoff_and_outcome_loop(tmp_path: Path) -> N
             ) as transport,
         ):
             client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
+            scope_response = await transport.post(
+                "/v1/scopes",
+                json={
+                    "title": "Work continuity",
+                    "summary": "Delegation Handoff and outcome loop",
+                    "idempotency_key": "work-continuity-e2e",
+                },
+            )
+            scope_response.raise_for_status()
+            scope_id = scope_response.json()["scope_id"]
             contract = await client.create_work_contract(
                 CreateWorkContractRequest.model_validate({
                     "scope_id": scope_id,
@@ -534,8 +817,7 @@ def test_sdk_closes_the_delegation_handoff_and_outcome_loop(tmp_path: Path) -> N
             )
             report = await client.get_handoff_report(
                 GetHandoffReportRequest(
-                    scope_id=scope_id,
-                    include_evidence_checks=False,
+                    selection=ScopeSelection(root=ExactScopeSelection(mode="exact", scope_ids=[scope_id])),
                     format=ReportFormat.JSON,
                 )
             )
@@ -558,39 +840,26 @@ def test_sdk_closes_the_delegation_handoff_and_outcome_loop(tmp_path: Path) -> N
         assert outcome.position == 5
         assert not isinstance(report, str)
         assert report.report is not None
-        continuity = report.report["workstreams"][0]["continuity"]
-        assert continuity["coverage"]["transfer_state"] == "accepted"
-        assert continuity["coverage"]["outcome_state"] == "covered"
-        assert continuity["coverage"]["handoff_result_covered"] is True
-        assert [event["kind"] for event in continuity["events"]] == [
-            "work-contract",
-            "handoff-boundary",
-            "handoff-receipt",
-            "handoff-receipt",
-            "task-outcome",
-        ]
+        assert report.report["scope_ids"] == [scope_id]
+        assert report.report["scopes"][0]["handoff"] == {
+            "scope_id": scope_id,
+            "artifact": committed.reference.model_dump(mode="json"),
+        }
+        assert report.report["scopes"][0]["content"]["objective"] == ("Implement and verify the work-continuity loop.")
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
 def test_server_databases_share_vector_and_hybrid_search_behavior(
-    database_kind: str,
+    database: SQLiteConfig | OceanBaseConfig,
     tmp_path: Path,
 ) -> None:
-    if database_kind == "oceanbase":
-        if OCEANBASE_URL is None:
-            pytest.skip("set POWERCONTEXT_TEST_OCEANBASE_URL to a dedicated OceanBase MySQL-mode test database")
-        database = OceanBaseConfig(url=SecretStr(OCEANBASE_URL))
-    else:
-        database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'vector-runtime.db'}")
-    scope_id = f"vector-e2e-{uuid4()}"
+    settings = ServerSettings(database=database, mcp=McpConfig(enabled=False))
+    _initialize_remote_server_storage(settings, tmp_path, embedding_profile=EMBEDDING_PROFILE)
     app = create_server_app(
-        settings=ServerSettings(
-            database=database,
-            mcp=McpConfig(enabled=False),
-        ),
-        candidate_pipeline=ContentCandidatePipeline(),
+        settings=settings,
+        candidate_pipeline=atomic_memory_pipeline(ContentCandidatePipeline()),
         embedding_model=KeywordEmbeddingModel(),
     )
 
@@ -604,6 +873,14 @@ def test_server_databases_share_vector_and_hybrid_search_behavior(
         ):
             client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
             capabilities = await client.get_capabilities()
+            scope = await client.create_scope(
+                CreateScopeRequest(
+                    title="Vector search acceptance",
+                    summary="Isolated vector and hybrid search acceptance.",
+                    idempotency_key=f"vector-e2e-{uuid4()}",
+                )
+            )
+            scope_id = scope.scope_id
             await client.capture_content_source(
                 CaptureContentSourceRequest(
                     scope_id=scope_id,
@@ -634,12 +911,12 @@ def test_server_databases_share_vector_and_hybrid_search_behavior(
                 )
             )
 
-        assert flushed.memory is not None
+        assert flushed.memory is None
         assert capabilities.search_modes == ["auto", "fts", "vector", "hybrid"]
-        assert [hit.text for hit in vector.hits] == ["Alpha semantic record."]
+        assert [hit.memory.text for hit in vector.hits] == ["Alpha semantic record."]
         assert vector.hits[0].matched_by == ["vector"]
-        assert [hit.text for hit in hybrid.hits] == ["Alpha semantic record."]
-        assert hybrid.hits[0].matched_by == ["fts", "vector"]
+        assert [hit.memory.text for hit in hybrid.hits] == ["Alpha semantic record."]
+        assert hybrid.hits[0].matched_by == ["text", "vector"]
 
     asyncio.run(scenario())
 
@@ -650,100 +927,91 @@ def test_sdk_memory_lifecycle_reaches_one_composed_runtime(tmp_path: Path) -> No
     async def scenario() -> None:
         async with (
             app.router.lifespan_context(app),
-            httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="http://testserver",
-            ) as transport,
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as transport,
         ):
             client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
+            scope_id = (await client.get_default_scope()).scope_id
             remembered = await client.remember_memory(
                 RememberMemoryRequest(
-                    scope_id="project:powercontext",
+                    scope_id=scope_id,
                     kind="decision",
                     text="Use strict transport models.",
+                    description="Explicit fixture memory",
                 )
             )
-            assert remembered.entry is not None
-            exact = await client.get_memory_entry(
-                GetMemoryEntryRequest(
-                    scope_id="project:powercontext",
-                    citation=remembered.entry.citation,
-                )
+            assert len(remembered.records) == 1
+            original = remembered.records[0]
+            ref = original.artifact
+            exact = await client.get_artifact_revision(scope_id, ref.family, ref.artifact_id, ref.revision)
+            path = f"/v1/scopes/{scope_id}/artifacts/atomic-memory/{ref.artifact_id}"
+            head = await transport.get(path)
+            revised = await client.replace_artifact(
+                scope_id,
+                ref.family,
+                ref.artifact_id,
+                ReplaceArtifactRequest.model_validate({
+                    "content": {
+                        "kind": "decision",
+                        "text": "Keep strict Pydantic transport models.",
+                        "description": "Explicit fixture memory",
+                    }
+                }),
+                expected_etag=head.headers["ETag"],
             )
-            revised = await client.revise_memory_entry(
-                ReviseMemoryEntryRequest(
-                    scope_id="project:powercontext",
-                    citation=remembered.entry.citation,
-                    kind="decision",
-                    text="Keep strict Pydantic transport models.",
-                )
+            state = await client.get_atomic_memory_state(scope_id, ref.artifact_id)
+            forgotten = await client.change_atomic_memory_lifecycle(
+                AtomicMemoryLifecycleRequest.model_validate({
+                    "scope_id": scope_id,
+                    "target": {
+                        "artifact": state.artifact.model_dump(mode="json"),
+                        "state_version": state.state_version,
+                    },
+                    "state": "forgotten",
+                })
             )
-            assert revised.entry is not None
-            changes = await client.list_memory_changes(
-                ListMemoryChangesRequest(
-                    scope_id="project:powercontext",
-                    since_revision=remembered.memory.revision,
-                )
-            )
-            retired = await client.retire_memory_entry(
-                RetireMemoryEntryRequest(
-                    scope_id="project:powercontext",
-                    citation=revised.entry.citation,
-                    reason="superseded",
-                )
-            )
-            assert retired.entry is not None
-            current = await client.list_memory_entries(
-                ListMemoryEntriesRequest(scope_id="project:powercontext"),
-            )
+            current = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=scope_id))
             audited = await client.list_memory_entries(
-                ListMemoryEntriesRequest(
-                    scope_id="project:powercontext",
-                    include_inactive=True,
-                ),
+                ListMemoryEntriesRequest(scope_id=scope_id, include_inactive=True)
             )
-            retired_search = await client.search_memory(
-                SearchMemoryRequest(
-                    scope_id="project:powercontext",
-                    query="strict Pydantic transport models",
-                ),
+            forgotten_search = await client.search_memory(
+                SearchMemoryRequest(scope_id=scope_id, query="strict Pydantic transport models")
             )
-            retired_exact = await client.get_memory_entry(
-                GetMemoryEntryRequest(
-                    scope_id="project:powercontext",
-                    citation=retired.entry.citation,
-                ),
+            forgotten_exact = await client.get_artifact_revision(
+                scope_id, ref.family, ref.artifact_id, revised.revision
             )
+            legacy = {
+                "memory_ref": {"family": "memory", "artifact_id": "legacy-collection", "revision": 1},
+                "entry_id": "legacy-entry",
+                "entry_version_id": "legacy-version",
+            }
             with pytest.raises(ServerResponseError) as inactive:
                 await client.revise_memory_entry(
                     ReviseMemoryEntryRequest(
-                        scope_id="project:powercontext",
-                        citation=retired.entry.citation,
-                        kind="decision",
-                        text="Inactive entries cannot be revised.",
+                        scope_id=scope_id, citation=legacy, kind="decision", text="Rejected legacy revision."
                     )
                 )
+            with pytest.raises(ServerResponseError) as retired:
+                await client.retire_memory_entry(RetireMemoryEntryRequest(scope_id=scope_id, citation=legacy))
+            with pytest.raises(ServerResponseError) as changes:
+                await client.list_memory_changes(ListMemoryChangesRequest(scope_id=scope_id, since_revision=1))
             with pytest.raises(ServerResponseError) as missing:
-                await client.get_memory_entry(
-                    GetMemoryEntryRequest(
-                        scope_id="project:powercontext",
-                        citation=retired.entry.citation.model_copy(update={"entry_id": "missing-entry"}),
-                    )
-                )
+                await client.get_artifact_revision(scope_id, ref.family, "missing-memory", 1)
+            assert (
+                await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=scope_id, include_inactive=True))
+                == audited
+            )
 
-        assert exact.text == "Use strict transport models."
-        assert revised.entry.text == "Keep strict Pydantic transport models."
-        assert [revision.memory_ref.revision for revision in changes.revisions] == [revised.memory.revision]
-        assert retired.entry.state == "inactive"
-        assert current.memory == retired.memory
+        assert exact.content["text"] == "Use strict transport models."
+        assert revised.content["text"] == "Keep strict Pydantic transport models."
+        assert revised.revision == ref.revision + 1
+        assert forgotten.records[0].state == "forgotten"
         assert current.entries == []
-        assert audited.memory == retired.memory
-        assert audited.entries == [retired.entry]
-        assert retired_search.memory == retired.memory
-        assert retired_search.hits == []
-        assert retired_exact == retired.entry
-        assert (inactive.value.status_code, inactive.value.code) == (409, "memory_entry_inactive")
-        assert (missing.value.status_code, missing.value.code) == (404, "memory_not_found")
+        assert audited.entries == forgotten.records
+        assert forgotten_search.hits == []
+        assert forgotten_exact.content == revised.content
+        for error in (inactive.value, retired.value, changes.value):
+            assert (error.status_code, error.code) == (422, "legacy_memory_operation_unsupported")
+        assert missing.value.status_code == 404
 
     asyncio.run(scenario())
 
@@ -752,13 +1020,16 @@ def test_runtime_conflicts_keep_http_and_sdk_error_context(tmp_path: Path) -> No
     app = create_server_app(settings=_server_settings(tmp_path / "runtime.db"))
 
     with TestClient(app) as transport:
+        default_scope = transport.get("/v1/scopes/default")
+        default_scope.raise_for_status()
+        scope_id = default_scope.json()["scope_id"]
         first = transport.post(
             "/v1/sources/content",
-            json={"scope_id": "project", "source_id": "turn-1", "content": "first"},
+            json={"scope_id": scope_id, "source_id": "turn-1", "content": "first"},
         )
         conflict = transport.post(
             "/v1/sources/content",
-            json={"scope_id": "project", "source_id": "turn-1", "content": "changed"},
+            json={"scope_id": scope_id, "source_id": "turn-1", "content": "changed"},
         )
 
     assert first.status_code == 202
@@ -777,19 +1048,22 @@ def test_runtime_conflicts_keep_http_and_sdk_error_context(tmp_path: Path) -> No
         ):
             client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
             remembered = await client.remember_memory(
-                RememberMemoryRequest(scope_id="project", kind="decision", text="first")
+                RememberMemoryRequest(
+                    scope_id=scope_id, kind="decision", text="first", description="Explicit fixture memory"
+                )
             )
             with pytest.raises(ServerResponseError) as caught:
                 await client.remember_memory(
                     RememberMemoryRequest(
-                        scope_id="project",
+                        scope_id=scope_id,
                         kind="decision",
                         text="stale",
-                        expected_revision=remembered.memory.revision + 1,
+                        expected_revision=remembered.records[0].artifact.revision + 1,
+                        description="Explicit fixture memory",
                     )
                 )
-        assert caught.value.status_code == 409
-        assert caught.value.code == "revision_conflict"
+        assert caught.value.status_code == 422
+        assert caught.value.code == "legacy_memory_operation_unsupported"
         assert caught.value.request_id is not None
 
     asyncio.run(stale_revision())
@@ -799,20 +1073,19 @@ def test_memory_search_returns_revision_conflict_as_http_409(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    async def conflicting_search(
-        _self: ScopedMemoryApplication,
-        _request: RuntimeSearchMemoryRequest,
-        /,
-    ) -> MemorySearchPage:
+    async def conflicting_search(_self: ScopedAtomicMemoryApplication, _query: str, **_kwargs: object) -> None:
         raise RevisionConflictError("stale", "current")
 
-    monkeypatch.setattr(ScopedMemoryApplication, "search", conflicting_search)
+    monkeypatch.setattr(ScopedAtomicMemoryApplication, "search", conflicting_search)
     app = create_server_app(settings=_server_settings(tmp_path / "runtime.db"))
 
     with TestClient(app) as transport:
+        default_scope = transport.get("/v1/scopes/default")
+        default_scope.raise_for_status()
+        scope_id = default_scope.json()["scope_id"]
         response = transport.post(
             "/v1/memory/search",
-            json={"scope_id": "project", "query": "stable searchable"},
+            json={"scope_id": scope_id, "query": "stable searchable"},
         )
 
     assert response.status_code == 409
@@ -829,10 +1102,13 @@ def test_runtime_server_rejects_non_strict_transport_values(tmp_path: Path) -> N
     app = create_server_app(settings=_server_settings(tmp_path / "runtime.db"))
 
     with TestClient(app) as transport:
+        default_scope = transport.get("/v1/scopes/default")
+        default_scope.raise_for_status()
+        scope_id = default_scope.json()["scope_id"]
         responses = [
             transport.post(
                 "/v1/memory/search",
-                json={"scope_id": "project", "query": "query", "limit": True},
+                json={"scope_id": scope_id, "query": "query", "limit": True},
             ),
             transport.post(
                 "/v1/memory/search",
@@ -840,9 +1116,196 @@ def test_runtime_server_rejects_non_strict_transport_values(tmp_path: Path) -> N
             ),
             transport.post(
                 "/v1/memory/remember",
-                json={"scope_id": "project", "kind": "decision", "text": "🧠" * 3_000},
+                json={
+                    "scope_id": scope_id,
+                    "kind": "decision",
+                    "text": "🧠" * 3_000,
+                    "description": "Explicit fixture memory",
+                },
             ),
         ]
 
     assert [response.status_code for response in responses] == [422, 422, 422]
     assert {response.json()["error"]["code"] for response in responses} == {"invalid_request"}
+
+
+@pytest.mark.parametrize("text", ["a" * 8_193, "界" * 2_731, "🧠" * 2_049], ids=["ascii", "chinese", "emoji"])
+def test_runtime_server_returns_canonical_memory_error_details(tmp_path: Path, text: str) -> None:
+    app = create_server_app(settings=_server_settings(tmp_path / "runtime.db"))
+
+    with TestClient(app) as transport:
+        default_scope = transport.get("/v1/scopes/default")
+        default_scope.raise_for_status()
+        scope_id = default_scope.json()["scope_id"]
+        remembered = transport.post(
+            "/v1/memory/remember",
+            json={
+                "scope_id": scope_id,
+                "kind": "decision",
+                "text": "Keep canonical errors actionable.",
+                "description": "Explicit fixture memory",
+            },
+        )
+        remembered.raise_for_status()
+        before = transport.post("/v1/memory/entries/list", json={"scope_id": scope_id})
+        before.raise_for_status()
+        responses = [
+            transport.post(
+                "/v1/memory/remember",
+                json={"scope_id": scope_id, "kind": "decision", "text": text, "description": "Explicit fixture memory"},
+            ),
+            transport.post(
+                "/v1/memory/entries/revise",
+                json={
+                    "scope_id": scope_id,
+                    "citation": {
+                        "memory_ref": {"family": "memory", "artifact_id": "legacy-collection", "revision": 1},
+                        "entry_id": "legacy-entry",
+                        "entry_version_id": "legacy-version",
+                    },
+                    "kind": "decision",
+                    "text": text,
+                },
+            ),
+        ]
+        after = transport.post("/v1/memory/entries/list", json={"scope_id": scope_id})
+        after.raise_for_status()
+        assert after.json() == before.json()
+
+    expected_error = {
+        "code": "invalid_request",
+        "message": "The request violates the API contract.",
+        "details": {
+            "errors": [
+                {
+                    "type": "value_error",
+                    "loc": ["text"],
+                    "msg": "Value error, memory entry text must not exceed 8192 UTF-8 bytes",
+                }
+            ],
+        },
+    }
+    assert [response.status_code for response in responses] == [422, 422]
+    assert responses[0].json()["error"] == expected_error
+    assert responses[1].json()["error"]["code"] == "legacy_memory_operation_unsupported"
+
+
+@pytest.mark.parametrize(
+    ("text", "normalized"),
+    [
+        ("a" * 8_192, "a" * 8_192),
+        ("🧠" * 2_048, "🧠" * 2_048),
+        (" " + "a" * 8_192 + " ", "a" * 8_192),
+        ("e\u0301" * 4_096, "é" * 4_096),
+    ],
+    ids=["ascii-limit", "emoji-limit", "trimmed-limit", "nfc-limit"],
+)
+def test_runtime_server_accepts_normalized_memory_byte_limit(tmp_path: Path, text: str, normalized: str) -> None:
+    app = create_server_app(settings=_server_settings(tmp_path / "runtime.db"))
+
+    with TestClient(app) as transport:
+        scope = transport.get("/v1/scopes/default")
+        scope.raise_for_status()
+        payload = {
+            "scope_id": scope.json()["scope_id"],
+            "kind": "decision",
+            "text": text,
+            "description": "Explicit fixture memory",
+        }
+        remembered = transport.post("/v1/memory/remember", json=payload)
+        remembered.raise_for_status()
+        assert remembered.json()["records"][0]["text"] == normalized
+        revised = transport.post(
+            "/v1/memory/entries/revise",
+            json={
+                **{key: value for key, value in payload.items() if key != "description"},
+                "citation": {
+                    "memory_ref": {"family": "memory", "artifact_id": "legacy-collection", "revision": 1},
+                    "entry_id": "legacy-entry",
+                    "entry_version_id": "legacy-version",
+                },
+            },
+        )
+        assert revised.status_code == 422
+        assert revised.json()["error"]["code"] == "legacy_memory_operation_unsupported"
+        listed = transport.post("/v1/memory/entries/list", json={"scope_id": payload["scope_id"]})
+        assert listed.json()["entries"] == remembered.json()["records"]
+
+
+def test_runtime_server_rejects_legacy_memory_tag_targets(tmp_path: Path) -> None:
+    app = create_server_app(settings=_server_settings(tmp_path / "runtime.db"))
+
+    with TestClient(app) as transport:
+        scope = transport.get("/v1/scopes/default")
+        scope.raise_for_status()
+        scope_id = scope.json()["scope_id"]
+        remembered = transport.post(
+            "/v1/memory/remember",
+            json={
+                "scope_id": scope_id,
+                "kind": "fact",
+                "text": "Tagged migrations.",
+                "description": "Explicit fixture memory",
+            },
+        )
+        remembered.raise_for_status()
+        artifact_id = remembered.json()["records"][0]["artifact"]["artifact_id"]
+        empty = transport.get(f"/v1/scopes/{scope_id}/artifacts/atomic-memory/{artifact_id}/tags")
+        empty.raise_for_status()
+        tagged = transport.put(
+            f"/v1/scopes/{scope_id}/artifacts/atomic-memory/{artifact_id}/tags",
+            json={"tags": ["project"]},
+            headers={"If-Match": empty.headers["ETag"]},
+        )
+        tagged.raise_for_status()
+        collection = f"/v1/scopes/{scope_id}/artifacts/memory/legacy-collection/tags"
+        responses = [
+            transport.get(collection),
+            transport.put(collection, json={"tags": ["project"]}, headers={"If-Match": '"tags:legacy"'}),
+            transport.post(
+                f"/v1/scopes/{scope_id}/artifact-tags/query", json={"tags": ["project"], "families": ["memory"]}
+            ),
+            transport.post(
+                f"/v1/scopes/{scope_id}/artifact-tags/query",
+                json={"tags": ["project"], "target_types": ["memory_entry"]},
+            ),
+        ]
+        for response in responses:
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "legacy_memory_operation_unsupported"
+        current = transport.post(f"/v1/scopes/{scope_id}/artifact-tags/query", json={"tags": ["project"]})
+        current.raise_for_status()
+        assert [item["target"] for item in current.json()["items"]] == [
+            {"type": "artifact", "family": "atomic-memory", "artifact_id": artifact_id}
+        ]
+
+
+def test_runtime_server_keeps_unstructured_memory_errors_private(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def invalid_create(_self: ScopedAtomicMemoryApplication, _contents: object, /, *, context=None) -> None:
+        raise InvalidMemoryCandidateError("canonical", "private implementation detail")
+
+    monkeypatch.setattr(ScopedAtomicMemoryApplication, "create", invalid_create)
+    app = create_server_app(settings=_server_settings(tmp_path / "runtime.db"))
+
+    with TestClient(app) as transport:
+        default_scope = transport.get("/v1/scopes/default")
+        default_scope.raise_for_status()
+        response = transport.post(
+            "/v1/memory/remember",
+            json={
+                "scope_id": default_scope.json()["scope_id"],
+                "kind": "decision",
+                "text": "valid text",
+                "description": "Explicit fixture memory",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == {
+        "code": "invalid_request",
+        "message": "The request is invalid.",
+        "details": None,
+    }

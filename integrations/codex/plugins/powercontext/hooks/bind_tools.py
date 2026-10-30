@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Bind PowerContext MCP data-plane calls to the current Codex Session."""
+
+from __future__ import annotations
+
+import json
+import sys
+from http.client import HTTPException
+from pathlib import Path
+from time import monotonic
+
+_PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+_SCRIPTS_ROOT = _PLUGIN_ROOT / "scripts"
+sys.path.insert(0, str(_PLUGIN_ROOT))
+sys.path.insert(0, str(_SCRIPTS_ROOT))
+
+from scope_binding import (  # noqa: E402
+    ScopeBindingError,
+    ScopeBindingRejectedError,
+    ScopeBindingStatusError,
+    binding_keys,
+    resolve_scope_id,
+    session_binding_key,
+)
+from settings import CodexPluginSettings  # noqa: E402
+
+_PREFIX = "mcp__powercontext__"
+_BINDING_FAILURE_REASON = "PowerContext could not resolve the current Scope binding."
+_AUTHENTICATION_FAILURE_REASON = (
+    "PowerContext authentication failed (HTTP 401): the configured credential was rejected. "
+    "Re-run powercontext setup codex or set POWERCONTEXT_CODEX_AUTHORIZATION."
+)
+_AUTHORIZATION_DENIED_REASON = (
+    "PowerContext authorization denied (HTTP 403) while resolving the current Scope binding: "
+    "the configured credential lacks permission."
+)
+_CONTROL_OPERATIONS = frozenset({"set_scope_binding", "clear_scope_binding"})
+_RESOLVE_OPERATIONS = frozenset({"resolve_scope_binding"})
+_HOST_OPERATIONS = frozenset({"create_scope", "get_scope", "list_scopes", "publish_artifact"})
+_CURRENT_OPERATIONS = frozenset({
+    "acknowledge_handoff",
+    "activate_handoff",
+    "approve_candidate",
+    "capture_content_source",
+    "change_atomic_memory_lifecycle",
+    "capture_working_note",
+    "commit_handoff",
+    "continue_handoff",
+    "create_remote_skill_target",
+    "create_work_contract",
+    "download_skill_package",
+    "finalize_handoff",
+    "flush_memory",
+    "flush_topic_memory",
+    "generate_experience",
+    "generate_skill",
+    "get_artifact",
+    "get_candidate",
+    "get_candidate_history",
+    "get_artifact_revision",
+    "get_atomic_memory_state",
+    "get_experience",
+    "get_memory_entry",
+    "get_recall_manifest",
+    "get_skill",
+    "get_skill_package_manifest",
+    "get_topic_memory",
+    "get_topic_memory_processing_block",
+    "get_topic_memory_processing_status",
+    "handoff_current_work",
+    "import_external_skill",
+    "list_candidates",
+    "list_atomic_memories",
+    "list_external_skills",
+    "list_managed_skills",
+    "list_memory_entries",
+    "list_remote_skill_targets",
+    "merge_atomic_memories",
+    "prepare_context",
+    "prepare_bootstrap_context",
+    "prepare_handoff",
+    "prepare_handoff_hint",
+    "preview_atomic_memory_restoration",
+    "propose_experience",
+    "propose_skill",
+    "propose_skill_package",
+    "publish_remote_skill",
+    "query_code",
+    "record_skill_usage",
+    "record_bootstrap_delivery",
+    "record_task_outcome",
+    "reject_candidate",
+    "remember_memory",
+    "replace_artifact",
+    "rename_remote_skill_target",
+    "resolve_external_skill",
+    "restore_atomic_memory",
+    "retry_topic_memory_processing",
+    "revise_candidate",
+    "revoke_remote_skill_target",
+    "scan_external_skills",
+    "search_atomic_memory",
+    "search_memory",
+    "search_topic_memory",
+    "unpublish_remote_skill",
+    "update_skill_lifecycle",
+})
+_SELECTION_OPERATIONS = frozenset({"get_handoff_report", "get_stats"})
+
+
+def main(settings: CodexPluginSettings | None = None) -> int:
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            return 0
+        tool_name = payload.get("tool_name")
+        tool_input = payload.get("tool_input")
+        session_id = payload.get("session_id")
+        cwd = payload.get("cwd")
+        if (
+            not isinstance(tool_name, str)
+            or not tool_name.startswith(_PREFIX)
+            or not isinstance(tool_input, dict)
+            or not isinstance(session_id, str)
+            or not isinstance(cwd, str)
+        ):
+            return 0
+        operation = tool_name.removeprefix(_PREFIX)
+        if operation in _CONTROL_OPERATIONS:
+            updated = dict(tool_input)
+            updated["key"] = session_binding_key(session_id)
+            _allow(updated)
+            return 0
+        if operation in _RESOLVE_OPERATIONS:
+            settings = CodexPluginSettings() if settings is None else settings
+            _allow({
+                "explicit_scope_id": settings.scope_id,
+                "binding_keys": binding_keys(cwd, session_id=session_id),
+            })
+            return 0
+        if operation in _HOST_OPERATIONS:
+            _allow(dict(tool_input))
+            return 0
+        if operation not in _CURRENT_OPERATIONS and operation not in _SELECTION_OPERATIONS:
+            return 0
+        settings = CodexPluginSettings() if settings is None else settings
+        scope_id = resolve_scope_id(
+            cwd,
+            session_id=session_id,
+            settings=settings,
+            deadline=monotonic() + settings.http_budget_seconds,
+        )
+        updated = dict(tool_input)
+        if operation in _SELECTION_OPERATIONS:
+            updated["selection"] = {"mode": "exact", "scope_ids": [scope_id]}
+        else:
+            updated["scope_id"] = scope_id
+        _allow(updated)
+    except (
+        ScopeBindingError,
+        HTTPException,
+        ValueError,
+        OSError,
+    ) as error:
+        _deny(_denial_reason(error))
+    return 0
+
+
+def _allow(updated_input: dict[str, object]) -> None:
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": updated_input,
+            }
+        },
+        sys.stdout,
+        separators=(",", ":"),
+    )
+    sys.stdout.write("\n")
+
+
+def _denial_reason(error: Exception) -> str:
+    if isinstance(error, ScopeBindingRejectedError):
+        return _AUTHENTICATION_FAILURE_REASON
+    if isinstance(error, ScopeBindingStatusError):
+        if error.status == 401:
+            return _AUTHENTICATION_FAILURE_REASON
+        if error.status == 403:
+            return _AUTHORIZATION_DENIED_REASON
+    return _BINDING_FAILURE_REASON
+
+
+def _deny(reason: str = _BINDING_FAILURE_REASON) -> None:
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        },
+        sys.stdout,
+        separators=(",", ":"),
+    )
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

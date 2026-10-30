@@ -16,20 +16,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel
-from sqlalchemy import insert, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.builtin.persistence.codec import dump_model, load_model, stored_bytes
+from powercontext.builtin.persistence.database import SELECTION_BATCH_SIZE
 from powercontext.builtin.persistence.errors import (
     GenerationConflictError,
     InvalidRepositoryArgumentError,
+    InvalidStoredColumnError,
+    InvalidStoredPayloadError,
 )
-from powercontext.builtin.persistence.tables import SOURCE_CURSORS_TABLE
+from powercontext.builtin.persistence.tables import SOURCE_CURSORS_TABLE, SOURCE_JOURNAL_HEADS_TABLE
 from powercontext.builtin.sources import SourceCursor
 from powercontext.limits import MAX_BINDING_NAME_LENGTH, MAX_SCOPE_ID_LENGTH
 
@@ -45,6 +49,49 @@ class StoredSourceCursor(BaseModel):
 
 class SourceCursorRepository:
     """Persist source-window cursors with generation CAS."""
+
+    async def unconsumed_scope_ids(self, connection: AsyncConnection, binding_name: str, /) -> tuple[str, ...]:
+        """Select journals ahead of this binding, without per-Scope transactions.
+
+        This is advisory discovery. The processor still validates its cursor and
+        window inside the owning transaction. Invalid cursors remain selected so
+        that their failure stays isolated to that Scope.
+        """
+
+        _require_identifier("binding_name", binding_name, MAX_BINDING_NAME_LENGTH)
+        heads = SOURCE_JOURNAL_HEADS_TABLE
+        cursors = SOURCE_CURSORS_TABLE
+        statement = (
+            select(heads.c.scope_id, heads.c.position, cursors.c.cursor)
+            .select_from(
+                heads.outerjoin(
+                    cursors,
+                    (cursors.c.scope_id == heads.c.scope_id) & (cursors.c.binding_name == binding_name),
+                )
+            )
+            .where(heads.c.position > 0)
+            .order_by(heads.c.scope_id)
+        )
+        selected: list[str] = []
+        async with connection.stream(statement) as result:
+            async for batch in result.partitions(SELECTION_BATCH_SIZE):
+                for scope_id, position, payload in batch:
+                    if payload is None:
+                        selected.append(str(scope_id))
+                        continue
+                    try:
+                        cursor = load_model(
+                            SourceCursor,
+                            stored_bytes(payload, column="cursor"),
+                            kind="source-cursor",
+                            name=binding_name,
+                        )
+                    except (InvalidStoredColumnError, InvalidStoredPayloadError):
+                        selected.append(str(scope_id))
+                    else:
+                        if cursor.sequence < position:
+                            selected.append(str(scope_id))
+        return tuple(selected)
 
     async def load(
         self,
@@ -66,6 +113,36 @@ class SourceCursorRepository:
         row = (await connection.execute(statement)).mappings().one_or_none()
         return None if row is None else _decode_row(row)
 
+    async def load_many(
+        self,
+        connection: AsyncConnection,
+        scope_ids: Sequence[str],
+        binding_name: str,
+        /,
+    ) -> dict[str, StoredSourceCursor]:
+        """Return the cursors that exist for one binding across a Scope selection."""
+
+        _require_identifier("binding_name", binding_name, MAX_BINDING_NAME_LENGTH)
+        scopes: dict[str, None] = {}
+        for scope_id in scope_ids:
+            _require_identifier("scope_id", scope_id, MAX_SCOPE_ID_LENGTH)
+            scopes.setdefault(scope_id, None)
+        ordered = tuple(scopes)
+        loaded: dict[str, StoredSourceCursor] = {}
+        for start in range(0, len(ordered), SELECTION_BATCH_SIZE):
+            batch = ordered[start : start + SELECTION_BATCH_SIZE]
+            rows = (
+                await connection.execute(
+                    select(SOURCE_CURSORS_TABLE).where(
+                        SOURCE_CURSORS_TABLE.c.scope_id.in_(batch),
+                        SOURCE_CURSORS_TABLE.c.binding_name == binding_name,
+                    )
+                )
+            ).mappings()
+            for row in rows:
+                loaded[str(row["scope_id"])] = _decode_row(row)
+        return loaded
+
     async def save(
         self,
         connection: AsyncConnection,
@@ -82,24 +159,17 @@ class SourceCursorRepository:
             raise InvalidRepositoryArgumentError("expected_generation", "must be positive")
         payload = dump_model(cursor, kind="source-cursor", name=binding_name)
         if expected_generation is None:
-            existing = await self.load(connection, scope_id, binding_name)
-            if existing is not None:
-                raise GenerationConflictError(binding_name, None, existing.generation)
             generation = 1
-            try:
-                async with connection.begin_nested():
-                    await connection.execute(
-                        insert(SOURCE_CURSORS_TABLE).values(
-                            scope_id=scope_id,
-                            binding_name=binding_name,
-                            cursor=payload,
-                            generation=generation,
-                        )
-                    )
-            except IntegrityError:
-                # Another runtime may have inserted the same cursor after our
-                # initial read. Normalize that database race to the same CAS
-                # conflict used for concurrent updates.
+            created = await _insert_if_absent(
+                connection,
+                scope_id=scope_id,
+                binding_name=binding_name,
+                cursor=payload,
+                generation=generation,
+            )
+            if not created:
+                # The unique constraint is the initial-generation CAS. Read only
+                # on conflict to report the generation that won the race.
                 existing = await self.load(
                     connection,
                     scope_id,
@@ -107,7 +177,7 @@ class SourceCursorRepository:
                     for_update=True,
                 )
                 if existing is None:
-                    raise
+                    raise GenerationConflictError(binding_name, None, None)
                 raise GenerationConflictError(binding_name, None, existing.generation) from None
         else:
             generation = expected_generation + 1
@@ -133,6 +203,34 @@ class SourceCursorRepository:
             cursor=cursor,
             generation=generation,
         )
+
+
+async def _insert_if_absent(
+    connection: AsyncConnection,
+    *,
+    scope_id: str,
+    binding_name: str,
+    cursor: bytes,
+    generation: int,
+) -> bool:
+    values = {
+        "scope_id": scope_id,
+        "binding_name": binding_name,
+        "cursor": cursor,
+        "generation": generation,
+    }
+    if connection.dialect.name == "sqlite":
+        statement = sqlite_insert(SOURCE_CURSORS_TABLE).values(**values).on_conflict_do_nothing()
+    elif connection.dialect.name == "mysql":
+        # OceanBase MySQL mode accepts SAVEPOINT but does not retain it for
+        # RELEASE/ROLLBACK. INSERT IGNORE keeps first creation atomic without
+        # relying on a nested transaction; all values are validated first, so
+        # the only ignored error is the table's cursor identity conflict.
+        statement = mysql_insert(SOURCE_CURSORS_TABLE).values(**values).prefix_with("IGNORE")
+    else:
+        raise InvalidRepositoryArgumentError("dialect", f"{connection.dialect.name!r} does not support source cursors")
+    result = await connection.execute(statement)
+    return result.rowcount == 1
 
 
 def _decode_row(row: Mapping[Any, Any]) -> StoredSourceCursor:

@@ -12,19 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from sqlalchemy import BigInteger, Date, Integer, String
+import re
+from pathlib import Path
+
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    inspect,
+)
 from sqlalchemy.dialects import mysql
 from sqlalchemy.schema import CreateTable, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 
+from powercontext.builtin.persistence.schema import _create_mysql_tables
 from powercontext.builtin.persistence.tables import (
+    AGENT_SKILL_TARGETS_TABLE,
+    ARTIFACT_HANDLES_TABLE,
     ARTIFACTS_TABLE,
+    BUILTIN_TABLES,
     SHARED_METADATA,
+    SHARED_TABLES,
+    SKILL_PACKAGES_TABLE,
     SOURCE_CURSORS_TABLE,
     SOURCES_TABLE,
 )
 
 INNODB_MAX_INDEX_BYTES = 3072
 UTF8MB4_MAX_BYTES_PER_CHARACTER = 4
+
+
+def test_mysql_initialization_ignores_unselected_table_with_unresolved_foreign_key() -> None:
+    metadata = MetaData()
+    selected = Table("pc_selected", metadata, Column("id", Integer, primary_key=True))
+    Table(
+        "pc_unselected",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("missing_id", Integer, ForeignKey("pc_missing.id")),
+    )
+
+    with create_engine("sqlite://").begin() as connection:
+        _create_mysql_tables(connection, (selected,))
+        assert inspect(connection).has_table(selected.name)
+        assert not inspect(connection).has_table("pc_unselected")
 
 
 class _UnbudgetedColumnTypeError(AssertionError):
@@ -38,10 +76,17 @@ def _column_budget(column) -> int:
         return column.type.length * UTF8MB4_MAX_BYTES_PER_CHARACTER
     if isinstance(column.type, BigInteger):
         return 8
+    if isinstance(column.type, LargeBinary):
+        assert column.type.length is not None
+        return column.type.length
     if isinstance(column.type, Integer):
         return 4
+    if isinstance(column.type, DateTime):
+        return 8
     if isinstance(column.type, Date):
         return 3
+    if isinstance(column.type, DateTime):
+        return 8
     raise _UnbudgetedColumnTypeError(column.type)
 
 
@@ -53,17 +98,104 @@ def test_mysql_ddl_uses_utf8mb4_bin_for_identity_keys() -> None:
     assert "source_type VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in ddl
 
 
+def test_artifact_handles_use_scope_local_identity_and_exact_revision_target() -> None:
+    primary_key = tuple(column.name for column in ARTIFACT_HANDLES_TABLE.primary_key.columns)
+    foreign_keys = tuple(
+        constraint
+        for constraint in ARTIFACT_HANDLES_TABLE.foreign_key_constraints
+        if constraint.referred_table is ARTIFACTS_TABLE
+    )
+
+    assert primary_key == ("scope_id", "family", "handle_key")
+    assert len(foreign_keys) == 1
+    assert tuple(element.parent.name for element in foreign_keys[0].elements) == (
+        "scope_id",
+        "family",
+        "artifact_id",
+        "revision",
+    )
+    assert tuple(element.column.name for element in foreign_keys[0].elements) == (
+        "scope_id",
+        "family",
+        "artifact_id",
+        "revision",
+    )
+    assert foreign_keys[0].ondelete == "RESTRICT"
+    assert "ck_pc_artifact_handles_revision_positive" in {
+        constraint.name for constraint in ARTIFACT_HANDLES_TABLE.constraints
+    }
+    assert ARTIFACT_HANDLES_TABLE in SHARED_TABLES
+
+
 def test_mysql_ddl_uses_mediumblob_for_every_canonical_payload() -> None:
     dialect = mysql.dialect()
     expected = {
-        SOURCES_TABLE: "payload",
-        ARTIFACTS_TABLE: "content",
-        SOURCE_CURSORS_TABLE: "`cursor`",
+        SOURCES_TABLE: ("payload",),
+        ARTIFACTS_TABLE: ("content",),
+        SOURCE_CURSORS_TABLE: ("`cursor`",),
+        SKILL_PACKAGES_TABLE: ("archive_bytes", "manifest"),
     }
 
-    for table, column_name in expected.items():
+    for table, column_names in expected.items():
         ddl = str(CreateTable(table).compile(dialect=dialect))
-        assert f"{column_name} MEDIUMBLOB NOT NULL" in ddl
+        for column_name in column_names:
+            assert f"{column_name} MEDIUMBLOB NOT NULL" in ddl
+
+
+def test_mysql_remote_target_credentials_use_binary_identity_columns() -> None:
+    ddl = str(CreateTable(AGENT_SKILL_TARGETS_TABLE).compile(dialect=mysql.dialect()))
+
+    assert "credential_verifier VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin" in ddl
+    assert "UNIQUE (credential_verifier)" in ddl
+    assert "ck_pc_agent_skill_targets_state_payload" in ddl
+    assert "state = 'active'" in ddl
+    assert "credential_verifier IS NOT NULL" in ddl
+
+
+def _assert_restore_layers_are_parent_first(
+    restore_layers: tuple[tuple[str, ...], ...],
+    tables: tuple[Table, ...],
+) -> None:
+    restored_tables = tuple(table_name for layer in restore_layers for table_name in layer)
+    table_names = {table.name for table in tables}
+
+    assert len(restored_tables) == len(set(restored_tables)) == len(tables)
+    assert set(restored_tables) == table_names
+
+    foreign_keys = tuple(
+        (table, constraint)
+        for table in tables
+        for constraint in table.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+    )
+
+    layer_by_table = {
+        table_name: layer_index for layer_index, layer in enumerate(restore_layers) for table_name in layer
+    }
+    for table, foreign_key in foreign_keys:
+        parent_table_name = foreign_key.referred_table.name
+        if parent_table_name == table.name:
+            continue
+        assert layer_by_table[parent_table_name] < layer_by_table[table.name]
+
+
+def test_documented_obloader_restore_layers_are_parent_first() -> None:
+    restore_guides = (
+        Path("docs/en/docs/operate/troubleshoot.md"),
+        Path("docs/zh/docs/operate/troubleshoot.md"),
+    )
+    restore_plans = tuple(
+        tuple(
+            tuple(table_names.split(","))
+            for table_names in re.findall(r"--table '([^']+)'", guide.read_text(encoding="utf-8"))
+        )
+        for guide in restore_guides
+    )
+    assert all(len(restore_layers) == 4 for restore_layers in restore_plans)
+    assert len(set(restore_plans)) == 1
+
+    restore_layers = restore_plans[0]
+    _assert_restore_layers_are_parent_first(restore_layers, BUILTIN_TABLES)
 
 
 def test_every_mysql_utf8mb4_key_stays_below_the_innodb_limit() -> None:
@@ -83,5 +215,5 @@ def test_every_mysql_utf8mb4_key_stays_below_the_innodb_limit() -> None:
             budgets[name] = sum(_column_budget(column) for column in index.columns)
 
     assert budgets
-    assert max(budgets.values()) == 2560
+    assert max(budgets.values()) == 2640
     assert all(budget < INNODB_MAX_INDEX_BYTES for budget in budgets.values())
