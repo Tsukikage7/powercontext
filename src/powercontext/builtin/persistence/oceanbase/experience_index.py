@@ -50,7 +50,6 @@ ON pc_artifact_heads (searchable_text) WITH PARSER SPACE
 """
 
 
-
 class OceanBaseExperienceFTSIndex:
     """Maintain and query approved Experience and Skill heads with OceanBase FULLTEXT."""
 
