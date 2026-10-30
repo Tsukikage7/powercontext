@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy import Column, Index, Integer, MetaData, Table, create_engine, create_mock_engine, inspect, select
 from sqlalchemy.dialects.mysql import dialect
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from powercontext.builtin.artifacts.memory import EmbeddingProfile
 from powercontext.builtin.persistence import schema
@@ -40,7 +40,9 @@ def test_relational_schema_creation_preserves_native_vector_index_ownership(fami
             else OceanBaseTopicMemoryVectorIndex(profile)
         )
         statements = []
-        sync = create_mock_engine("mysql://", lambda sql, *_a, **_k: statements.append(str(sql.compile(dialect=dialect()))))
+        sync = create_mock_engine(
+            "mysql://", lambda sql, *_a, **_k: statements.append(str(sql.compile(dialect=dialect())))
+        )
         inspector = MagicMock()
         inspector.get_table_names.return_value = []
         inspector.has_table.return_value = False
@@ -68,3 +70,32 @@ def test_relational_schema_creation_preserves_rows_and_regular_indexes():
         schema._create_mysql_tables(connection, (table,))
         assert connection.execute(select(table)).all() == [(1, 42)]
         assert [index["name"] for index in inspect(connection).get_indexes(table.name)] == ["ix_startup_probe_value"]
+
+
+@pytest.mark.parametrize("selected_exists", [False, True])
+def test_managed_schema_startup_never_creates_missing_tables_or_indexes(selected_exists):
+    from powercontext.builtin.persistence.migrations.models import MigrationError
+
+    async def scenario():
+        table = Table("managed_probe", MetaData(), Column("id", Integer, primary_key=True))
+        Index("ix_managed_probe_id", table.c.id)
+        engine = create_async_engine("sqlite+aiosqlite://")
+        try:
+            async with engine.begin() as connection:
+                await connection.exec_driver_sql("CREATE TABLE pc_schema_revision (revision TEXT)")
+                if selected_exists:
+                    await connection.exec_driver_sql("CREATE TABLE managed_probe (id INTEGER PRIMARY KEY)")
+                    await connection.execute(table.insert().values(id=7))
+                    await schema.create_tables(connection, (table,))
+                    assert (await connection.execute(select(table))).all() == [(7,)]
+                    indexes = await connection.run_sync(lambda sync: inspect(sync).get_indexes(table.name))
+                    assert indexes == []
+                else:
+                    with pytest.raises(MigrationError) as raised:
+                        await schema.create_tables(connection, (table,))
+                    assert raised.value.code == "unsupported_configuration"
+                    assert not await connection.run_sync(lambda sync: inspect(sync).has_table(table.name))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())

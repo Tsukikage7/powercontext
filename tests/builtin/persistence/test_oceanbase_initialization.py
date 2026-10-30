@@ -255,11 +255,12 @@ def test_live_vector_initialization_is_concurrent_and_repeatable() -> None:
                 atomic = OceanBaseAtomicMemoryIndex(embedding_profile)
                 topics = OceanBaseTopicMemoryVectorIndex(embedding_profile)
                 for table in (*atomic.tables, *topics.tables):
-                    probe = (
-                        select(table.c.embedding)
-                        .order_by(func.l2_distance(table.c.embedding, bindparam("query_vector", type_=VECTOR(3))))
-                        .suffix_with("APPROXIMATE LIMIT 1")
+                    probe = select(table.c.embedding).order_by(
+                        func.l2_distance(table.c.embedding, bindparam("query_vector", type_=VECTOR(3)))
                     )
+                    # Details use exact ranking; only Atomic Memory and title
+                    # projections require native ANN indexes in the current schema.
+                    probe = probe.limit(1) if table is topics.chunk_table else probe.suffix_with("APPROXIMATE LIMIT 1")
                     await connection.execute(probe, {"query_vector": (1.0, 0.0, 0.0)})
 
     asyncio.run(scenario())
