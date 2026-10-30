@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.mysql import match
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -49,6 +49,16 @@ CREATE FULLTEXT INDEX IF NOT EXISTS {_OCEANBASE_FTS_INDEX_NAME}
 ON pc_artifact_heads (searchable_text) WITH PARSER SPACE
 """
 
+_OCEANBASE_FTS_INDEX_EXISTS_SQL = text(
+    """
+    SELECT COUNT(*)
+    FROM information_schema.statistics
+    WHERE table_schema = DATABASE()
+      AND table_name = 'pc_artifact_heads'
+      AND index_name = :index_name
+    """
+)
+
 
 class OceanBaseExperienceFTSIndex:
     """Maintain and query approved Experience and Skill heads with OceanBase FULLTEXT."""
@@ -59,7 +69,11 @@ class OceanBaseExperienceFTSIndex:
         if connection.dialect.name != "mysql":
             raise CapabilityNotSupportedError("oceanbase-experience-fts")
         await ensure_artifact_head_searchable_text(connection)
-        await connection.exec_driver_sql(_OCEANBASE_CREATE_FTS_SQL)
+        # Keep provisioned schemas usable without runtime CREATE privileges;
+        # native IF NOT EXISTS still closes a concurrent missing-index race.
+        count = await connection.scalar(_OCEANBASE_FTS_INDEX_EXISTS_SQL, {"index_name": _OCEANBASE_FTS_INDEX_NAME})
+        if count == 0:
+            await connection.exec_driver_sql(_OCEANBASE_CREATE_FTS_SQL)
         if not await lexical_projection_is_current(
             connection, ARTIFACT_HEADS_TABLE.name, version=APPROVED_ARTIFACT_PROJECTION_VERSION
         ):

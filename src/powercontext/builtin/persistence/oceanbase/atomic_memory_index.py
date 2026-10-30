@@ -101,10 +101,13 @@ class OceanBaseAtomicMemoryIndex(RelationalAtomicMemoryIndex):
         await create_tables(connection, self.tables)
         await self.require_current_schema(connection)
         try:
-            await connection.exec_driver_sql(
-                f"CREATE FULLTEXT INDEX IF NOT EXISTS {_FTS_INDEX_NAME} "
-                "ON pc_atomic_memory_current (searchable_text) WITH PARSER SPACE"
-            )
+            # Existing deployments may use a DML-only runtime account. Even
+            # IF NOT EXISTS requires CREATE privileges on OceanBase.
+            if not await connection.scalar(_INDEX_EXISTS, {"index_name": _FTS_INDEX_NAME}):
+                await connection.exec_driver_sql(
+                    f"CREATE FULLTEXT INDEX IF NOT EXISTS {_FTS_INDEX_NAME} "
+                    "ON pc_atomic_memory_current (searchable_text) WITH PARSER SPACE"
+                )
             await connection.exec_driver_sql(
                 "SELECT artifact_id FROM pc_atomic_memory_current "
                 "WHERE MATCH(searchable_text) AGAINST ('powercontext') > 0 LIMIT 1"
