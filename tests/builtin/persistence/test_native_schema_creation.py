@@ -39,6 +39,54 @@ from powercontext.builtin.persistence.oceanbase.atomic_memory_index import Ocean
 from powercontext.builtin.persistence.oceanbase.topic_memory_index import OceanBaseTopicMemoryVectorIndex
 
 
+@pytest.mark.parametrize("state", ["provisioned", "missing-audit", "inspection-denied"])
+def test_mysql_access_startup_preserves_dml_only_table_access(state, monkeypatch):
+    from pymysql.err import OperationalError as MySQLOperationalError
+    from sqlalchemy.exc import OperationalError
+
+    from powercontext.server.authz.repository import ACCESS_TABLES
+
+    async def scenario():
+        statements = []
+        denied = OperationalError("startup probe", {}, MySQLOperationalError(1142, "command denied"))
+
+        def execute(statement, *_args, **_kwargs):
+            statements.append(str(statement.compile(dialect=dialect())))
+            raise denied
+
+        sync = create_mock_engine("mysql://", execute)
+        inspector = MagicMock()
+        inspector.get_table_names.return_value = [table.name for table in ACCESS_TABLES]
+
+        def has_table(name, **_kwargs):
+            if name != "pc_access_audit" or state == "provisioned":
+                return True
+            if state == "inspection-denied":
+                raise denied
+            return False
+
+        inspector.has_table.side_effect = has_table
+        monkeypatch.setattr(schema, "inspect", lambda _connection: inspector)
+        connection = AsyncMock(spec=AsyncConnection)
+        connection.dialect = dialect()
+        connection.run_sync.side_effect = lambda callback: callback(sync)
+        if state == "provisioned":
+            await schema.create_tables(connection, ACCESS_TABLES)
+            await schema.create_tables(connection, ACCESS_TABLES)
+            assert statements == []
+        else:
+            with pytest.raises(OperationalError) as caught:
+                await schema.create_tables(connection, ACCESS_TABLES)
+            assert caught.value is denied
+            if state == "missing-audit":
+                assert len(statements) == 1
+                assert "CREATE TABLE IF NOT EXISTS pc_access_audit" in statements[0]
+            else:
+                assert statements == []
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("family", ["atomic-memory", "topic-memory"])
 def test_relational_schema_creation_preserves_native_vector_index_ownership(family, monkeypatch):
     async def scenario():
