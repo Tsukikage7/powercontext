@@ -37,3 +37,9 @@ authors:
     name: jackie-cqz
     description: PowerContext 贡献者
     avatar: assets/blog/authors/jackie-cqz.jpg
+  tsukikage7:
+    name: Tsukikage
+    description: Magpie PowerContext 插件作者
+    avatar: assets/blog/authors/tsukikage7.jpg
+    socials:
+      github: Tsukikage7

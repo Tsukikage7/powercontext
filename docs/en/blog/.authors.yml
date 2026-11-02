@@ -37,3 +37,9 @@ authors:
     name: jackie-cqz
     description: PowerContext contributor
     avatar: assets/blog/authors/jackie-cqz.jpg
+  tsukikage7:
+    name: Tsukikage
+    description: Author of the Magpie PowerContext plugin
+    avatar: assets/blog/authors/tsukikage7.jpg
+    socials:
+      github: Tsukikage7
